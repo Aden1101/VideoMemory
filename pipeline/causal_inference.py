@@ -5,6 +5,7 @@ import torch
 import os
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from wan.modules.video_memory import TTTBlockCache
 
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
 from utils.debug_option import DEBUG
@@ -42,6 +43,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.frame_seq_length = 1560
 
         self.kv_cache1 = None
+        self.ttt_cache = None  # fast-weight state
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = args.model_kwargs.local_attn_size
@@ -87,6 +89,8 @@ class CausalInferencePipeline(torch.nn.Module):
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
             move_model_to_device_with_memory_preservation(self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+            if next(self.generator.parameters()).device.type == 'cpu':
+                self.generator.to(noise.device)
 
         # Decide the device for output based on low_memory (CPU for low-memory mode; otherwise GPU)
         output_device = torch.device('cpu') if low_memory else noise.device
@@ -133,6 +137,8 @@ class CausalInferencePipeline(torch.nn.Module):
             dtype=noise.dtype,
             device=noise.device
         )
+        # Fresh per sequence
+        self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
         if self.use_prompt_cache:
             self._initialize_prompt_cache(
                 batch_size=batch_size,
@@ -187,7 +193,9 @@ class CausalInferencePipeline(torch.nn.Module):
                         current_start=current_start_frame * self.frame_seq_length,
                         rope_enhance=self.rope_enhance,
                         prompt_cache=self.prompt_cache,
-                        new_prompt_chunk_flag=n%6==0
+                        new_prompt_chunk_flag=n%6==0,
+                        ttt_cache=self.ttt_cache,
+                        ttt_update=False,  # read only on noisy denoising passes
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -207,7 +215,9 @@ class CausalInferencePipeline(torch.nn.Module):
                         current_start=current_start_frame * self.frame_seq_length,
                         rope_enhance=self.rope_enhance,
                         prompt_cache=self.prompt_cache,
-                        new_prompt_chunk_flag=n%6==0
+                        new_prompt_chunk_flag=n%6==0,
+                        ttt_cache=self.ttt_cache,
+                        ttt_update=False,  # read only on noisy denoising passes
                     )
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
@@ -222,7 +232,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 current_start=current_start_frame * self.frame_seq_length,
                 rope_enhance=self.rope_enhance,
                 prompt_cache=self.prompt_cache,
-                new_prompt_chunk_flag=n%6==0
+                new_prompt_chunk_flag=n%6==0,
+                ttt_cache=self.ttt_cache,
+                ttt_update=True,  # write into memory
             )
 
             if profile:
@@ -242,8 +254,17 @@ class CausalInferencePipeline(torch.nn.Module):
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
 
-        # Step 3: Decode the output
-        video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
+        # Step 3: Decode the output (offload diffusion model first to free VRAM for VAE)
+        if low_memory:
+            self.generator.to('cpu')
+            self.kv_cache1 = None
+            self.crossattn_cache = None
+            self.prompt_cache = None
+            self.ttt_cache = None
+            import gc; gc.collect()
+            torch.cuda.empty_cache()
+        # stack decoded chunks in RAM instead of VRAM (240s videos OOM otherwise)
+        video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False, to_cpu=low_memory)
         video = (video * 0.5 + 0.5).clamp(0, 1)
         if profile:
             # End VAE timing and synchronize CUDA

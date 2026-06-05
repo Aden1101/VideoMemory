@@ -10,6 +10,7 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
+from wan.modules.video_memory import VideoMemoryLayer, TTTBlockCache
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
@@ -460,7 +461,8 @@ class CausalWanAttentionBlock(nn.Module):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 use_memory=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -489,6 +491,10 @@ class CausalWanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+        # parallel memory branch (None = unchanged baseline block)
+        self.memory = VideoMemoryLayer(dim=dim, num_heads=1, inter_multi=4,
+                                       g_init=0.0) if use_memory else None
+
     def forward(
         self,
         x,
@@ -506,6 +512,9 @@ class CausalWanAttentionBlock(nn.Module):
         sink_recache_after_switch=False,
         rope_enhance=False,
         prompt_cache=None,
+        ttt_cache=None,
+        ttt_update=False,
+        ttt_state=None,
     ):
         r"""
         Args:
@@ -522,11 +531,13 @@ class CausalWanAttentionBlock(nn.Module):
         # assert e[0].dtype == torch.float32
 
         # self-attention
+        x_in = x
+        h = self.norm1(x_in)  # cache normalized input; reused by the memory branch
         self_attn_result = self.self_attn(
-            (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
+            (h.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
             freqs, block_mask, kv_cache, current_start, cache_start, sink_recache_after_switch, rope_enhance, prompt_cache)
-        
+
         if kv_cache is not None:
             y, cache_update_info = self_attn_result
         else:
@@ -534,7 +545,20 @@ class CausalWanAttentionBlock(nn.Module):
             cache_update_info = None
 
         # with amp.autocast(dtype=torch.float32):
-        x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
+        x = x_in + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
+
+        # parallel memory branch (gate bias g_init=0.0 -> mem_out == 0 at init)
+        if self.memory is not None and ttt_cache is not None:
+            # ttt_state = state snapshot taken outside the gradient-checkpoint region:
+            # checkpoint saves these tensors, so the backward recompute reads the same state
+            state_in = ttt_state if ttt_state is not None else ttt_cache.state
+            mem_out, new_state = self.memory.step(
+                h, state=state_in, do_update=ttt_update)  # h = norm1(x_in)
+            x = x + mem_out
+            if ttt_update:
+                # attribute write on a TTTBlockCache OBJECT (not a dict key!):this mutation survives the call stack.
+                ttt_cache.state = new_state
+        # ===================================================================================
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
@@ -690,10 +714,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
+        MEMORY_LAYERS = {5}  # inject memory at L5 to start; later e.g. {5, 10, 15, 20}
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
-            for _ in range(num_layers)
+                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
+                                    use_memory=(i in MEMORY_LAYERS))
+            for i in range(num_layers)
         ])
 
         # head
@@ -1019,6 +1045,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         rope_enhance=False,
         prompt_cache=None,
         new_prompt_chunk_flag=False,
+        ttt_cache=None,
+        ttt_update=False,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1123,6 +1151,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "prompt_cache": prompt_cache[block_index] if prompt_cache is not None else None,
+                        "ttt_cache": ttt_cache[block_index] if ttt_cache is not None else None,
+                        "ttt_update": ttt_update,
+                        # state snapshot: read the fast-weight state outside the checkpointed
+                        # function and pass it as explicit tensors.
+                        "ttt_state": (
+                            (ttt_cache[block_index].state
+                             if ttt_cache[block_index].state is not None
+                             else block.memory.init_state(x.shape[0], x.device, x.dtype))
+                            if (ttt_cache is not None and block.memory is not None) else None),
                     }
                 )
                 result = torch.utils.checkpoint.checkpoint(
@@ -1146,6 +1183,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "prompt_cache": prompt_cache[block_index] if prompt_cache is not None else None,
+                        "ttt_cache": ttt_cache[block_index] if ttt_cache is not None else None,
+                        "ttt_update": ttt_update,
+                        "ttt_state": None,  # read the live object state
                     }
                 )
                 result = block(x, **kwargs)

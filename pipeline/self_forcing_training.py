@@ -1,6 +1,7 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
 from utils.wan_wrapper import WanDiffusionWrapper
+from wan.modules.video_memory import TTTBlockCache
 from utils.scheduler import SchedulerInterface
 from typing import List, Optional, Tuple
 import torch
@@ -38,6 +39,7 @@ class SelfForcingTrainingPipeline:
         self.kv_cache1 = None
         self.kv_cache2 = None
         self.crossattn_cache = None
+        self.ttt_cache = None  # fast-weight state, allocated per rollout
         self.independent_first_frame = independent_first_frame
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
@@ -119,7 +121,12 @@ class SelfForcingTrainingPipeline:
             denoised_timestep_to: ending denoise timestep
         """
         batch_size, chunk_frames, num_channels, height, width = noise.shape
-        
+
+        # fast-weight state threaded like the KV cache. Lazily allocated here,
+        # persists across per-chunk calls within a sequence, reset by clear_kv_cache().
+        if getattr(self, "ttt_cache", None) is None:
+            self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
+
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SeqTrain-Pipeline] generate_chunk_with_cache: batch_size={batch_size}, chunk_frames={chunk_frames}")
             print(f"[SeqTrain-Pipeline] current_start_frame={current_start_frame}, requires_grad={requires_grad}")
@@ -212,8 +219,10 @@ class SelfForcingTrainingPipeline:
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
+                            ttt_cache=self.ttt_cache,
+                            ttt_update=False,  # read only on noisy denoising passes
                         )
-                        
+
                         # Add noise for the next step
                         if step_idx < len(self.denoising_step_list) - 1:
                             next_timestep = self.denoising_step_list[step_idx + 1]
@@ -240,6 +249,8 @@ class SelfForcingTrainingPipeline:
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
+                            ttt_cache=self.ttt_cache,
+                            ttt_update=False,  # read only on noisy denoising passes
                         )
                     break
             
@@ -265,8 +276,10 @@ class SelfForcingTrainingPipeline:
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
                     current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
+                    ttt_cache=self.ttt_cache,
+                    ttt_update=True,  # write the clean chunk into memory (mirrors KV-cache way)
                 )
-            
+
             local_start_frame += current_num_frames
         
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
@@ -326,6 +339,8 @@ class SelfForcingTrainingPipeline:
         self._initialize_crossattn_cache(
             batch_size=batch_size, dtype=noise.dtype, device=noise.device
         )
+        # Fresh per rollout
+        self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
         # if self.kv_cache1 is None:
         #     self._initialize_kv_cache(
         #         batch_size=batch_size,
@@ -361,7 +376,9 @@ class SelfForcingTrainingPipeline:
                     timestep=timestep * 0,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length
+                    current_start=current_start_frame * self.frame_seq_length,
+                    ttt_cache=self.ttt_cache,
+                    ttt_update=False,  # initial-latent caching: do not write memory (only Step 3.3 does)
                 )
             current_start_frame += 1
 
@@ -409,7 +426,9 @@ class SelfForcingTrainingPipeline:
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length
+                            current_start=current_start_frame * self.frame_seq_length,
+                            ttt_cache=self.ttt_cache,
+                            ttt_update=False,  # read only on noisy denoising passes
                         )
                         next_timestep = self.denoising_step_list[index + 1]
                         noisy_input = self.scheduler.add_noise(
@@ -430,7 +449,9 @@ class SelfForcingTrainingPipeline:
                                 timestep=timestep,
                                 kv_cache=self.kv_cache1,
                                 crossattn_cache=self.crossattn_cache,
-                                current_start=current_start_frame * self.frame_seq_length
+                                current_start=current_start_frame * self.frame_seq_length,
+                                ttt_cache=self.ttt_cache,
+                                ttt_update=False,  # read only on noisy denoising passes
                             )
                     else:
                         # print(f"enable grad: {current_start_frame}")
@@ -441,7 +462,9 @@ class SelfForcingTrainingPipeline:
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length
+                            current_start=current_start_frame * self.frame_seq_length,
+                            ttt_cache=self.ttt_cache,
+                            ttt_update=False,  # read only on noisy denoising passes
                         )
                     break
 
@@ -461,13 +484,19 @@ class SelfForcingTrainingPipeline:
                 print(f"rank {dist.get_rank()}, current_start_frame: {current_start_frame}, current_num_frames: {current_num_frames}, current_timestep: {current_timestep}")
                 print(f"rank {dist.get_rank()}, rerun_for_cache")
             with torch.no_grad():
+                # Step 3.3 clean-context rerun = the ONLY place the fast weights move.
+                # NOTE: kept under no_grad on purpose for this phase -> the memory state is
+                # threaded/updated (like inference) but the write-path (k,v,lrs) receives NO
+                # meta-gradient. Lift this no_grad later to train the write-path through BPTT.
                 self.generator(
                     noisy_image_or_video=denoised_pred,
                     conditional_dict=conditional_dict,
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length
+                    current_start=current_start_frame * self.frame_seq_length,
+                    ttt_cache=self.ttt_cache,
+                    ttt_update=True,  # WRITE the clean chunk into memory (mirrors the clean KV-cache write)
                 )
 
             # Step 3.4: update the start and end frame indices
@@ -540,6 +569,10 @@ class SelfForcingTrainingPipeline:
                     blk["global_end_index"].zero_()
                 if "local_end_index" in blk:
                     blk["local_end_index"].zero_()
+
+        # Clear the memory fast-weight state
+        if getattr(self, "ttt_cache", None) is not None:
+            self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
 
         # Clear cross-attention cache
         if getattr(self, "crossattn_cache", None) is not None:

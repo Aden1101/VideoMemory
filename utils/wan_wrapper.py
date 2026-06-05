@@ -95,7 +95,9 @@ class WanVAEWrapper(torch.nn.Module):
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
-    def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+    def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False, to_cpu: bool = False) -> torch.Tensor:
+        # to_cpu: move each decoded chunk to CPU immediately so the final stack happens in RAM
+        # instead of VRAM (long videos, e.g. 240s, OOM otherwise). Default False: re-encode the pixels on GPU
         zs = latent.permute(0, 2, 1, 3, 4)
         if use_cache:
             assert latent.shape[0] == 1, "Batch size must be 1 when using cache"
@@ -111,7 +113,8 @@ class WanVAEWrapper(torch.nn.Module):
 
         output = []
         for u in zs:
-            output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
+            out = decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0)
+            output.append(out.cpu() if to_cpu else out)
         output = torch.stack(output, dim=0)
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]
@@ -132,10 +135,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         super().__init__()
         # 修改为模型路径，方便修改
         if is_causal:
+            # low_cpu_mem_usage=False: the pretrained Wan checkpoint predates the memory
+            # branch (blocks.5.memory.*), diffusers must build the full model first so the
+            # missing memory keys keep their __init__ initialization (Kaiming + gate 0)
             self.model = CausalWanModel.from_pretrained(
-                model_name, local_attn_size=local_attn_size, sink_size=sink_size)
-            # self.model = CausalWanModel.from_pretrained(
-            #     model_name, local_attn_size=local_attn_size, sink_size=sink_size, ignore_mismatched_sizes=True, low_cpu_mem_usage=False)  # 权重不匹配时使用
+                model_name, local_attn_size=local_attn_size, sink_size=sink_size,
+                low_cpu_mem_usage=False, device_map=None)
         else:
             self.model = WanModel.from_pretrained(model_name)
             if use_gan:
@@ -247,6 +252,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         rope_enhance=False,
         prompt_cache=None,
         new_prompt_chunk_flag=False,
+        ttt_cache=None,
+        ttt_update=False,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -272,6 +279,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 rope_enhance=rope_enhance,
                 prompt_cache=prompt_cache,
                 new_prompt_chunk_flag=new_prompt_chunk_flag,
+                ttt_cache=ttt_cache,
+                ttt_update=ttt_update,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:

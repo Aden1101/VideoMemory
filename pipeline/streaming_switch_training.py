@@ -8,6 +8,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 from pipeline.streaming_training import StreamingTrainingPipeline
+from wan.modules.video_memory import TTTBlockCache
 from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
@@ -93,6 +94,10 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         num_blocks = chunk_frames // self.num_frame_per_block
         all_num_frames = [self.num_frame_per_block] * num_blocks
 
+        # fast-weight state threaded like the KV cache.
+        if getattr(self, "ttt_cache", None) is None:
+            self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
+
         # Prepare output
         output = torch.zeros_like(noise)
         
@@ -170,7 +175,9 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             flow_cache=self.flow_cache,
                             rope_enhance=self.rope_enhance,
                             prompt_cache=self.prompt_cache,
-                            new_prompt_chunk_flag=block_index==0
+                            new_prompt_chunk_flag=block_index==0,
+                            ttt_cache=self.ttt_cache,
+                            ttt_update=False,  # read only on noisy denoising passes
                         )
                         if self.flow_cache is not None and dist.get_rank() == 0 and MY_VISUAL_DEBUG:
                             print("[SeqTrain-DMDSwitch] flow_pred update, flow_pred.sum is {}".format(flow_pred.sum()))
@@ -206,7 +213,9 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             flow_cache=self.flow_cache,
                             rope_enhance=self.rope_enhance,
                             prompt_cache=self.prompt_cache,
-                            new_prompt_chunk_flag=block_index==0
+                            new_prompt_chunk_flag=block_index==0,
+                            ttt_cache=self.ttt_cache,
+                            ttt_update=False,  # read only on noisy denoising passes
                         )
                         if self.flow_cache is not None and dist.get_rank() == 0 and MY_VISUAL_DEBUG:
                             print("[SeqTrain-DMDSwitch] flow_pred update, flow_pred.sum is {}".format(flow_pred.sum()))
@@ -243,7 +252,9 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                     flow_cache=self.flow_cache,
                     rope_enhance=self.rope_enhance,
                     prompt_cache=self.prompt_cache,
-                    new_prompt_chunk_flag=block_index==0
+                    new_prompt_chunk_flag=block_index==0,
+                    ttt_cache=self.ttt_cache,
+                    ttt_update=True,  # write the clean chunk into memory
                 )
             
             local_start_frame += current_num_frames
@@ -339,6 +350,8 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 rope_enhance=self.rope_enhance,
                 prompt_cache=self.prompt_cache,
                 new_prompt_chunk_flag=False,
+                ttt_cache=self.ttt_cache,
+                ttt_update=False,  # these frames were already written into memory at their own clean pass
             )
 
         # reset cross-attention cache  清空cross-attention缓存，下一步进入generator会重新计算缓存

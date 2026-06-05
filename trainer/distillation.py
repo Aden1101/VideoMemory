@@ -116,15 +116,22 @@ class Trainer:
                 if "generator" in base_checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {base_checkpoint_path}")
-                    result = self.model.generator.load_state_dict(base_checkpoint["generator"], strict=True)
+                    # strict=False: the base checkpoint predates the MAG memory branch; only acceptable missing keys are memory params
+                    result = self.model.generator.load_state_dict(base_checkpoint["generator"], strict=False)
+                    non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
+                    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
+                    assert not result.unexpected_keys, f"Unexpected keys: {list(result.unexpected_keys)[:5]}"
                     if self.is_main_process:
-                        print("Generator weights loaded successfully")
+                        print(f"Generator weights loaded successfully ({len(result.missing_keys)} memory keys kept at init)")
                 elif "model" in base_checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {base_checkpoint_path}")
-                    result = self.model.generator.load_state_dict(base_checkpoint["model"], strict=True)
+                    result = self.model.generator.load_state_dict(base_checkpoint["model"], strict=False)
+                    non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
+                    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
+                    assert not result.unexpected_keys, f"Unexpected keys: {list(result.unexpected_keys)[:5]}"
                     if self.is_main_process:
-                        print("Generator weights loaded successfully")
+                        print(f"Generator weights loaded successfully ({len(result.missing_keys)} memory keys kept at init)")
                 else:
                     if self.is_main_process:
                         print("Warning: Generator checkpoint not found in base model.")
@@ -234,9 +241,18 @@ class Trainer:
                 if "critic_lora" in lora_checkpoint:
                     if self.is_main_process:
                         print(f"Loading LoRA critic weights: {len(lora_checkpoint['critic_lora'])} keys in checkpoint")
-                    
+
                     # Use PEFT's set_peft_model_state_dict; it automatically aligns key names
                     peft.set_peft_model_state_dict(self.model.fake_score.model, lora_checkpoint["critic_lora"])
+
+                # memory params, restore them too,
+                if "generator_memory" in lora_checkpoint:
+                    if self.is_main_process:
+                        print(f"Loading memory weights: {len(lora_checkpoint['generator_memory'])} keys in checkpoint")
+                    result = self.model.generator.load_state_dict(lora_checkpoint["generator_memory"], strict=False)
+                    assert not result.unexpected_keys, f"Unexpected memory keys: {list(result.unexpected_keys)[:5]}"
+                    still_missing_mem = [k for k in result.missing_keys if "memory" in k]
+                    assert not still_missing_mem, f"Memory NOT loaded (would stay at init!): {still_missing_mem[:5]}"
 
                 # Load training step
                 resume_step = getattr(config, "resume_step", True)
@@ -247,6 +263,12 @@ class Trainer:
             else:
                 if self.is_main_process:
                     print("No LoRA checkpoint to load, starting from scratch")
+
+        # memory params are new, full-rank and trainable (excluded from LoRA targets).
+        # peft freezes every non-LoRA param, so we un-freeze them here.
+        for n, p in self.model.generator.named_parameters():
+            if "memory" in n:
+                p.requires_grad_(True)
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -259,7 +281,9 @@ class Trainer:
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy
+            wrap_strategy=config.real_score_fsdp_wrap_strategy,
+            # Mirrors text_encoder_cpu_offload below; default False = unchanged behavior.
+            cpu_offload=getattr(config, "real_score_cpu_offload", False)
         )
 
         self.model.fake_score = fsdp_wrap(
@@ -311,10 +335,18 @@ class Trainer:
         
         
         # Step 4: Initialize the optimizer
+        # memory params (full-rank, excluded from LoRA, un-frozen BEFORE the FSDP wrap), get their own LR group.  
+        gen = self.model.generator
+        mem_params = [p for n, p in gen.named_parameters() if "memory" in n and p.requires_grad]
+        other_params = [p for n, p in gen.named_parameters() if "memory" not in n and p.requires_grad]
+        # safety net
+        assert mem_params or not any("memory" in n for n, _ in gen.named_parameters()), \
+            "memory params exist but none landed in the optimizer group (name-match broke post-FSDP)"
+        generator_param_groups = [{"params": other_params, "lr": config.lr}]  # LoRA adapters
+        if mem_params:  # no memory layers -> single group, strictly identical to baseline
+            generator_param_groups.append({"params": mem_params, "lr": getattr(config, "lr_mem", 1e-4)})
         self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
-            lr=config.lr,
+            generator_param_groups,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
@@ -428,11 +460,18 @@ class Trainer:
                 if "generator" in checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {checkpoint_path}")
-                    self.model.generator.load_state_dict(checkpoint["generator"], strict=True)
+                    # tolerate checkpoints that predate the MAG memory branch
+                    result = self.model.generator.load_state_dict(checkpoint["generator"], strict=False)
+                    non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
+                    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
+                    assert not result.unexpected_keys, f"Unexpected keys: {list(result.unexpected_keys)[:5]}"
                 elif "model" in checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {checkpoint_path}")
-                    self.model.generator.load_state_dict(checkpoint["model"], strict=True)
+                    result = self.model.generator.load_state_dict(checkpoint["model"], strict=False)
+                    non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
+                    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
+                    assert not result.unexpected_keys, f"Unexpected keys: {list(result.unexpected_keys)[:5]}"
                 else:
                     if self.is_main_process:
                         print("Warning: Generator checkpoint not found.")
@@ -681,12 +720,16 @@ class Trainer:
                 self.model.generator.model)
             crit_lora_sd = self._gather_lora_state_dict(
                 self.model.fake_score.model)
+            # memory params are not part of the LoRA state dict, persist them explicitly
+            gen_memory_sd = self._gather_memory_state_dict(self.model.generator)
 
             state_dict = {
                 "generator_lora": gen_lora_sd,
                 "critic_lora": crit_lora_sd,
                 "step": self.step,
             }
+            if gen_memory_sd:
+                state_dict["generator_memory"] = gen_memory_sd
         else:
             with FSDP.state_dict_type(
                 self.model.generator,
@@ -1055,6 +1098,8 @@ class Trainer:
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                     print(f"[SeqTrain-Trainer] train_first_chunk={train_first_chunk}, current_seq_length={current_seq_length}")
 
+            self._log_memory_stats()
+
             # Compute generator loss
             generator_loss, generator_log_dict = self.streaming_model.compute_generator_loss(
                 chunk=generated_chunk,
@@ -1182,10 +1227,11 @@ class Trainer:
                         
                         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                             print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={generator_grad_norm.item()}")
-                        
+
                         self.generator_optimizer.step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
+                        self._log_memory_stats()
                     else:
                         generator_log_dict = {}
                     
@@ -1345,7 +1391,9 @@ class Trainer:
         for name, module in transformer.named_modules():
             if module.__class__.__name__ in adapter_target_modules:
                 for full_submodule_name, submodule in module.named_modules(prefix=name):
-                    if isinstance(submodule, torch.nn.Linear):
+                    # exclude the memory branch: its Linears (qkv/lrs/proj) are
+                    # full-rank trainable params, not LoRA targets (see the lr_mem group).
+                    if isinstance(submodule, torch.nn.Linear) and ".memory." not in full_submodule_name:
                         target_linear_modules.add(full_submodule_name)
         
         target_linear_modules = list(target_linear_modules)
@@ -1388,6 +1436,73 @@ class Trainer:
         ):
             full = lora_model.state_dict()
         return get_peft_model_state_dict(lora_model, state_dict=full)
+
+    def _log_memory_stats(self):
+        """opt-in memory instrumentation.
+        config.log_memory_stats: print gate stats and live fast-weight drift.
+        config.assert_memory_drift: fail loudly if the state stops accumulating
+        (guards against fsdp/pytree container rebuilds swallowing the state writes;
+        run after any change to the ttt threading or a torch upgrade).
+        note: |w| is pinned at its init norm by weight_norm_update, so only
+        ||w - w_init|| discriminates a frozen state from a living one."""
+        do_log = getattr(self.config, "log_memory_stats", False)
+        do_assert = getattr(self.config, "assert_memory_drift", False)
+        if not (do_log or do_assert) or not self.is_main_process:
+            return
+        try:
+            if do_log:
+                for n, p in self.model.generator.named_parameters():
+                    if "memory" in n and n.endswith("proj.bias"):
+                        b = p.detach().float()
+                        third = b.numel() // 3
+                        print(f"mem stats step={self.step} gate={b[2*third:].abs().mean().item():.3e} "
+                              f"shift+scale={b[:2*third].abs().mean().item():.3e}")
+                        break
+            pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
+            ttt = getattr(pipe, "ttt_cache", None)
+            if ttt is None:
+                if do_log:
+                    print(f"mem stats step={self.step} no ttt_cache")
+                return
+            inits = {n.rsplit(".", 1)[-1]: p.detach()
+                     for n, p in self.model.generator.named_parameters()
+                     if "memory" in n and n.rsplit(".", 1)[-1] in ("w0", "w1", "w2")}
+            found = False
+            max_drift = 0.0
+            for i, blk in enumerate(ttt):
+                st = getattr(blk, "state", None)
+                if st is None:
+                    continue
+                found = True
+                drifts = []
+                for w, key in zip(st, ("w0", "w1", "w2")):
+                    if key in inits:
+                        d = (w.detach().float() - inits[key].float()).norm().item()
+                        max_drift = max(max_drift, d)
+                        drifts.append(f"{d:.3e}")
+                    else:
+                        drifts.append("n/a")
+                if do_log:
+                    print(f"mem stats step={self.step} block={i} drift=({', '.join(drifts)})")
+            if not found and do_log:
+                print(f"mem stats step={self.step} ttt allocated but no state")
+            if do_assert and self.step >= getattr(self.config, "dfake_gen_update_ratio", 1):
+                assert found, "drift guard: no live fast-weight state (writes swallowed again?)"
+                assert max_drift > 1.0, f"drift guard: drift={max_drift:.3e} ~ 0, memory stuck at init"
+        except AssertionError:
+            raise
+        except Exception as e:  # never let logging kill a training run
+            print(f"mem stats logging failed: {e}")
+
+    def _gather_memory_state_dict(self, fsdp_model):
+        "gather the full state dict on rank 0 and keep only the memory params (full-rank, not lora)"
+        with FSDP.state_dict_type(
+            fsdp_model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
+        ):
+            full = fsdp_model.state_dict()
+        return {k: v for k, v in full.items() if "memory" in k}
     
     # --------------------------------------------------------------------------------------------------------------
     # Visualization helpers

@@ -8,6 +8,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 from utils.wan_wrapper import WanDiffusionWrapper
+from wan.modules.video_memory import TTTBlockCache
 from utils.scheduler import SchedulerInterface
 from typing import List, Optional, Tuple
 import torch
@@ -48,6 +49,7 @@ class StreamingTrainingPipeline:
         self.kv_cache1 = None
         self.crossattn_cache = None
         self.flow_cache = None
+        self.ttt_cache = None  # memory fast-weight state
         self.prompt_cache = None
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
@@ -112,6 +114,10 @@ class StreamingTrainingPipeline:
         assert chunk_frames % self.num_frame_per_block == 0
         num_blocks = chunk_frames // self.num_frame_per_block
         all_num_frames = [self.num_frame_per_block] * num_blocks
+
+        # fast-weight state threaded like the KV cache.
+        if getattr(self, "ttt_cache", None) is None:
+            self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
 
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SeqTrain-Pipeline] generate_chunk_with_cache: batch_size={batch_size}, chunk_frames={chunk_frames}")
@@ -190,7 +196,9 @@ class StreamingTrainingPipeline:
                             flow_cache=self.flow_cache,
                             rope_enhance=self.rope_enhance,
                             prompt_cache=self.prompt_cache,
-                            new_prompt_chunk_flag=False
+                            new_prompt_chunk_flag=False,
+                            ttt_cache=self.ttt_cache,
+                            ttt_update=False,  # read only on noisy denoising passes
                         )
                         if self.flow_cache is not None and dist.get_rank() == 0 and MY_VISUAL_DEBUG:
                             print("[SeqTrain-Pipeline] flow_pred update, flow_pred.sum is {}".format(flow_pred.sum()))
@@ -228,7 +236,9 @@ class StreamingTrainingPipeline:
                             flow_cache=self.flow_cache,
                             rope_enhance=self.rope_enhance,
                             prompt_cache=self.prompt_cache,
-                            new_prompt_chunk_flag=False
+                            new_prompt_chunk_flag=False,
+                            ttt_cache=self.ttt_cache,
+                            ttt_update=False,  # read only on noisy denoising passes
                         )
                         if self.flow_cache is not None and dist.get_rank() == 0 and MY_VISUAL_DEBUG:
                             print("[SeqTrain-Pipeline] flow_pred update, flow_pred.sum is {}".format(flow_pred.sum()))
@@ -261,7 +271,9 @@ class StreamingTrainingPipeline:
                     flow_cache=self.flow_cache,
                     rope_enhance=self.rope_enhance,
                     prompt_cache=self.prompt_cache,
-                    new_prompt_chunk_flag=False
+                    new_prompt_chunk_flag=False,
+                    ttt_cache=self.ttt_cache,
+                    ttt_update=True,  # write the clean chunk into memory
                 )
             
             local_start_frame += current_num_frames
@@ -376,6 +388,10 @@ class StreamingTrainingPipeline:
                     blk["global_end_index"].zero_()
                 if "local_end_index" in blk:
                     blk["local_end_index"].zero_()
+
+        # Clear the memory fast-weight state
+        if getattr(self, "ttt_cache", None) is not None:
+            self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
 
         # Clear cross-attention cache
         if getattr(self, "crossattn_cache", None) is not None:

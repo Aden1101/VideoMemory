@@ -92,8 +92,18 @@ if config.generator_ckpt:
                 print(f"[Warning] {len(missing)} parameters are missing when loading checkpoint: {missing[:8]} ...")
             if len(unexpected) > 0:
                 print(f"[Warning] {len(unexpected)} unexpected parameters encountered when loading checkpoint: {unexpected[:8]} ...")
+        # same memory-aware safety net as the non-EMA branch: only memory keys may be missing
+        non_memory_missing = [k for k in missing if "memory" not in k]
+        assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
+        assert not unexpected, f"Unexpected keys: {list(unexpected)[:5]}"
     else:
-        pipeline.generator.load_state_dict(raw_gen_state_dict)
+        # acceptable missing keys are the memory params (they keep their fresh init)
+        missing, unexpected = pipeline.generator.load_state_dict(raw_gen_state_dict, strict=False)
+        non_memory_missing = [k for k in missing if "memory" not in k]
+        assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
+        assert not unexpected, f"Unexpected keys: {list(unexpected)[:5]}"
+        if local_rank == 0 and len(missing) > 0:
+            print(f"[MAG] {len(missing)} memory keys kept at init (not in checkpoint)")
 
 # --------------------------- LoRA support (optional) ---------------------------
 from utils.lora_utils import configure_lora_for_model
@@ -125,6 +135,18 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
             peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint)  # type: ignore
         if local_rank == 0:
             print("LoRA weights loaded for generator")
+
+        # MAG memory (full-rank), restore the trained weights.
+        if isinstance(lora_checkpoint, dict) and "generator_memory" in lora_checkpoint:
+            mem_sd = lora_checkpoint["generator_memory"]
+            model_mem_keys = {k for k in pipeline.generator.state_dict() if "memory" in k}
+            result = pipeline.generator.load_state_dict(mem_sd, strict=False)
+            assert not result.unexpected_keys, f"Unexpected memory keys: {list(result.unexpected_keys)[:5]}"
+            still_missing_mem = [k for k in result.missing_keys if "memory" in k]
+            assert not still_missing_mem, f"Memory NOT loaded (would stay at init!): {still_missing_mem[:5]}"
+            if local_rank == 0:
+                print(f"[MAG] {len(mem_sd)} trained memory keys loaded "
+                      f"(model has {len(model_mem_keys)} memory keys)")
     else:
         if local_rank == 0:
             print("No LoRA checkpoint specified; using base weights with LoRA adapters initialized")
