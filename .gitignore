@@ -29,3 +29,6 @@ venv/
 .DS_Store
 
 .claude/
+
+# --- Figures/plots and other unecessary files ---
+reference/

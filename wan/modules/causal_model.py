@@ -741,6 +741,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+        # init_weights() xavier-inits EVERY nn.Linear, which breaks the memory branch's inert
+        # gate init (proj=0).
+        for block in self.blocks:
+            if getattr(block, "memory", None) is not None:
+                block.memory.reset_parameters()
+
         self.gradient_checkpointing = False
 
         self.block_mask = None

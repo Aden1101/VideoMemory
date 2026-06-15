@@ -211,6 +211,8 @@ class VideoMemoryLayer(nn.Module):
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
 
+        self.dim = dim
+        self.g_init = g_init
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.muon_update_steps = muon_update_steps
@@ -252,6 +254,13 @@ class VideoMemoryLayer(nn.Module):
             nn.init.zeros_(self.proj.weight)
             nn.init.zeros_(self.proj.bias)
             self.proj.bias[2 * dim:] = g_init  # gate bias only
+
+    def reset_parameters(self):
+        """Re-apply the memory branch's own initialization. must be called after any global
+        model init (e.g. CausalWanModel.init_weights(), which xavier-inits every nn.Linear in
+        the model)."""
+        if self.use_modulation:
+            self._init_modulation_params(self.dim, g_init=self.g_init)
 
     # ---- internals ----
     def _qkv_lr(self, x):
