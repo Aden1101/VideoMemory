@@ -32,3 +32,9 @@ venv/
 
 # --- Figures/plots and other unecessary files ---
 reference/
+
+# --- wandb local cache ---
+wandb/
+
+# --- debug log---
+tea_debug.log

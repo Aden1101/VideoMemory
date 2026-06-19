@@ -26,4 +26,5 @@ class DMDSwitch(DMD):
             slice_last_frames=getattr(self.args, "slice_last_frames", 21),
             global_sink=getattr(self.args, "global_sink", False),
             rope_enhance=getattr(self.args, "rope_enhance", False),
+            train_write=getattr(self.args, "train_write", False),
         )

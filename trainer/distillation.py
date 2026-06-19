@@ -62,6 +62,18 @@ class Trainer:
         self.causal = config.causal
         if self.is_main_process:
             self.writer = SummaryWriter(log_dir=config.logdir)
+            if getattr(config, "use_wandb", False):
+                import wandb
+                run_name = os.path.basename(config.logdir.rstrip("/"))
+                wandb.init(
+                    project=getattr(config, "wandb_project", "anchor-forcing-memory"),
+                    name=run_name,
+                    id=run_name,
+                    resume="allow",
+                    dir=config.logdir,
+                    config=OmegaConf.to_container(config, resolve=True),
+                    sync_tensorboard=True,
+                )
 
         # use a random seed for the training
         if config.seed == 0:
@@ -270,11 +282,20 @@ class Trainer:
             if "memory" in n:
                 p.requires_grad_(True)
 
+        # fast weights (w0/w1/w2) are excluded from FSDP
+        mem_ignored = []
+        if self.world_size > 1:
+            mem_ignored = [m for m in self.model.generator.modules()
+                           if type(m).__name__ == "VideoMemoryLayer"]
+            for m in mem_ignored:
+                m.to(device=self.device, dtype=self.dtype)
+
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy
+            wrap_strategy=config.generator_fsdp_wrap_strategy,
+            ignored_modules=mem_ignored or None
         )
 
         self.model.real_score = fsdp_wrap(
@@ -1170,6 +1191,26 @@ class Trainer:
             
             return critic_log_dict
 
+    def _vram_profile_tick(self):
+        """VRAM profiler hook"""
+        n = getattr(self.config, "profile_vram", 0)
+        if not n:
+            return
+        warmup = getattr(self.config, "profile_vram_warmup", 3)
+        if self.step == warmup:
+            torch.cuda.reset_peak_memory_stats()
+        elif self.step >= warmup + n:
+            torch.cuda.synchronize()
+            alloc = torch.cuda.max_memory_allocated() / 2**30
+            reserved = torch.cuda.max_memory_reserved() / 2**30
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(f"[VRAM_PROFILE] layers={getattr(self.config, 'model_kwargs', {}).get('memory_layers', [5])} "
+                      f"train_write={getattr(self.config, 'train_write', False)} "
+                      f"alloc_GiB={alloc:.2f} reserved_GiB={reserved:.2f}", flush=True)
+            if dist.is_initialized():
+                dist.barrier()
+            os._exit(0)
+
     def train(self):
         start_step = self.step
         pbar_total = max(0, self.config.max_iters - self.step)
@@ -1249,7 +1290,8 @@ class Trainer:
                     
                     # Increase step count
                     self.step += 1
-                    
+                    self._vram_profile_tick()
+
                     if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                         print(f"[SeqTrain-Trainer] streaming training step completed: step={self.step}")
                         if hasattr(self, 'streaming_model') and self.streaming_model is not None:
@@ -1455,8 +1497,12 @@ class Trainer:
                     if "memory" in n and n.endswith("proj.bias"):
                         b = p.detach().float()
                         third = b.numel() // 3
-                        print(f"mem stats step={self.step} gate={b[2*third:].abs().mean().item():.3e} "
-                              f"shift+scale={b[:2*third].abs().mean().item():.3e}")
+                        gate = b[2*third:].abs().mean().item()
+                        shift_scale = b[:2*third].abs().mean().item()
+                        print(f"mem stats step={self.step} gate={gate:.3e} shift+scale={shift_scale:.3e}")
+                        if hasattr(self, "writer"):
+                            self.writer.add_scalar("memory/gate", gate, self.step)
+                            self.writer.add_scalar("memory/shift_scale", shift_scale, self.step)
                         break
             pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
             ttt = getattr(pipe, "ttt_cache", None)
@@ -1486,6 +1532,8 @@ class Trainer:
                     print(f"mem stats step={self.step} block={i} drift=({', '.join(drifts)})")
             if not found and do_log:
                 print(f"mem stats step={self.step} ttt allocated but no state")
+            if do_log and found and hasattr(self, "writer"):
+                self.writer.add_scalar("memory/drift_max", max_drift, self.step)
             if do_assert and self.step >= getattr(self.config, "dfake_gen_update_ratio", 1):
                 assert found, "drift guard: no live fast-weight state (writes swallowed again?)"
                 assert max_drift > 1.0, f"drift guard: drift={max_drift:.3e} ~ 0, memory stuck at init"

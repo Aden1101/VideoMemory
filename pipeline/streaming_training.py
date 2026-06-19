@@ -65,6 +65,20 @@ class StreamingTrainingPipeline:
         self.rope_enhance = kwargs.get("rope_enhance", False)
         print(f"[rope_enhance policy] {self.rope_enhance}")
 
+        # train_write=True: write under enable_grad + keep state graph so the write-path trains.
+        self.train_write = kwargs.get("train_write", False)
+        if self.train_write:
+            from wan.modules.video_memory import VideoMemoryLayer
+            model = getattr(self.generator, "model", None)
+            if model is not None:
+                for _, m in model.named_modules():
+                    if isinstance(m, VideoMemoryLayer):
+                        m.detach_state = False
+            print("[train_write] ENABLED")
+
+    def _write_context(self):
+        return torch.enable_grad() if getattr(self, "train_write", False) else torch.no_grad()
+
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -260,7 +274,7 @@ class StreamingTrainingPipeline:
             if DEBUG and block_index == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Pipeline] Updating cache with context_noise={self.context_noise}")
             
-            with torch.no_grad():
+            with self._write_context():
                 self.generator(
                     noisy_image_or_video=context_noisy,
                     conditional_dict=conditional_dict,

@@ -26,7 +26,6 @@ from typing import List, Dict, Tuple
 import torch.nn.functional as F
 import copy
 import matplotlib.pyplot as plt
-import os
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -462,7 +461,9 @@ class CausalWanAttentionBlock(nn.Module):
                  qk_norm=True,
                  cross_attn_norm=False,
                  eps=1e-6,
-                 use_memory=False):
+                 use_memory=False,
+                 gate_init=0.1,
+                 ckpt_write=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -493,7 +494,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # parallel memory branch (None = unchanged baseline block)
         self.memory = VideoMemoryLayer(dim=dim, num_heads=1, inter_multi=4,
-                                       g_init=0.0) if use_memory else None
+                                       g_init=gate_init, checkpoint_write=ckpt_write) if use_memory else None
 
     def forward(
         self,
@@ -547,7 +548,7 @@ class CausalWanAttentionBlock(nn.Module):
         # with amp.autocast(dtype=torch.float32):
         x = x_in + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
-        # parallel memory branch (gate bias g_init=0.0 -> mem_out == 0 at init)
+        # parallel memory branch
         if self.memory is not None and ttt_cache is not None:
             # ttt_state = state snapshot taken outside the gradient-checkpoint region:
             # checkpoint saves these tensors, so the backward recompute reads the same state
@@ -641,7 +642,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 memory_layers=(5,),
+                 gate_init=0.1,
+                 ckpt_write=False):
         r"""
         Initialize the diffusion model backbone.
 
@@ -714,11 +718,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
-        MEMORY_LAYERS = {5}  # inject memory at L5 to start; later e.g. {5, 10, 15, 20}
+        # which blocks get a memory branch
+        MEMORY_LAYERS = {int(x) for x in memory_layers}
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                     local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
-                                    use_memory=(i in MEMORY_LAYERS))
+                                    use_memory=(i in MEMORY_LAYERS),
+                                    gate_init=gate_init, ckpt_write=ckpt_write)
             for i in range(num_layers)
         ])
 

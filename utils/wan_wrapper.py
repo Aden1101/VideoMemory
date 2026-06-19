@@ -130,7 +130,10 @@ class WanDiffusionWrapper(torch.nn.Module):
             is_causal=False,
             local_attn_size=-1,
             sink_size=0,
-            use_gan=False
+            use_gan=False,
+            memory_layers=(5,),
+            gate_init=0.1,
+            ckpt_write=False
     ):
         super().__init__()
         # 修改为模型路径，方便修改
@@ -140,6 +143,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             # missing memory keys keep their __init__ initialization (Kaiming + gate 0)
             self.model = CausalWanModel.from_pretrained(
                 model_name, local_attn_size=local_attn_size, sink_size=sink_size,
+                memory_layers=memory_layers, gate_init=gate_init, ckpt_write=ckpt_write,
                 low_cpu_mem_usage=False, device_map=None)
         else:
             self.model = WanModel.from_pretrained(model_name)

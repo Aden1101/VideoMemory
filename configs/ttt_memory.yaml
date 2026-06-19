@@ -12,6 +12,9 @@ max_checkpoints: 3
 auto_resume: False
 logdir: /shared/ssd_14T_project/adenelmi/ttt_memory_train
 
+use_wandb: true
+wandb_project: anchor-forcing-memory
+
 ema_weight: 0.99
 ema_start_step: 200
 
@@ -73,6 +76,9 @@ model_kwargs:
   timestep_shift: 5.0
   local_attn_size: 12
   sink_size: 3
+  memory_layers: [5]    # which transformer blocks get a memory branch
+  gate_init: 0.1        # gate-bias init
+  ckpt_write: false     # gradient-checkpoint the write update
 
 guidance_scale: 3.0
 global_sink: true

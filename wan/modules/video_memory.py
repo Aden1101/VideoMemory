@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 
 class CompatRMSNorm(nn.Module):
@@ -207,6 +208,7 @@ class VideoMemoryLayer(nn.Module):
         use_modulation: bool = True,
         g_init: float = 0.0,       # 0.0 -> inert warm start (identical to baseline at step 0; Scal3R: 0.1)
         detach_state: Optional[bool] = None,  # None -> detach in eval, keep graph in train
+        checkpoint_write: bool = False,  # gradient-checkpoint the write update
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -218,6 +220,7 @@ class VideoMemoryLayer(nn.Module):
         self.muon_update_steps = muon_update_steps
         self.use_modulation = use_modulation
         self.detach_state = detach_state
+        self.checkpoint_write = checkpoint_write
 
         # Query, Key, Value linear layers
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
@@ -311,9 +314,15 @@ class VideoMemoryLayer(nn.Module):
         o = swiglu_apply(q, w0, w1, w2)                       # APPLY-FIRST (state from < this chunk)
         new_state = state
         if do_update:                                          # write the clean chunk
-            w0_grad, w1_grad, w2_grad = swiglu_fast_weight_gradient(k, v, w0, w1, w2, lr0, lr1, lr2)
-            w0n, w1n, w2n = weight_norm_update(
-                w0, w1, w2, w0_grad, w1_grad, w2_grad, self.muon_update_steps, allreduce_fn)
+            def _write(k, v, w0, w1, w2, lr0, lr1, lr2):
+                g0, g1, g2 = swiglu_fast_weight_gradient(k, v, w0, w1, w2, lr0, lr1, lr2)
+                return weight_norm_update(
+                    w0, w1, w2, g0, g1, g2, self.muon_update_steps, allreduce_fn)
+            if self.checkpoint_write and torch.is_grad_enabled():
+                w0n, w1n, w2n = checkpoint(_write, k, v, w0, w1, w2, lr0, lr1, lr2,
+                                           use_reentrant=False)
+            else:
+                w0n, w1n, w2n = _write(k, v, w0, w1, w2, lr0, lr1, lr2)
             if self._detach():
                 w0n, w1n, w2n = w0n.detach(), w1n.detach(), w2n.detach()
             new_state = (w0n, w1n, w2n)

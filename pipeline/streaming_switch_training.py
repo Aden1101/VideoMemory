@@ -241,7 +241,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 context_timestep.flatten(0, 1),
             ).unflatten(0, denoised_pred.shape[:2])
             
-            with torch.no_grad():
+            with self._write_context():
                 self.generator(
                     noisy_image_or_video=context_noisy,
                     conditional_dict=cond_in_use,
