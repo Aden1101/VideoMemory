@@ -79,6 +79,7 @@ model_kwargs:
   memory_layers: [5]    # which transformer blocks get a memory branch
   gate_init: 0.1        # gate-bias init
   ckpt_write: false     # gradient-checkpoint the write update
+  gate_extra: []        # extra gate inputs (off=[]); e.g. [agreement] (memory<->prompt match)
 
 guidance_scale: 3.0
 global_sink: true

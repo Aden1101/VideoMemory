@@ -7,7 +7,9 @@
 # No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
 #
 # SPDX-License-Identifier: Apache-2.0
+import os
 import time
+import random
 import torch
 import torch.distributed as dist
 from typing import Tuple, Dict, Any, Optional, List
@@ -77,8 +79,21 @@ class StreamingTrainingModel:
         self.use_prompt_cache = getattr(config, "use_prompt_cache", False)
         self.use_gan = getattr(config, "use_gan", False)
         self.use_decouple_dmd = getattr(config, "use_decouple_dmd", False)
+        # Text-dropout (identity signal): prob of generating a chunk with null text so the
+        # model must rely on memory/history for the subject. 0.0 = off (default = unchanged).
+        self.text_dropout_prob = getattr(config, "text_dropout_prob", 0.0)
+        # identity + anti-freeze objective terms; all weights 0.0 => unchanged.
+        # id term: decode a few frames, DINO-embed, cosine to the chunk-0 anchor (grad flows through the decoder).
+        self.id_loss_weight = getattr(config, "id_loss_weight", 0.0)
+        self.id_decode_frames = getattr(config, "id_decode_frames", 2)   # latent frames decoded (grad) / chunk
+        # Differentiable temporal-variance floor (anti-freeze): hinge on adjacent-latent motion.
+        self.tv_loss_weight = getattr(config, "tv_loss_weight", 0.0)
+        self.tv_motion_floor = getattr(config, "tv_motion_floor", 0.0)   # latent-diff floor; 0 => inactive
+        self._dino = None                                                # lazy frozen DINOv2
+        self._id_anchor = None                                           # per-sequence chunk-0 subject anchor
         if dist.get_rank() == 0:
-            print(f"[StreamingTrain-Model] use_prompt_cache={self.use_prompt_cache}. use_gan={self.use_gan}. use_decouple_dmd={self.use_decouple_dmd}")
+            print(f"[StreamingTrain-Model] use_prompt_cache={self.use_prompt_cache}. use_gan={self.use_gan}. use_decouple_dmd={self.use_decouple_dmd}. text_dropout_prob={self.text_dropout_prob}")
+            print(f"[StreamingTrain-Model] id/tv terms: id_loss_weight={self.id_loss_weight} id_decode_frames={self.id_decode_frames} tv_loss_weight={self.tv_loss_weight} tv_motion_floor={self.tv_motion_floor}")
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] streamingTrainingModel initialized:")
@@ -205,10 +220,11 @@ class StreamingTrainingModel:
         return cond_info["conditional_dict"]
     
     def _generate_chunk(
-        self, 
+        self,
         noise_chunk: torch.Tensor,
         chunk_start_frame: int,
         requires_grad: bool = True,
+        detach_state: bool = True,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """
         Generate a single chunk.
@@ -232,7 +248,18 @@ class StreamingTrainingModel:
             
         # Get the conditional_dict to use now
         current_conditional_dict = self._get_current_conditional_dict(chunk_start_frame)
-        
+
+        # Text-dropout: with prob text_dropout_prob, generate this chunk on null text (the DMD target
+        # + critic keep the true prompt), so the student must reproduce the subject from memory -- that
+        # gradient trains the read/write. Chunk 0 is never dropped (subject established + written first).
+        if (self.text_dropout_prob > 0.0 and chunk_start_frame > 0
+                and random.random() < self.text_dropout_prob):
+            # shallow copy: unconditional_dict is cached across steps (self.unconditional_dict),
+            # so never hand the cached object to generation (which may add keys e.g. initial_latent)
+            current_conditional_dict = dict(self.state["conditional_info"]["unconditional_dict"])
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[StreamingTrain-Model] text-dropout: NULL text at chunk {chunk_start_frame}")
+
         # Prepare generation parameters
         kwargs = {
             "noise": noise_chunk,
@@ -278,6 +305,17 @@ class StreamingTrainingModel:
                 for block_index in range(self.inference_pipeline.num_transformer_blocks):
                     self.inference_pipeline.prompt_cache[block_index]["switch_frame"].fill_(switch_frame_index)
 
+        # the TTT state is carried chunk->chunk by reference, but training backwards once per chunk
+        # (its graph is then freed). detach_state=True detaches the entering state so each chunk's
+        # write-graph starts from a leaf (else "backward a second time" crash). detach_state=False
+        # (chunks 2..K of a BPTT window) keeps the grad_fn so the loss backprops into the previous
+        # chunk; the trainer sums the window's losses and backwards once (no freed-graph, no leak).
+        ttt_cache = getattr(self.inference_pipeline, "ttt_cache", None)
+        if detach_state and ttt_cache is not None:
+            for _c in ttt_cache:
+                if _c is not None and getattr(_c, "state", None) is not None:
+                    _c.state = tuple(s.detach() for s in _c.state)
+
         # Call the pipeline-specific method to generate a chunk
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] Calling pipeline.generate_chunk_with_cache")
@@ -322,6 +360,7 @@ class StreamingTrainingModel:
         mismatch_pairs=None
     ):
         """Set up a new sequence"""
+        self._id_anchor = None  # reset the chunk-0 identity anchor for this new sequence
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"StreamingTrain-Model: Before setup_sequence", device=self.device, rank=dist.get_rank() if dist.is_initialized() else 0)
             
@@ -461,7 +500,7 @@ class StreamingTrainingModel:
             print(f"[StreamingTrain-Model] can_generate_more: current_length={current_length}, temp_max_length={temp_max_length}, global_max_length={self.max_length}, can_generate={can_generate}")
             
         return can_generate
-    def generate_next_chunk(self, requires_grad: bool = True) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def generate_next_chunk(self, requires_grad: bool = True, detach_state: bool = True) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Generate the next chunk, supporting overlap to ensure temporal continuity.
 
@@ -548,6 +587,7 @@ class StreamingTrainingModel:
             noise_chunk=noise_chunk,
             chunk_start_frame=current_length,
             requires_grad=requires_grad,
+            detach_state=detach_state,
         )
 
         # Build the full chunk for loss computation
@@ -612,6 +652,12 @@ class StreamingTrainingModel:
 
         self.state["previous_frames"] = frames_to_save
 
+        # cache the identity anchor on the first chunk of the sequence, here in the rollout, so it is
+        # set whether a generator or a critic step rolls frame 0 (the generator-loss path alone never
+        # sees frame 0 under the windowed schedule).
+        if previous_frames is None:
+            self._set_id_anchor(full_chunk)
+
         # Return info
         info = {
             "denoised_timestep_from": denoised_timestep_from,
@@ -627,6 +673,83 @@ class StreamingTrainingModel:
             print(f"[StreamingTrain-Model] current_training_chunk: ({self.state['current_length'] - new_frames_to_generate} -> {self.state['current_length']})/{self.state['temp_max_length']}")
         return full_chunk, info
     
+    # ---- frame-level identity anchor + temporal-variance floor ----
+    _DINO_MEAN = (0.485, 0.456, 0.406)
+    _DINO_STD = (0.229, 0.224, 0.225)
+
+    def _get_dino(self):
+        """Lazily load a frozen DINOv2-ViT-B/14 (offline from the torch.hub cache)."""
+        if self._dino is None:
+            hub = os.path.expanduser("~/.cache/torch/hub")
+            torch.hub.set_dir(hub)
+            local = os.path.join(hub, "facebookresearch_dinov2_main")
+            m = torch.hub.load(local, "dinov2_vitb14", source="local", pretrained=True)
+            m.eval().to(self.device)
+            for p in m.parameters():
+                p.requires_grad_(False)
+            self._dino = m
+            if (not dist.is_initialized() or dist.get_rank() == 0):
+                print("[StreamingTrain-Model] loaded frozen DINOv2-vitb14 for identity loss")
+        return self._dino
+
+    def _dino_embed_pixels(self, pixels):
+        """pixels [B,T,C,H,W] in [-1,1] -> L2-normalized DINO CLS embeddings [B*T, D] (fp32)."""
+        dino = self._get_dino()
+        b, t, c, h, w = pixels.shape
+        x = pixels.reshape(b * t, c, h, w).float()
+        x = (x * 0.5 + 0.5).clamp(0, 1)                       # [-1,1] -> [0,1]
+        x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        mean = torch.tensor(self._DINO_MEAN, device=x.device).view(1, 3, 1, 1)
+        std = torch.tensor(self._DINO_STD, device=x.device).view(1, 3, 1, 1)
+        x = (x - mean) / std
+        f = dino(x)                                           # [B*T, D] CLS embedding
+        return F.normalize(f, dim=-1)
+
+    def _set_id_anchor(self, chunk):
+        """Cache the chunk-0 subject identity anchor (no grad), called from the rollout on the first
+        chunk so it is populated whether a generator or a critic step rolls frame 0."""
+        if self.id_loss_weight <= 0.0:
+            return
+        k = max(1, int(self.id_decode_frames))
+        with torch.no_grad():
+            px = self.base_model.vae.decode_to_pixel(chunk[:, -k:, ...], use_cache=False)
+            emb = self._dino_embed_pixels(px)
+            self._id_anchor = F.normalize(emb.mean(0, keepdim=True), dim=-1).detach()
+
+    def _compute_identity_tv_loss(self, chunk, chunk_start_frame, gradient_mask):
+        """Frame-level identity anchor loss + temporal-variance floor. Returns (id_loss, tv_loss, log).
+        All log values are 0-dim tensors present on EVERY chunk (chunk-0 defaults) so merge_dict_list
+        (which keys off the first chunk's dict) keeps them and stacks them across chunks."""
+        device = chunk.device
+        id_loss = torch.zeros((), device=device)
+        tv_loss = torch.zeros((), device=device)
+        # consistent keys every chunk (chunk-0 identity is perfect by construction -> cos=1, loss=0)
+        log = {
+            "e1_latent_motion": torch.zeros((), device=device),
+            "e1_tv_loss": torch.zeros((), device=device),
+            "e1_id_cos": torch.ones((), device=device),
+            "e1_id_loss": torch.zeros((), device=device),
+        }
+
+        # temporal-variance floor (anti-freeze): hinge on adjacent-latent motion; penalize only if frozen
+        if self.tv_loss_weight > 0.0 and chunk.shape[1] >= 2:
+            motion = (chunk[:, 1:] - chunk[:, :-1]).abs().mean()
+            tv_loss = F.relu(self.tv_motion_floor - motion)
+            log["e1_latent_motion"] = motion.detach()
+            log["e1_tv_loss"] = tv_loss.detach()
+
+        # frame-level identity: decode a few frames -> DINO -> cosine to the chunk-0 anchor, on later
+        # chunks only, with grad through decode -> gate -> read -> write (anchor cached in the rollout).
+        if self.id_loss_weight > 0.0 and chunk_start_frame > 0 and self._id_anchor is not None:
+            k = max(1, int(self.id_decode_frames))
+            px = self.base_model.vae.decode_to_pixel(chunk[:, -k:, ...], use_cache=False)
+            emb = self._dino_embed_pixels(px)
+            cos = (emb * self._id_anchor).sum(-1)            # [k]
+            id_loss = (1.0 - cos).mean()
+            log["e1_id_cos"] = cos.mean().detach()
+            log["e1_id_loss"] = id_loss.detach()
+        return id_loss, tv_loss, log
+
     def compute_generator_loss(self,
         chunk: torch.Tensor,
         chunk_info: Dict[str, Any]
@@ -685,6 +808,18 @@ class StreamingTrainingModel:
             "loss_time": time.time() - _t_loss_start,
             "new_frames_supervised": chunk_info.get("new_frames_generated", chunk.shape[1]),
         })
+
+        ###### identity + temporal-variance objective ######
+        if self.id_loss_weight > 0.0 or self.tv_loss_weight > 0.0:
+            try:
+                id_loss, tv_loss, e1_log = self._compute_identity_tv_loss(
+                    chunk, chunk_start_frame, gradient_mask)
+                dmd_loss = dmd_loss + self.id_loss_weight * id_loss + self.tv_loss_weight * tv_loss
+                dmd_log_dict.update(e1_log)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if (not dist.is_initialized() or dist.get_rank() == 0):
+                    print("[StreamingTrain-Model] E1 identity/tv loss OOM -> skipped this step")
 
         ###### gan process #####
         if self.use_gan:

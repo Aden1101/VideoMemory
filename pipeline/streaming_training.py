@@ -76,8 +76,12 @@ class StreamingTrainingPipeline:
                         m.detach_state = False
             print("[train_write] ENABLED")
 
-    def _write_context(self):
-        return torch.enable_grad() if getattr(self, "train_write", False) else torch.no_grad()
+    def _write_context(self, requires_grad: bool = True):
+        # Only build the write graph when this chunk will actually be backpropped.
+        # On critic steps generate_chunk runs with requires_grad=False (chunk is detached,
+        # critic backward goes through fake_score only) -> building the clean-rerun graph
+        # under enable_grad there is pure waste and the dominant VRAM leak. Gate on requires_grad.
+        return torch.enable_grad() if (getattr(self, "train_write", False) and requires_grad) else torch.no_grad()
 
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -274,7 +278,11 @@ class StreamingTrainingPipeline:
             if DEBUG and block_index == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Pipeline] Updating cache with context_noise={self.context_noise}")
             
-            with self._write_context():
+            # The last block's write is never read within the chunk and it is detached cross-chunk
+            # -> its enable_grad graph is never backpropped and never freed (+1 write-forward leaked
+            # per generator step). Run it under no_grad (never trained anyway).
+            _write_grad = requires_grad and (block_index < len(all_num_frames) - 1)
+            with self._write_context(_write_grad):
                 self.generator(
                     noisy_image_or_video=context_noisy,
                     conditional_dict=conditional_dict,

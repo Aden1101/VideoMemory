@@ -1,5 +1,6 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+import os
 from wan.modules.attention import attention
 from wan.modules.model import (
     WanRMSNorm,
@@ -463,7 +464,13 @@ class CausalWanAttentionBlock(nn.Module):
                  eps=1e-6,
                  use_memory=False,
                  gate_init=0.1,
-                 ckpt_write=False):
+                 ckpt_write=False,
+                 gate_extra=None,
+                 use_decay=False,
+                 decay_init=0.95,
+                 bounded_gate=False,
+                 single_norm=False,
+                 muon_update_steps=5):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -494,7 +501,11 @@ class CausalWanAttentionBlock(nn.Module):
 
         # parallel memory branch (None = unchanged baseline block)
         self.memory = VideoMemoryLayer(dim=dim, num_heads=1, inter_multi=4,
-                                       g_init=gate_init, checkpoint_write=ckpt_write) if use_memory else None
+                                       g_init=gate_init, checkpoint_write=ckpt_write,
+                                       gate_extra=gate_extra, use_decay=use_decay,
+                                       decay_init=decay_init, bounded_gate=bounded_gate,
+                                       single_norm=single_norm,
+                                       muon_update_steps=muon_update_steps) if use_memory else None
 
     def forward(
         self,
@@ -516,6 +527,8 @@ class CausalWanAttentionBlock(nn.Module):
         ttt_cache=None,
         ttt_update=False,
         ttt_state=None,
+        denoising_step=None,
+        switch_global_frame=None,
     ):
         r"""
         Args:
@@ -553,9 +566,40 @@ class CausalWanAttentionBlock(nn.Module):
             # ttt_state = state snapshot taken outside the gradient-checkpoint region:
             # checkpoint saves these tensors, so the backward recompute reads the same state
             state_in = ttt_state if ttt_state is not None else ttt_cache.state
+            # build the optional per-token gate_extra signals: denoising_step from the timestep t,
+            # frames_since_switch from the global frame index vs the switch.
+            mem_ds, mem_fss = None, None
+            gx = getattr(self.memory, "gate_extra", None)
+            if gx:
+                B = x.shape[0]
+                if "denoising_step" in gx and denoising_step is not None:
+                    ds = denoising_step.float()
+                    if ds.dim() == 1:                       # [B] -> [B, F]
+                        ds = ds[:, None].expand(B, num_frames)
+                    elif ds.shape[1] != num_frames:
+                        ds = ds[:, :1].expand(B, num_frames)
+                    mem_ds = ds.repeat_interleave(frame_seqlen, dim=1)          # (B, L)
+                if "frames_since_switch" in gx:
+                    csf = current_start // frame_seqlen                          # chunk start frame
+                    gf = csf + torch.arange(num_frames, device=x.device)         # global frame idx
+                    if switch_global_frame is None:
+                        fss = gf.float()                                         # no switch -> since start
+                    else:
+                        fss = torch.where(gf >= switch_global_frame,
+                                          gf - switch_global_frame, gf).float()  # resets to 0 at switch
+                    mem_fss = fss[None, :].expand(B, num_frames).repeat_interleave(frame_seqlen, dim=1)
             mem_out, new_state = self.memory.step(
-                h, state=state_in, do_update=ttt_update)  # h = norm1(x_in)
-            x = x + mem_out
+                h, state=state_in, do_update=ttt_update,  # h = norm1(x_in)
+                prompt_emb=context,                      
+                denoising_step=mem_ds, frames_since_switch=mem_fss)
+            # on the write pass (ttt_update=True) mem_out only feeds the detached clean cache, not
+            # the loss -> detach it, else every frozen downstream block builds a wasted ~15GB backward
+            # graph; the write gradient reaches the memory via new_state, not x. On reads keep the graph.
+            # MEM_ZERO_ALL ablation (env-gated, default off): zero mem_out on both passes.
+            _mz_all = int(os.environ.get("MEM_ZERO_ALL", "0"))
+            if _mz_all > 0 and (current_start // frame_seqlen) < _mz_all:
+                mem_out = mem_out * 0.0
+            x = x + (mem_out.detach() if ttt_update else mem_out)
             if ttt_update:
                 # attribute write on a TTTBlockCache OBJECT (not a dict key!):this mutation survives the call stack.
                 ttt_cache.state = new_state
@@ -645,7 +689,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  eps=1e-6,
                  memory_layers=(5,),
                  gate_init=0.1,
-                 ckpt_write=False):
+                 ckpt_write=False,
+                 gate_extra=None,
+                 use_decay=False,
+                 decay_init=0.95,
+                 bounded_gate=False,
+                 single_norm=False,
+                 muon_update_steps=5):
         r"""
         Initialize the diffusion model backbone.
 
@@ -724,7 +774,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                     local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
                                     use_memory=(i in MEMORY_LAYERS),
-                                    gate_init=gate_init, ckpt_write=ckpt_write)
+                                    gate_init=gate_init, ckpt_write=ckpt_write,
+                                    gate_extra=gate_extra, use_decay=use_decay,
+                                    decay_init=decay_init, bounded_gate=bounded_gate,
+                                    single_norm=single_norm,
+                                    muon_update_steps=muon_update_steps)
             for i in range(num_layers)
         ])
 
@@ -1059,6 +1113,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         new_prompt_chunk_flag=False,
         ttt_cache=None,
         ttt_update=False,
+        switch_global_frame=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1172,6 +1227,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                              if ttt_cache[block_index].state is not None
                              else block.memory.init_state(x.shape[0], x.device, x.dtype))
                             if (ttt_cache is not None and block.memory is not None) else None),
+                        "denoising_step": t,
+                        "switch_global_frame": switch_global_frame,
                     }
                 )
                 result = torch.utils.checkpoint.checkpoint(
@@ -1198,6 +1255,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "ttt_cache": ttt_cache[block_index] if ttt_cache is not None else None,
                         "ttt_update": ttt_update,
                         "ttt_state": None,  # read the live object state
+                        "denoising_step": t,
+                        "switch_global_frame": switch_global_frame,
                     }
                 )
                 result = block(x, **kwargs)

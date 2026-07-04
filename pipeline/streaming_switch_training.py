@@ -94,6 +94,10 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         num_blocks = chunk_frames // self.num_frame_per_block
         all_num_frames = [self.num_frame_per_block] * num_blocks
 
+        # global frame index of the switch (for frames_since_switch). switch_frame_index is
+        # relative to this chunk start; current_start_frame is the chunk's global offset.
+        switch_global_frame = current_start_frame + switch_frame_index
+
         # fast-weight state threaded like the KV cache.
         if getattr(self, "ttt_cache", None) is None:
             self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
@@ -178,6 +182,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             new_prompt_chunk_flag=block_index==0,
                             ttt_cache=self.ttt_cache,
                             ttt_update=False,  # read only on noisy denoising passes
+                            switch_global_frame=switch_global_frame,
                         )
                         if self.flow_cache is not None and dist.get_rank() == 0 and MY_VISUAL_DEBUG:
                             print("[SeqTrain-DMDSwitch] flow_pred update, flow_pred.sum is {}".format(flow_pred.sum()))
@@ -216,6 +221,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             new_prompt_chunk_flag=block_index==0,
                             ttt_cache=self.ttt_cache,
                             ttt_update=False,  # read only on noisy denoising passes
+                            switch_global_frame=switch_global_frame,
                         )
                         if self.flow_cache is not None and dist.get_rank() == 0 and MY_VISUAL_DEBUG:
                             print("[SeqTrain-DMDSwitch] flow_pred update, flow_pred.sum is {}".format(flow_pred.sum()))
@@ -241,7 +247,12 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 context_timestep.flatten(0, 1),
             ).unflatten(0, denoised_pred.shape[:2])
             
-            with self._write_context():
+            # The last block's write is never read within the chunk (next-block read trains the
+            # earlier writes) and it is detached cross-chunk -> its enable_grad graph is never
+            # backpropped and never freed = +1 full write-forward leaked per generator step.
+            # Run it under no_grad (it is never trained anyway).
+            _write_grad = requires_grad and (block_index < len(all_num_frames) - 1)
+            with self._write_context(_write_grad):
                 self.generator(
                     noisy_image_or_video=context_noisy,
                     conditional_dict=cond_in_use,
@@ -255,6 +266,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                     new_prompt_chunk_flag=block_index==0,
                     ttt_cache=self.ttt_cache,
                     ttt_update=True,  # write the clean chunk into memory
+                    switch_global_frame=switch_global_frame,
                 )
             
             local_start_frame += current_num_frames

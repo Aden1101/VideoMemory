@@ -84,8 +84,9 @@ def launch_distributed_job(backend: str = "nccl"):
         init_method = f"tcp://[{host}]:{port}"
     else:  # IPv4
         init_method = f"tcp://{host}:{port}"
+    _pg_timeout_min = int(os.environ.get("PG_TIMEOUT_MIN", "30"))
     dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
-                            init_method=init_method, timeout=timedelta(minutes=30))
+                            init_method=init_method, timeout=timedelta(minutes=_pg_timeout_min))
     torch.cuda.set_device(local_rank)
 
 

@@ -155,13 +155,13 @@ def swiglu_fast_weight_gradient(k, v, w0, w1, w2, lr0, lr1, lr2):
     return w0_grad, w1_grad, w2_grad
 
 
-def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps, allreduce_fn=None):
-    """ Muon (Newton-Schulz) + weight-norm fast-weight update.
-
-    Mirrors the update block of Scal3R's fast_weight_swish_glu_weight_norm_mini_batch_apply (and
-    its update() method): remember the per-row norm, orthogonalize the raw grad, ascend, then
-    renormalize each row back to its original norm. `allreduce_fn` replaces Scal3R's
-    context_parallelism (applied to the RAW grads, before Muon); None in the single-stream case.
+def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps, allreduce_fn=None,
+                       decay=None, init_norms=None):
+    """ Muon (Newton-Schulz) + fast-weight update.
+    Default (decay=None): Scal3R renorm -- ascend the Muon'd grad, then renorm each row to its
+    pre-update norm (norm conserved, no forgetting; the state only rotates in a fixed-norm shell).
+    Gated-delta (decay/init_norms set): w <- decay*w + muon(grad), then cap each row to its init norm
+    (shrink allowed = explicit forgetting). `allreduce_fn` = Scal3R's context-parallel allreduce (raw grads).
     """
     # Remember that the weight norm before the update is applied
     w0_norm = w0.detach().norm(dim=1, keepdim=True)
@@ -176,16 +176,34 @@ def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps,
     w1_grad = zeropower_via_newtonschulz5(w1_grad, muon_update_steps)
     w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
 
-    # Update the fast weights with the gradients
-    w0 = w0 + w0_grad
-    w1 = w1 + w1_grad
-    w2 = w2 + w2_grad
+    if decay is None:
+        # original: ascend then renorm each row back to its pre-update norm (no forgetting)
+        w0 = w0 + w0_grad
+        w1 = w1 + w1_grad
+        w2 = w2 + w2_grad
+        w0 = w0 / (w0.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
+        w1 = w1 / (w1.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
+        w2 = w2 / (w2.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
+        return w0, w1, w2
 
-    # Do weight normalization here
-    w0 = w0 / (w0.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
-    w1 = w1 / (w1.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
-    w2 = w2 / (w2.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
+    # gated-delta: decay (forget) the old state, add the update, cap each row norm to its init norm
+    d0, d1, d2 = decay
+    n0, n1, n2 = init_norms
+    w0 = d0 * w0 + w0_grad
+    w1 = d1 * w1 + w1_grad
+    w2 = d2 * w2 + w2_grad
+    w0 = w0 / (w0.norm(dim=1, keepdim=True) / (n0 + 1e-5)).clamp(min=1.0)
+    w1 = w1 / (w1.norm(dim=1, keepdim=True) / (n1 + 1e-5)).clamp(min=1.0)
+    w2 = w2 / (w2.norm(dim=1, keepdim=True) / (n2 + 1e-5)).clamp(min=1.0)
     return w0, w1, w2
+
+
+def _sinusoid_embed(vals, dim):
+    """vals: (...,) scalars -> (..., dim) parameter-free sinusoidal embedding."""
+    half = max(dim // 2, 1)
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=vals.device).float() / half)
+    ang = vals.float().unsqueeze(-1) * freqs
+    return torch.cat([ang.sin(), ang.cos()], dim=-1)
 
 
 class VideoMemoryLayer(nn.Module):
@@ -207,8 +225,14 @@ class VideoMemoryLayer(nn.Module):
         qk_norm: bool = True,      # RMSNorm on head_dim (on for AR stability; Scal3R default False)
         use_modulation: bool = True,
         g_init: float = 0.0,       # 0.0 -> inert warm start (identical to baseline at step 0; Scal3R: 0.1)
+        use_decay: bool = False,   # gated-delta forgetting in weight_norm_update (else renorm-to-init)
+        decay_init: float = 0.95,  # initial forget gate value = sigmoid(decay_logit); 1.0 = no forgetting
+        bounded_gate: bool = False,  # tanh-bound the output gate (kills the unbounded fixed-RMS injection)
+        single_norm: bool = False,   # read-path hygiene: drop the redundant o_norm so proj sees the raw
+                                     # read magnitude (relevance-coupled injection); keep only AdaLN a_norm
         detach_state: Optional[bool] = None,  # None -> detach in eval, keep graph in train
         checkpoint_write: bool = False,  # gradient-checkpoint the write update
+        gate_extra: Optional[Sequence[str]] = None,  # extra gate inputs (off=[]): "agreement","denoising_step","frames_since_switch"
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -219,8 +243,15 @@ class VideoMemoryLayer(nn.Module):
         self.head_dim = dim // num_heads
         self.muon_update_steps = muon_update_steps
         self.use_modulation = use_modulation
+        self.use_decay = use_decay
+        self.bounded_gate = bounded_gate
+        self.single_norm = single_norm
         self.detach_state = detach_state
         self.checkpoint_write = checkpoint_write
+        self.gate_extra = list(gate_extra) if gate_extra else []
+        if use_decay:
+            # one learned forget gate (scalar), sigmoid(decay_logit); init to decay_init
+            self.decay_logit = nn.Parameter(torch.tensor(math.log(decay_init / (1.0 - decay_init))))
 
         # Query, Key, Value linear layers
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
@@ -233,16 +264,18 @@ class VideoMemoryLayer(nn.Module):
             # Adaptive layer normalization without affine parameters
             self.a_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
             self._init_modulation_params(dim, g_init=g_init)
+            if self.gate_extra:
+                self._build_gate_extra(dim)
 
         # TTT fast weight dimensions
         di = self.head_dim
         do = self.head_dim
         dh = self.head_dim * inter_multi
 
-        # TTT fast weight parameters initialization
-        self.w0 = nn.Parameter(torch.randn(num_heads, di, dh) * (math.sqrt(2) / math.sqrt(di)))
-        self.w1 = nn.Parameter(torch.randn(num_heads, dh, do) * (math.sqrt(2) / math.sqrt(dh)))
-        self.w2 = nn.Parameter(torch.randn(num_heads, di, dh) * (math.sqrt(2) / math.sqrt(di)))
+        # TTT fast weight parameters initialization -- LaCT/Scal3R: 1/sqrt(fan_in) (no sqrt(2) gain)
+        self.w0 = nn.Parameter(torch.randn(num_heads, di, dh) / math.sqrt(di))
+        self.w1 = nn.Parameter(torch.randn(num_heads, dh, do) / math.sqrt(dh))
+        self.w2 = nn.Parameter(torch.randn(num_heads, di, dh) / math.sqrt(di))
 
         # Learning rates for the fast weight
         self.lrs = nn.Linear(dim, num_heads * 3)
@@ -258,12 +291,53 @@ class VideoMemoryLayer(nn.Module):
             nn.init.zeros_(self.proj.bias)
             self.proj.bias[2 * dim:] = g_init  # gate bias only
 
+    # ---- optional extra gate inputs; zero-init proj so they contribute nothing until trained ----
+    GX_RANK = 64   # shared-space rank for the memory<->prompt agreement
+    GX_EMB = 16    # sinusoidal dim for scalar signals (denoising step / frames-since-switch)
+
+    def _build_gate_extra(self, dim: int):
+        extra_dim = 0
+        if "agreement" in self.gate_extra:
+            self.gx_po = nn.Linear(dim, self.GX_RANK, bias=False)  # project memory read
+            self.gx_pc = nn.Linear(dim, self.GX_RANK, bias=False)  # project prompt c (same dim)
+            extra_dim += 1                                          # the scalar a in [0,1]
+        if "denoising_step" in self.gate_extra:
+            extra_dim += self.GX_EMB
+        if "frames_since_switch" in self.gate_extra:
+            extra_dim += self.GX_EMB
+        # separate proj, added to the base proj(o_hat); zero-init so it contributes nothing at init
+        self.proj_extra = nn.Linear(extra_dim, 3 * dim, bias=False)
+        nn.init.zeros_(self.proj_extra.weight)
+
+    def _gate_extra_vec(self, o_hat, prompt_emb, frames_since_switch, denoising_step):
+        """Build the (B, L, extra_dim) feature vector fed to proj_extra."""
+        B, L, _ = o_hat.shape
+        feats = []
+        if "agreement" in self.gate_extra:
+            if prompt_emb is None:
+                raise ValueError("gate_extra 'agreement' needs prompt_emb (the text context c)")
+            c = prompt_emb.mean(dim=1)                                       # (B, dim) pooled prompt
+            a = torch.sigmoid((self.gx_po(o_hat) * self.gx_pc(c)[:, None, :]).sum(-1, keepdim=True))
+            self.dbg_agreement = a.detach().float().mean()                  # for logging (0-dim, no host sync)
+            feats.append(a.to(o_hat.dtype))                                  # (B, L, 1)
+        if "denoising_step" in self.gate_extra:
+            if denoising_step is None:
+                raise ValueError("gate_extra 'denoising_step' needs the denoising step signal (not wired yet)")
+            feats.append(_sinusoid_embed(denoising_step, self.GX_EMB).to(o_hat.dtype))
+        if "frames_since_switch" in self.gate_extra:
+            if frames_since_switch is None:
+                raise ValueError("gate_extra 'frames_since_switch' needs the frames-since-switch signal (not wired yet)")
+            feats.append(_sinusoid_embed(frames_since_switch, self.GX_EMB).to(o_hat.dtype))
+        return torch.cat(feats, dim=-1)
+
     def reset_parameters(self):
         """Re-apply the memory branch's own initialization. must be called after any global
         model init (e.g. CausalWanModel.init_weights(), which xavier-inits every nn.Linear in
         the model)."""
         if self.use_modulation:
             self._init_modulation_params(self.dim, g_init=self.g_init)
+            if self.gate_extra:
+                nn.init.zeros_(self.proj_extra.weight)  # re-zero extras after global init
 
     # ---- internals ----
     def _qkv_lr(self, x):
@@ -288,12 +362,20 @@ class VideoMemoryLayer(nn.Module):
         lr0, lr1, lr2 = lr0.type_as(k), lr1.type_as(k), lr2.type_as(k)
         return q, k, v, lr0, lr1, lr2, B
 
-    def _project_output(self, x, batch_size):
-        x = self.o_norm(x)
+    def _project_output(self, x, batch_size, prompt_emb=None,
+                        frames_since_switch=None, denoising_step=None):
+        if not self.single_norm:               # default: legacy double-norm (o_norm then a_norm)
+            x = self.o_norm(x)                 # single_norm=True -> skip, let raw read magnitude reach proj
         x = rearrange(x, '(b h) l d -> b l (h d)', h=self.num_heads, b=batch_size)
         if not self.use_modulation:
             return self.proj(x)
         shift, scale, gate = self.proj(x).chunk(3, dim=-1)
+        if self.gate_extra:  # extra inputs -> added via the zero-init proj_extra (no-op at init)
+            es, esc, eg = self.proj_extra(
+                self._gate_extra_vec(x, prompt_emb, frames_since_switch, denoising_step)).chunk(3, dim=-1)
+            shift, scale, gate = shift + es, scale + esc, gate + eg
+        if self.bounded_gate:                 # tanh-bound -> no unbounded fixed-RMS injection
+            gate = torch.tanh(gate)
         return gate * (self.a_norm(x) * (1 + scale) + shift)
 
     def init_state(self, B, device, dtype):
@@ -304,9 +386,23 @@ class VideoMemoryLayer(nn.Module):
     def _detach(self):
         return (not self.training) if self.detach_state is None else self.detach_state
 
+    def _decay_and_norms(self, B):
+        """Gated-delta forget gate (scalar sigmoid) + per-row INIT norms repeated to the (B*nh) state.
+        Returns (None, None) when use_decay is off (-> weight_norm_update keeps renorm-to-init)."""
+        if not self.use_decay:
+            return None, None
+        dec = torch.sigmoid(self.decay_logit)
+        decay = (dec, dec, dec)
+        init_norms = (self.w0.detach().norm(dim=1, keepdim=True).repeat(B, 1, 1),
+                      self.w1.detach().norm(dim=1, keepdim=True).repeat(B, 1, 1),
+                      self.w2.detach().norm(dim=1, keepdim=True).repeat(B, 1, 1))
+        return decay, init_norms
+
     # ---- AR / inference / rollout: one temporal chunk per call ----
-    def step(self, x, state=None, do_update=True, allreduce_fn=None):
-        """x:(B,L,dim) for the current chunk. Returns (mem_out:(B,L,dim), new_state)."""
+    def step(self, x, state=None, do_update=True, allreduce_fn=None,
+             prompt_emb=None, frames_since_switch=None, denoising_step=None):
+        """x:(B,L,dim) for the current chunk. Returns (mem_out:(B,L,dim), new_state).
+        prompt_emb/frames_since_switch/denoising_step feed the optional gate_extra inputs."""
         q, k, v, lr0, lr1, lr2, B = self._qkv_lr(x)
         if state is None:
             state = self.init_state(B, x.device, q.dtype)
@@ -314,10 +410,12 @@ class VideoMemoryLayer(nn.Module):
         o = swiglu_apply(q, w0, w1, w2)                       # APPLY-FIRST (state from < this chunk)
         new_state = state
         if do_update:                                          # write the clean chunk
+            decay, init_norms = self._decay_and_norms(B)
             def _write(k, v, w0, w1, w2, lr0, lr1, lr2):
                 g0, g1, g2 = swiglu_fast_weight_gradient(k, v, w0, w1, w2, lr0, lr1, lr2)
                 return weight_norm_update(
-                    w0, w1, w2, g0, g1, g2, self.muon_update_steps, allreduce_fn)
+                    w0, w1, w2, g0, g1, g2, self.muon_update_steps, allreduce_fn,
+                    decay=decay, init_norms=init_norms)
             if self.checkpoint_write and torch.is_grad_enabled():
                 w0n, w1n, w2n = checkpoint(_write, k, v, w0, w1, w2, lr0, lr1, lr2,
                                            use_reentrant=False)
@@ -326,13 +424,20 @@ class VideoMemoryLayer(nn.Module):
             if self._detach():
                 w0n, w1n, w2n = w0n.detach(), w1n.detach(), w2n.detach()
             new_state = (w0n, w1n, w2n)
-        return self._project_output(o, B), new_state
+        out = self._project_output(o, B, prompt_emb=prompt_emb,
+                                   frames_since_switch=frames_since_switch,
+                                   denoising_step=denoising_step)
+        # lightweight diagnostics (0-dim tensors -> no host sync here; .item() at log time)
+        self.dbg_read_rms = o.detach().float().pow(2).mean().sqrt()
+        self.dbg_out_rms = out.detach().float().pow(2).mean().sqrt()
+        return out, new_state
 
     # ---- training (fully parallel over all chunks of a clip) ----
     def forward_sequence(self, x, chunks: Sequence[Tuple[int, int]], clean_mask: Sequence[bool],
                          allreduce_fn=None):
         q, k, v, lr0, lr1, lr2, B = self._qkv_lr(x)
         w0, w1, w2 = self.init_state(B, x.device, q.dtype)
+        decay, init_norms = self._decay_and_norms(B)
         o = torch.zeros_like(q)
         for c, (s, e) in enumerate(chunks):
             o[:, s:e] = swiglu_apply(q[:, s:e], w0, w1, w2)    # apply-first
@@ -340,5 +445,6 @@ class VideoMemoryLayer(nn.Module):
                 w0_grad, w1_grad, w2_grad = swiglu_fast_weight_gradient(
                     k[:, s:e], v[:, s:e], w0, w1, w2, lr0[:, s:e], lr1[:, s:e], lr2[:, s:e])
                 w0, w1, w2 = weight_norm_update(
-                    w0, w1, w2, w0_grad, w1_grad, w2_grad, self.muon_update_steps, allreduce_fn)
+                    w0, w1, w2, w0_grad, w1_grad, w2_grad, self.muon_update_steps, allreduce_fn,
+                    decay=decay, init_norms=init_norms)
         return self._project_output(o, B)

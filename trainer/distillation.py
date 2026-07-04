@@ -61,7 +61,8 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         if self.is_main_process:
-            self.writer = SummaryWriter(log_dir=config.logdir)
+            # wandb.init must come before SummaryWriter so sync_tensorboard can patch the TB writer
+            # (otherwise only wandb's auto system metrics show, not our add_scalar curves).
             if getattr(config, "use_wandb", False):
                 import wandb
                 run_name = os.path.basename(config.logdir.rstrip("/"))
@@ -74,6 +75,7 @@ class Trainer:
                     config=OmegaConf.to_container(config, resolve=True),
                     sync_tensorboard=True,
                 )
+            self.writer = SummaryWriter(log_dir=config.logdir)
 
         # use a random seed for the training
         if config.seed == 0:
@@ -282,6 +284,29 @@ class Trainer:
             if "memory" in n:
                 p.requires_grad_(True)
 
+        # Selective LoRA unfreeze: only blocks >= lora_unfreeze_from_block (which consume the memory
+        # injection) stay trainable; earlier blocks' LoRA is frozen, dropping their grad + AdamW state
+        # (frees their VRAM). None = all LoRA trainable. Critic LoRA untouched.
+        _unfreeze_from = getattr(config, "lora_unfreeze_from_block", None)
+        if _unfreeze_from is not None:
+            import re as _re
+            _frozen_blocks, _kept_blocks, _kept = set(), set(), 0
+            for n, p in self.model.generator.named_parameters():
+                if "memory" in n or not p.requires_grad:
+                    continue
+                _m = _re.search(r"blocks\.(\d+)\.", n)
+                if _m is None or int(_m.group(1)) < int(_unfreeze_from):
+                    p.requires_grad_(False)
+                    if _m is not None:
+                        _frozen_blocks.add(int(_m.group(1)))
+                else:
+                    _kept += 1
+                    _kept_blocks.add(int(_m.group(1)))
+            if self.is_main_process:
+                print(f"[selective LoRA] unfreeze from block {_unfreeze_from}: "
+                      f"froze LoRA of blocks {sorted(_frozen_blocks)}, "
+                      f"kept {_kept} trainable LoRA tensors across blocks {sorted(_kept_blocks)}")
+
         # fast weights (w0/w1/w2) are excluded from FSDP
         mem_ignored = []
         if self.world_size > 1:
@@ -311,7 +336,11 @@ class Trainer:
             self.model.fake_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.fake_score_fsdp_wrap_strategy
+            wrap_strategy=config.fake_score_fsdp_wrap_strategy,
+            # Mirrors real_score_cpu_offload; default False = unchanged behavior.
+            # The critic is trainable, so this offloads its params/grads/optim to CPU
+            # (frees ~2.6GB/rank of peak VRAM) at the cost of slower critic steps.
+            cpu_offload=getattr(config, "fake_score_cpu_offload", False)
         )
 
         self.model.text_encoder = fsdp_wrap(
@@ -1103,6 +1132,61 @@ class Trainer:
             if dist.get_rank() == 0:
                 print(f"[SeqTrain-Trainer] Training generator: generating next chunk")
 
+            # Cross-chunk truncated BPTT over K = bptt_window chunks: roll K chunks, detach the state
+            # only at the window start, sum the per-chunk losses, one backward over the window (trains
+            # the write across chunk boundaries; graph alive for one backward, freed after = no leak).
+            K_bptt = int(getattr(self.config, "bptt_window", 1))
+            if K_bptt > 1:
+                # roll K_bptt chunks: the first (K_bptt - W) under no_grad (deep state past KV-eviction,
+                # cheap), the last W with grad = the supervised tail. W=1 avoids the cross-chunk
+                # checkpoint-vs-eviction error (no backward recomputes a previous chunk). Absent -> W=K.
+                W = int(getattr(self.config, "grad_tail_W", K_bptt))
+                W = max(1, min(W, K_bptt))
+                _losses = []
+                _logs = []
+                _used = 0
+                # force a fresh sequence so the K-chunk window always starts at frame 0 (chunk 0 sets the
+                # identity anchor, the grad tail lands in the same sequence).
+                if self.id_loss_weight > 0.0:
+                    self.streaming_active = False
+                    self.start_new_sequence()
+                for _k in range(K_bptt):
+                    if _k > 0 and not self.streaming_model.can_generate_more():
+                        break
+                    _used += 1
+                    rg = (_k >= K_bptt - W)                      # grad only on the last W chunks
+                    _gc, _ci = self.streaming_model.generate_next_chunk(
+                        requires_grad=rg, detach_state=(_k == K_bptt - W))
+                    if rg:
+                        _l, _ld = self.streaming_model.compute_generator_loss(chunk=_gc, chunk_info=_ci)
+                        _losses.append(_l)
+                        _logs.append(_ld)
+                if _losses:
+                    generator_loss = sum(_losses) / len(_losses)
+                    (generator_loss / self.gradient_accumulation_steps).backward()
+                    # grad probe (first few steps): confirm read (qkv/proj) + write (lrs/decay) memory grads exist
+                    if self.step in (0, 5, 10, 15, 20, 30) and (not dist.is_initialized() or dist.get_rank() == 0):
+                        try:
+                            gn = lambda p: (float(p.grad.detach().float().norm()) if (p is not None and getattr(p, "grad", None) is not None) else -1.0)
+                            mems = [mm for mm in self.model.generator.modules() if type(mm).__name__ == "VideoMemoryLayer"]
+                            for i, m in enumerate(mems):
+                                print(f"grad probe step={self.step} mem{i} "
+                                      f"WRITE lrs={gn(m.lrs.weight):.3e} decay={gn(getattr(m,'decay_logit',None)):.3e} "
+                                      f"READ qkv={gn(m.qkv.weight):.3e} proj={gn(m.proj.weight):.3e} "
+                                      f"SEED w0={gn(m.w0):.3e}")
+                        except Exception as _e:
+                            print(f"grad probe failed: {_e}")
+                else:
+                    generator_loss = torch.tensor(0.0, device=self.device)
+                generator_log_dict = merge_dict_list(_logs) if _logs else {}
+                generator_log_dict.update({
+                    "generator_loss": generator_loss,
+                    "generator_grad_norm": torch.tensor(0.0, device=self.device),
+                    "bptt_chunks_used": torch.tensor(float(_used), device=self.device),
+                    "bptt_grad_chunks": torch.tensor(float(len(_losses)), device=self.device),
+                })
+                return generator_log_dict
+
             train_first_chunk = getattr(self.config, "train_first_chunk", False)
             if train_first_chunk:
                 # 这里的梯度mask会记录新生成的chunk
@@ -1219,6 +1303,11 @@ class Trainer:
             while True:
                 pbar.update(1)
                 pbar.set_postfix(step=self.step)
+                # Reclaim cached-but-unallocated VRAM before the step's peak (frees the
+                # ~1.6GB the caching allocator strands). Lets write-training fit on the
+                # 48GB cards by a hair. Perf-only; gated off by default.
+                if getattr(self.config, "empty_cache_each_step", False):
+                    torch.cuda.empty_cache()
                 # Check if we should train generator on this optimization step
                 TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
                 if LOG_GPU_MEMORY:
@@ -1232,7 +1321,7 @@ class Trainer:
                     if TRAIN_GENERATOR:
                         self.generator_optimizer.zero_grad(set_to_none=True)
                     self.critic_optimizer.zero_grad(set_to_none=True)
-                    
+
                     # Whole-cycle gradient accumulation loop
                     accumulated_generator_logs = []
                     accumulated_critic_logs = []
@@ -1284,10 +1373,10 @@ class Trainer:
                         print(f"[SeqTrain-Trainer] Critic training completed, grad_norm={critic_grad_norm.item()}")
                     
                     self.critic_optimizer.step()
-                    
+
                     if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
                         log_gpu_memory(f"streaming Training Step {self.step}: After optimizer steps", device=self.device, rank=dist.get_rank())
-                    
+
                     # Increase step count
                     self.step += 1
                     self._vram_profile_tick()
@@ -1365,13 +1454,21 @@ class Trainer:
                         self.writer.add_scalar("generator/generator_loss", generator_log_dict["generator_loss"].mean().item(), self.step)
                         # dmd loss norm
                         self.writer.add_scalar("generator/generator_grad_norm", generator_log_dict["generator_grad_norm"].mean().item(), self.step)
-                        # 训练时梯度回传的norm
-                        self.writer.add_scalar("generator/dmdtrain_gradient_norm", generator_log_dict["dmdtrain_gradient_norm"].mean().item(), self.step)
+                        # 训练时梯度回传的norm (absent in the windowed path)
+                        if "dmdtrain_gradient_norm" in generator_log_dict:
+                            self.writer.add_scalar("generator/dmdtrain_gradient_norm", generator_log_dict["dmdtrain_gradient_norm"].mean().item(), self.step)
                         # gan loss
                         try:
                             self.writer.add_scalar("generator/generator_cls_loss", generator_log_dict["generator_cls_loss"].mean().item(), self.step)
                         except:
                             pass
+                        # identity + temporal-variance terms
+                        for _k in ["e1_id_cos", "e1_id_loss", "e1_latent_motion", "e1_tv_loss"]:
+                            if _k in generator_log_dict:
+                                try:
+                                    self.writer.add_scalar(f"generator/{_k}", generator_log_dict[_k].mean().item(), self.step)
+                                except Exception:
+                                    pass
 
 
                     self.writer.add_scalar("critic/critic_loss", critic_log_dict["critic_loss"].mean().item(), self.step)
@@ -1492,18 +1589,63 @@ class Trainer:
         if not (do_log or do_assert) or not self.is_main_process:
             return
         try:
-            if do_log:
+            if do_log and hasattr(self, "writer"):
+                first_gate = None
+                if not hasattr(self, "_mem_init"):
+                    self._mem_init = {}   # lazy init-weight snapshots (CPU) for weight-delta proof
+                # per-layer gate bias, shift+scale bias, gate-weight norm, P_o/P_c norms, weight-deltas
                 for n, p in self.model.generator.named_parameters():
-                    if "memory" in n and n.endswith("proj.bias"):
-                        b = p.detach().float()
-                        third = b.numel() // 3
-                        gate = b[2*third:].abs().mean().item()
-                        shift_scale = b[:2*third].abs().mean().item()
-                        print(f"mem stats step={self.step} gate={gate:.3e} shift+scale={shift_scale:.3e}")
-                        if hasattr(self, "writer"):
-                            self.writer.add_scalar("memory/gate", gate, self.step)
-                            self.writer.add_scalar("memory/shift_scale", shift_scale, self.step)
-                        break
+                    if "memory" not in n:
+                        continue
+                    mm = re.search(r"blocks\.(\d+)\.", n)
+                    li = mm.group(1) if mm else "x"
+                    if n.endswith("proj.bias"):
+                        b = p.detach().float(); third = b.numel() // 3
+                        g = b[2 * third:].abs().mean().item()
+                        ss = b[:2 * third].abs().mean().item()
+                        self.writer.add_scalar(f"memory/gate_b{li}", g, self.step)
+                        self.writer.add_scalar(f"memory/shiftscale_b{li}", ss, self.step)
+                        first_gate = g if first_gate is None else first_gate
+                    elif n.endswith("proj.weight"):
+                        wt = p.detach().float(); third = wt.shape[0] // 3
+                        self.writer.add_scalar(f"memory/gatew_b{li}", wt[2 * third:].norm().item(), self.step)
+                    elif n.endswith("gx_po.weight"):   # agreement projection P_o
+                        self.writer.add_scalar(f"memory/Po_b{li}", p.detach().float().norm().item(), self.step)
+                    elif n.endswith("gx_pc.weight"):   # agreement projection P_c
+                        self.writer.add_scalar(f"memory/Pc_b{li}", p.detach().float().norm().item(), self.step)
+                    elif n.endswith("proj_extra.weight"):
+                        # gate_extra usage: proj_extra is zero-init, so per-input column-norm = how much
+                        # the gate learned to use each combo input. feature order is code-fixed:
+                        # [agreement(1), denoising_step(GX_EMB=16), frames_since_switch(16)]. Normalize the
+                        # 16-dim ones by sqrt(16) so all three are per-weight-RMS comparable.
+                        w = p.detach().float(); E = 16
+                        if w.dim() == 2 and w.shape[1] >= 1 + 2 * E:
+                            self.writer.add_scalar(f"memory/gx_agree_b{li}", w[:, 0:1].norm().item(), self.step)
+                            self.writer.add_scalar(f"memory/gx_denoise_b{li}", w[:, 1:1 + E].norm().item() / (E ** 0.5), self.step)
+                            self.writer.add_scalar(f"memory/gx_frames_b{li}", w[:, 1 + E:1 + 2 * E].norm().item() / (E ** 0.5), self.step)
+                    # weight-delta from init -> proof the read (qkv) / gate (proj) weights actually move
+                    if n.endswith("qkv.weight") or n.endswith("proj.weight"):
+                        cur = p.detach().float().cpu()
+                        if n not in self._mem_init:
+                            self._mem_init[n] = cur.clone()
+                        else:
+                            d = (cur - self._mem_init[n]).norm().item()
+                            tag = "dqkv" if "qkv" in n else "dproj"
+                            self.writer.add_scalar(f"memory/{tag}_b{li}", d, self.step)
+                # effective contribution + read magnitude + agreement score (captured in step())
+                for n, mod in self.model.generator.named_modules():
+                    if type(mod).__name__ != "VideoMemoryLayer":
+                        continue
+                    mm = re.search(r"blocks\.(\d+)\.", n)
+                    li = mm.group(1) if mm else "x"
+                    if getattr(mod, "dbg_out_rms", None) is not None:
+                        self.writer.add_scalar(f"memory/memout_b{li}", float(mod.dbg_out_rms), self.step)
+                    if getattr(mod, "dbg_read_rms", None) is not None:
+                        self.writer.add_scalar(f"memory/read_b{li}", float(mod.dbg_read_rms), self.step)
+                    if getattr(mod, "dbg_agreement", None) is not None:
+                        self.writer.add_scalar(f"memory/agree_b{li}", float(mod.dbg_agreement), self.step)
+                if first_gate is not None:
+                    print(f"mem stats step={self.step} gate(first)={first_gate:.3e}")
             pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
             ttt = getattr(pipe, "ttt_cache", None)
             if ttt is None:
@@ -1520,16 +1662,41 @@ class Trainer:
                 if st is None:
                     continue
                 found = True
-                drifts = []
+                drifts = []; d_block = 0.0
                 for w, key in zip(st, ("w0", "w1", "w2")):
                     if key in inits:
                         d = (w.detach().float() - inits[key].float()).norm().item()
-                        max_drift = max(max_drift, d)
+                        max_drift = max(max_drift, d); d_block = max(d_block, d)
                         drifts.append(f"{d:.3e}")
                     else:
                         drifts.append("n/a")
+                if do_log and hasattr(self, "writer"):
+                    self.writer.add_scalar(f"memory/drift_b{i}", d_block, self.step)
                 if do_log:
                     print(f"mem stats step={self.step} block={i} drift=({', '.join(drifts)})")
+                # state-norm / init-norm ratio: the muon=0 collapse shows as ratio << 1 (the cap
+                # never binds); muon>0 keeps it ~1 (cap binds at init). drift (dist-from-init)
+                # cannot see this. Also report mean per-column ratio (the cap acts per column).
+                sn_ratios = []
+                col_ratios = []
+                for w, key in zip(st, ("w0", "w1", "w2")):
+                    if key in inits:
+                        wf = w.detach().float(); inf = inits[key].float()
+                        sn_ratios.append(wf.norm().item() / (inf.norm().item() + 1e-9))
+                        try:
+                            cr = (wf.norm(dim=-2) / (inf.norm(dim=-2) + 1e-9)).mean().item()
+                        except Exception:
+                            cr = float("nan")
+                        col_ratios.append(cr)
+                    else:
+                        sn_ratios.append(float("nan")); col_ratios.append(float("nan"))
+                if do_log:
+                    print(f"mem stats step={self.step} block={i} "
+                          f"statenorm/init=({', '.join(f'{r:.3f}' for r in sn_ratios)}) "
+                          f"colnorm/init=({', '.join(f'{r:.3f}' for r in col_ratios)})")
+                    if hasattr(self, "writer"):
+                        self.writer.add_scalar(f"memory/statenorm_ratio_b{i}", sn_ratios[0], self.step)
+                        self.writer.add_scalar(f"memory/colnorm_ratio_b{i}", col_ratios[0], self.step)
             if not found and do_log:
                 print(f"mem stats step={self.step} ttt allocated but no state")
             if do_log and found and hasattr(self, "writer"):

@@ -133,7 +133,13 @@ class WanDiffusionWrapper(torch.nn.Module):
             use_gan=False,
             memory_layers=(5,),
             gate_init=0.1,
-            ckpt_write=False
+            ckpt_write=False,
+            gate_extra=None,
+            use_decay=False,
+            decay_init=0.95,
+            bounded_gate=False,
+            single_norm=False,
+            muon_update_steps=5
     ):
         super().__init__()
         # 修改为模型路径，方便修改
@@ -144,6 +150,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             self.model = CausalWanModel.from_pretrained(
                 model_name, local_attn_size=local_attn_size, sink_size=sink_size,
                 memory_layers=memory_layers, gate_init=gate_init, ckpt_write=ckpt_write,
+                gate_extra=gate_extra, use_decay=use_decay, decay_init=decay_init,
+                bounded_gate=bounded_gate, single_norm=single_norm, muon_update_steps=muon_update_steps,
                 low_cpu_mem_usage=False, device_map=None)
         else:
             self.model = WanModel.from_pretrained(model_name)
@@ -258,6 +266,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         new_prompt_chunk_flag=False,
         ttt_cache=None,
         ttt_update=False,
+        switch_global_frame=None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -285,6 +294,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 new_prompt_chunk_flag=new_prompt_chunk_flag,
                 ttt_cache=ttt_cache,
                 ttt_update=ttt_update,
+                switch_global_frame=switch_global_frame,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
