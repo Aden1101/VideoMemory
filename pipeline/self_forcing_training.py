@@ -102,6 +102,8 @@ class SelfForcingTrainingPipeline:
         current_start_frame: int = 0,
         requires_grad: bool = True,
         return_sim_step: bool = False,
+        keep_last_write_grad: bool = False,      # accepted for a uniform call site, unused here
+        disable_crossattn_cache: bool = False,   # this pipeline has no cross-chunk write or cache bypass
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """
         Chunk generation method tailored for sequential training
@@ -120,6 +122,8 @@ class SelfForcingTrainingPipeline:
             denoised_timestep_from: starting denoise timestep
             denoised_timestep_to: ending denoise timestep
         """
+        assert not (disable_crossattn_cache or keep_last_write_grad), \
+            "SelfForcingTrainingPipeline does not support the E1 flags (text-dropout / cross-chunk write); use dmd_switch"
         batch_size, chunk_frames, num_channels, height, width = noise.shape
 
         # fast-weight state threaded like the KV cache. Lazily allocated here,

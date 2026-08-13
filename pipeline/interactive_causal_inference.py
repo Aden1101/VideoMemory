@@ -13,6 +13,7 @@ import torch
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from pipeline.causal_inference import CausalInferencePipeline
+from wan.modules.video_memory import TTTBlockCache
 import torch.distributed as dist
 from utils.debug_option import DEBUG
 import utils.debug_option as dbg
@@ -102,6 +103,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 rope_enhance=self.rope_enhance,
                 prompt_cache=self.prompt_cache,
                 new_prompt_chunk_flag=False,
+                ttt_cache=getattr(self, "ttt_cache", None),
+                ttt_update=False,
             )
 
             # # 查看recache输出结果
@@ -196,6 +199,10 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             dtype=noise.dtype,
             device=noise.device
         )
+        # fast-weight memory state, fresh per sequence (was missing, so interactive inference ran
+        # the stock model with the memory never read or written)
+        self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
+        self._switch_global_frame = None
         if self.use_prompt_cache:  # Junction KV cache
             self._initialize_prompt_cache(
                 batch_size=batch_size,
@@ -245,6 +252,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 #     print("[MultipleSwitch] change the switch_frame fill {}".format(switch_frame_indices[segment_idx - 1]))
 
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+                self._switch_global_frame = current_start_frame
                 if DEBUG:
                     print(
                         f"[MultipleSwitch] Switch to segment {segment_idx} at frame {current_start_frame}"
@@ -304,6 +312,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         rope_enhance=self.rope_enhance,
                         prompt_cache=self.prompt_cache,
                         new_prompt_chunk_flag=new_prompt_chunk_flag,
+                        ttt_cache=self.ttt_cache,
+                        ttt_update=False,
+                        switch_global_frame=self._switch_global_frame,
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -325,6 +336,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         rope_enhance=self.rope_enhance,
                         prompt_cache=self.prompt_cache,
                         new_prompt_chunk_flag=new_prompt_chunk_flag,
+                        ttt_cache=self.ttt_cache,
+                        ttt_update=False,
+                        switch_global_frame=self._switch_global_frame,
                     )
 
             # Record output
@@ -342,6 +356,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 rope_enhance=self.rope_enhance,
                 prompt_cache=self.prompt_cache,
                 new_prompt_chunk_flag=new_prompt_chunk_flag,
+                ttt_cache=self.ttt_cache,
+                ttt_update=True,
+                switch_global_frame=self._switch_global_frame,
             )
             # Update frame pointer
             current_start_frame += current_num_frames

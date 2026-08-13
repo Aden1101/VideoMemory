@@ -1,0 +1,2 @@
+2026-07-05 21:26:25 launching e1_rerun2 on CVD 1,3,4
+2026-07-05 21:44:21 training exited code 0

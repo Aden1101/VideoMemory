@@ -1,0 +1,173 @@
+# c2_eviction: c1_cotrain + the two fixes that give the memory a JOB (2026-07-14):
+#   1. eviction_feed (model_kwargs): the memory WRITES the chunk that just fell out of the
+#      attention window (simple FIFO-delay, VideoSSM/AHN-style cache-complement) instead of
+#      the CURRENT chunk whose k/v the KV cache already holds (c1's write was redundant by
+#      construction). READ query unchanged (current chunk).
+#   2. cache_dropout_prob: with prob 0.3 a WHOLE rollout runs with the runtime sink starved
+#      to 0 frames (memory ON), so DMD directly rewards the memory for carrying the anchor
+#      the sink no longer provides (breaks the "sink already does the job" redundancy).
+# Everything else = c1_cotrain verbatim: pure DMD, all guardrails 0, 248k substrate, LoRA
+#   fully unfrozen + memory co-trained, injection-taming (rel_norm+dc_remove+bounded_gate),
+#   text_dropout 0.3.
+# Selftest (reference/runs/c2_eviction/selftest.py): defaults byte-identical (bitwise) to
+#   pre-c2; eviction lag verified = window_chunks=4 chunks; sink chunks never written.
+# WATCH: freeze (DD collapse) still the failure to catch; grad probe nonzero at steps 0/5/10;
+#   3-way eval mem-ON | mem-OFF | AF-stock every checkpoint (VBench SC+BC+DD + revisit probe).
+trainer: score_distillation
+max_iters: 2000
+log_iters: 250
+mixed_precision: true
+seed: 0
+distribution_loss: dmd_switch
+load_raw_video: false
+gradient_accumulation_steps: 1
+max_checkpoints: 3
+auto_resume: false
+logdir: /shared/ssd_14T_project/adenelmi/c2_eviction
+use_wandb: true
+wandb_project: anchor-forcing-memory
+wandb_name: c2_eviction
+ema_weight: 0.99
+ema_start_step: 200
+generator_ckpt: ckpt/base.pt
+lora_ckpt: ckpt/final.pt
+resume_step: false
+# HEALTHY 248k substrate (NOT the 8-prompt e0_dynamic8 that e4 overfit)
+data_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/ckpt/prompts/train/vidprom_filtered_extended_switch.txt
+switch_prompt_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/ckpt/prompts/train/vidprom_filtered_extended_switch.txt
+batch_size: 1
+total_batch_size: 64
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+sharding_strategy: full
+text_encoder_cpu_offload: true
+real_score_cpu_offload: true
+log_memory_stats: true
+assert_memory_drift: true
+lr: 1.0e-05
+beta1: 0.0
+beta2: 0.999
+lr_critic: 2.0e-06
+beta1_critic: 0.0
+beta2_critic: 0.999
+lr_mem: 0.0001
+lora_unfreeze_from_block: 0
+train_write: true
+text_dropout_prob: 0.3
+# ---- c2: cache-dropout co-training (prob per rollout; sink starved to 0 frames) ----
+cache_dropout_prob: 0.3
+cache_dropout_sink: 0
+# ---- objective: PURE DMD. every guardrail OFF (=> _e3_on False => no twin, no DINO decode) ----
+id_loss_weight: 0.0
+id_decode_frames: 2
+tv_loss_weight: 0.0
+tv_motion_floor: 0.0
+adv_loss_weight: 0.0
+adv_clamp_pos: 0.05
+adv_clamp_neg: 0.20
+adv_gate_sigma: 0.405
+adv_floor_frac: 0.5
+dnh_weight: 0.0
+dnh_deadband: 0.01
+act_weight: 0.0
+act_floor: 0.05
+mm_rel_weight: 0.0
+mm_ext_weight: 0.0
+motion_lag2: false
+dose_tmean_remove: false
+flick_weight: 0.0
+flick_deadband: 0.25
+# ---- horizon ----
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 240
+- 16
+- 60
+- 104
+negative_prompt: "色调艳丽，过曝，静态，\
+  细节模糊不清，字幕，风格，作\
+  品，画作，画面，静止，整体发\
+  灰，最差质量，低质量，JPEG压缩\
+  残留，丑陋的，残缺的，多余的\
+  手指，画得不好的手部，画得不\
+  好的脸部，畸形的，毁容的，形\
+  态畸形的肢体，手指融合，静止\
+  不动的画面，杂乱的背景，三条\
+  腿，背景人很多，倒着走"
+gradient_checkpointing: true
+num_frame_per_block: 3
+same_step_across_blocks: true
+num_train_timestep: 1000
+timestep_shift: 5.0
+real_name: wan_models/Wan2.1-T2V-1.3B
+fake_name: wan_models/Wan2.1-T2V-1.3B
+generator_name: wan_models/Wan2.1-T2V-1.3B
+ts_schedule: false
+denoising_loss_type: flow
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+  memory_layers:
+  - 5
+  - 16
+  - 27
+  gate_init: 0.1
+  bounded_gate: true
+  single_norm: false
+  use_decay: false
+  muon_update_steps: 5
+  ckpt_write: true
+  gate_extra: []
+  bounded_mod: true
+  rel_norm: true
+  dc_remove: true
+  mem_stream_scale: 1.0
+  ema_alpha: 0.0
+  # c2: memory writes the EVICTED chunk (FIFO-delayed by the attention window), not the current one
+  eviction_feed: true
+guidance_scale: 3.0
+global_sink: true
+slice_last_frames: 27
+rope_enhance: true
+streaming_training: true
+sink_update_ratio: 0.0
+use_prompt_cache: true
+use_decouple_dmd: false
+use_gan: false
+vis_interval: 50
+vis_ema: false
+vis_video_lengths:
+- 60
+val_batch_size: 1
+val_data_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/ckpt/prompts/train/vidprom_filtered_extended.txt
+val_switch_prompt_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/ckpt/prompts/train/vidprom_filtered_extended_switch.txt
+switch_mode: random_choice
+switch_choices:
+- 1000
+streaming_chunk_size: 21
+streaming_max_length: 300
+streaming_min_new_frame: 18
+train_first_chunk: true
+last_step_only: false
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  apply_to_critic: true
+  verbose: false
+bptt_window: 14
+bptt_window_min: 4
+grad_tail_W: 1
+train_seed_every: 4

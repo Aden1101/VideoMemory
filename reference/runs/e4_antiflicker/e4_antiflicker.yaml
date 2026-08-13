@@ -1,0 +1,177 @@
+# e4_antiflicker: e3_antifreeze + the anti-flicker CONSTRAINT STACK (Fable e4 recommendation).
+# e3_antifreeze traded freeze -> flicker+blur (mem-ON +22.7% patch-luminance temporal std, -28%
+# Laplacian sharpness vs the mem-OFF twin; DD 0.996 hollow = shimmer counted as optical-flow motion).
+# e4 closes the temporal-artifact family with a CONSTRAINT (not another guardrail):
+#   1. ema_alpha 0.25         -- causal temporal EMA low-pass on the injection (makes injected
+#                                temporal HF INEXPRESSIBLE at every spatial scale, streaming-causal so
+#                                it holds at 240f OOD; per-denoising-step buffer, reset per video,
+#                                snapshot-safe in the twin).
+#   2. motion_lag2 true       -- flicker-BLIND lag-2 motion statistic in mm_rel/mm_ext + the dose
+#                                (removes the flicker PAYER: shimmer no longer counterfeits motion).
+#                                motion_targets.json regenerated with the SAME lag-2 stat.
+#   3. dose_tmean_remove true -- per-site TEMPORAL-mean removal in the AC-dose (a static overlay /
+#                                wallpaper earns ZERO dose -> only slow, state-evolving, spatially
+#                                structured change satisfies the floor).
+#   4. flick_weight 0.5       -- latent second-temporal-difference hinge vs the twin, as a TRIPWIRE:
+#                                under the EMA it should be ~0; a rise flags slow->fast conversion.
+# New telemetry (video_memory _project_output): ampdisp_spatial (WANTED relevance coupling) vs
+# ampdisp_temporal (the flicker). e4 health = temporal small while spatial stays > 0.
+# PRE-REGISTERED: expect DD to DROP when the counterfeit motion is removed -- a DD drop with CLEAN
+# visuals is a FIX, not a regression. Most-likely clean equilibrium is inert-with-a-twitch; the seed
+# noise-floor measurement (not this dashboard) decides whether the survivor is above seed noise.
+# PRE-LAUNCH GATES: syntax; twin selftest E3_TWIN_SELFTEST=1 -> max|real-twin|=0.0 (validates the EMA
+# buffer is snapshot-safe); grad probe qkv/proj/lrs nonzero; e3_flick + ampdisp_spatial/temporal fire.
+trainer: score_distillation
+max_iters: 2000
+log_iters: 250
+mixed_precision: true
+seed: 0
+distribution_loss: dmd_switch
+load_raw_video: false
+gradient_accumulation_steps: 1
+max_checkpoints: 3
+auto_resume: false
+logdir: /shared/ssd_14T_project/adenelmi/e4_antiflicker
+use_wandb: true
+wandb_project: anchor-forcing-memory
+wandb_name: e4_antiflicker
+ema_weight: 0.99
+ema_start_step: 200
+generator_ckpt: ckpt/base.pt
+lora_ckpt: ckpt/final.pt
+resume_step: false
+data_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+switch_prompt_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+batch_size: 1
+total_batch_size: 64
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+sharding_strategy: full
+text_encoder_cpu_offload: true
+real_score_cpu_offload: true
+log_memory_stats: true
+assert_memory_drift: true
+lr: 1.0e-05
+beta1: 0.0
+beta2: 0.999
+lr_critic: 2.0e-06
+beta1_critic: 0.0
+beta2_critic: 0.999
+lr_mem: 0.0001
+lora_unfreeze_from_block: 0
+train_write: true
+text_dropout_prob: 0.3
+# ---- objective (e3 base) ----
+id_loss_weight: 0.0            # REMOVED (freeze-ally)
+id_decode_frames: 2            # kept: used by the adv term + the chunk-0 anchor
+tv_loss_weight: 0.0            # REMOVED (subsumed by mm terms)
+tv_motion_floor: 0.0
+adv_loss_weight: 0.0           # BONUS mode (clamped beat-the-twin reward) OFF: freeze-risk, not needed
+adv_clamp_pos: 0.05            # (bonus mode only)
+adv_clamp_neg: 0.20            # (bonus mode only)
+adv_gate_sigma: 0.405          # (bonus-mode gate; also logged as e3_gate diagnostics)
+adv_floor_frac: 0.5            # absolute anti-co-freeze floor fires below 0.5x stock-AF motion
+dnh_weight: 10.0               # do-no-harm hinge: relu(cos_CF - cos_ON - deadband); unbounded repair
+dnh_deadband: 0.01             # tolerated paired-cos noise (cos units)
+act_weight: 1.0                # activity floor: relu(act_floor - AC_dose); the ONLY pro-active force
+act_floor: 0.05                # provisional; CALIBRATE IN-RUN from e3_dose at step 0-20
+mm_rel_weight: 1.0             # two-sided log-motion match to the twin (blocks inject-alters-motion)
+mm_ext_weight: 1.0             # one-sided log floor vs the external stock curve (blocks co-freeze)
+# ---- e4 anti-flicker constraint stack ----
+motion_lag2: true              # flicker-blind lag-2 motion statistic (mm_rel/mm_ext); targets regenerated
+dose_tmean_remove: true        # per-site temporal-mean removal in the AC-dose (kills wallpaper payer)
+flick_weight: 0.5              # latent D2 anti-flicker hinge (tripwire under the EMA)
+flick_deadband: 0.25           # relu deadband relative to the twin's own per-site roughness
+motion_target_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e4_antiflicker/motion_targets.json
+# ---- horizon ----
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 240
+- 16
+- 60
+- 104
+negative_prompt: "色调艳丽，过曝，静态，\
+  细节模糊不清，字幕，风格，作\
+  品，画作，画面，静止，整体发\
+  灰，最差质量，低质量，JPEG压缩\
+  残留，丑陋的，残缺的，多余的\
+  手指，画得不好的手部，画得不\
+  好的脸部，畸形的，毁容的，形\
+  态畸形的肢体，手指融合，静止\
+  不动的画面，杂乱的背景，三条\
+  腿，背景人很多，倒着走"
+gradient_checkpointing: true
+num_frame_per_block: 3
+same_step_across_blocks: true
+num_train_timestep: 1000
+timestep_shift: 5.0
+real_name: wan_models/Wan2.1-T2V-1.3B
+fake_name: wan_models/Wan2.1-T2V-1.3B
+generator_name: wan_models/Wan2.1-T2V-1.3B
+ts_schedule: false
+denoising_loss_type: flow
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+  memory_layers:
+  - 5
+  - 16
+  - 27
+  gate_init: 0.01
+  bounded_gate: true
+  single_norm: false
+  use_decay: false
+  muon_update_steps: 5
+  ckpt_write: true
+  gate_extra: []
+  bounded_mod: true
+  rel_norm: true
+  dc_remove: true
+  mem_stream_scale: 1.0        # stream-RMS envelope IN-CONFIG (launcher also exports MEM_STREAM_SCALE=1.0)
+  ema_alpha: 0.25              # e4: causal temporal EMA low-pass on the injection (0=OFF byte-identical)
+guidance_scale: 3.0
+global_sink: true
+slice_last_frames: 27
+rope_enhance: true
+streaming_training: true
+sink_update_ratio: 0.0
+use_prompt_cache: true
+use_decouple_dmd: false
+use_gan: false
+vis_interval: 50
+vis_ema: false
+vis_video_lengths:
+- 60
+val_batch_size: 1
+val_data_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+val_switch_prompt_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+switch_mode: random_choice
+switch_choices:
+- 1000
+streaming_chunk_size: 21
+streaming_max_length: 300      # rollout reaches past the freeze horizon (240+ latent)
+streaming_min_new_frame: 18
+train_first_chunk: true
+last_step_only: false
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  apply_to_critic: true
+  verbose: false
+bptt_window: 14                # tail (grad) chunk lands at latent 237-255 when K=14
+bptt_window_min: 4             # K ~ U{4..14} per gen step: many horizons, W=1 VRAM
+grad_tail_W: 1                 # PROVEN footprint; W>=2 OOMs at 4x48GB (e1_rerun_crosschunk)
+train_seed_every: 4

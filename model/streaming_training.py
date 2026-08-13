@@ -89,6 +89,51 @@ class StreamingTrainingModel:
         # Differentiable temporal-variance floor (anti-freeze): hinge on adjacent-latent motion.
         self.tv_loss_weight = getattr(config, "tv_loss_weight", 0.0)
         self.tv_motion_floor = getattr(config, "tv_motion_floor", 0.0)   # latent-diff floor; 0 => inactive
+        # e3 counterfactual-advantage objective (all defaults 0/off => byte-identical baseline).
+        # Rewards the memory ONLY for beating its own motion-valid mem-OFF twin on identity:
+        #   L = -w_adv * g * clamp(cos_ON - cos_CF, -neg, +pos) + w_rel*(log m_ON - log m_CF)^2
+        #       + w_ext * relu(log(frac*m_stock) - log m_ON)^2
+        self.adv_loss_weight = getattr(config, "adv_loss_weight", 0.0)   # BONUS mode only (default OFF)
+        self.adv_clamp_pos = getattr(config, "adv_clamp_pos", 0.05)      # reward saturates here (cos units)
+        self.adv_clamp_neg = getattr(config, "adv_clamp_neg", 0.20)      # do-no-harm side stays linear 4x deeper
+        self.adv_gate_sigma = getattr(config, "adv_gate_sigma", 0.405)   # ln(1.5): log-motion validity band
+        self.adv_floor_frac = getattr(config, "adv_floor_frac", 0.5)     # ext floor fires below frac*stock motion
+        self.mm_rel_weight = getattr(config, "mm_rel_weight", 0.0)       # two-sided log-motion match to the twin
+        self.mm_ext_weight = getattr(config, "mm_ext_weight", 0.0)       # one-sided log floor vs stock-AF curve
+        # do-no-harm hinge (identity may not be WORSE than the twin; nothing pays for beating it):
+        self.dnh_weight = getattr(config, "dnh_weight", 0.0)
+        self.dnh_deadband = getattr(config, "dnh_deadband", 0.01)        # cos units of tolerated noise
+        # activity floor: the injection's causal AC-dose (real-vs-twin latent difference, global
+        # per-channel mean removed so a DC/style bias cannot satisfy it) must stay >= act_floor.
+        # relu => zero gradient once satisfied: a floor, never a maximizer.
+        self.act_weight = getattr(config, "act_weight", 0.0)
+        self.act_floor = getattr(config, "act_floor", 0.05)              # relative AC-dose target (CALIBRATE)
+        # e4 anti-flicker (all defaults reproduce e3 exactly):
+        #  - motion_lag2: use the flicker-BLIND lag-2 motion statistic in mm_rel/mm_ext + the dose,
+        #    so frame-rate shimmer no longer counterfeits motion credit (removes the flicker payer).
+        #  - dose_tmean_remove: also subtract the per-site TEMPORAL mean in the AC-dose, so a static
+        #    overlay (wallpaper) earns zero dose (escalation named in the docstring).
+        #  - flick_weight/flick_deadband: latent second-temporal-difference hinge vs the twin (tripwire).
+        self.motion_lag2 = bool(getattr(config, "motion_lag2", False))
+        self.dose_tmean_remove = bool(getattr(config, "dose_tmean_remove", False))
+        self.flick_weight = getattr(config, "flick_weight", 0.0)
+        self.flick_deadband = getattr(config, "flick_deadband", 0.25)    # relative to the twin's roughness
+        self._e3_anchor_on = (self.adv_loss_weight > 0.0 or self.dnh_weight > 0.0)
+        self._e3_on = (self._e3_anchor_on or self.act_weight > 0.0
+                       or self.mm_rel_weight > 0.0 or self.mm_ext_weight > 0.0
+                       or self.flick_weight > 0.0)
+        self._motion_targets = None                                      # {sha1(prompt)[:16]: [m_c0..], "_global": [..]}
+        _mt_path = getattr(config, "motion_target_path", None)
+        if _mt_path and self._e3_on:
+            import json as _json
+            with open(_mt_path) as _f:
+                self._motion_targets = _json.load(_f)
+            if (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[StreamingTrain-Model] e3 objective ON: w_adv={self.adv_loss_weight} "
+                      f"w_dnh={self.dnh_weight} (deadband {self.dnh_deadband}) "
+                      f"w_act={self.act_weight} (floor {self.act_floor}) "
+                      f"w_rel={self.mm_rel_weight} w_ext={self.mm_ext_weight} floor_frac={self.adv_floor_frac} "
+                      f"gate_sigma={self.adv_gate_sigma} targets={_mt_path} ({len(self._motion_targets)} keys)")
         self._dino = None                                                # lazy frozen DINOv2
         self._id_anchor = None                                           # per-sequence chunk-0 subject anchor
         if dist.get_rank() == 0:
@@ -225,6 +270,7 @@ class StreamingTrainingModel:
         chunk_start_frame: int,
         requires_grad: bool = True,
         detach_state: bool = True,
+        keep_last_write_grad: bool = False,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """
         Generate a single chunk.
@@ -249,16 +295,19 @@ class StreamingTrainingModel:
         # Get the conditional_dict to use now
         current_conditional_dict = self._get_current_conditional_dict(chunk_start_frame)
 
-        # Text-dropout: with prob text_dropout_prob, generate this chunk on null text (the DMD target
-        # + critic keep the true prompt), so the student must reproduce the subject from memory -- that
-        # gradient trains the read/write. Chunk 0 is never dropped (subject established + written first).
+        # Text-dropout: with prob text_dropout_prob generate this chunk on null text (the DMD target
+        # and critic keep the true prompt) so the student must carry the subject from memory. Chunk 0 is
+        # never dropped. The cross-attn cache holds the chunk-0 true prompt, so a dropped chunk also
+        # bypasses that cache, else the denoising passes would still attend to the true text.
+        disable_crossattn_cache = False
         if (self.text_dropout_prob > 0.0 and chunk_start_frame > 0
+                and self.state.get("previous_frames") is not None
                 and random.random() < self.text_dropout_prob):
-            # shallow copy: unconditional_dict is cached across steps (self.unconditional_dict),
-            # so never hand the cached object to generation (which may add keys e.g. initial_latent)
+            # copy: the cached null dict must not be mutated by generation (it may add initial_latent)
             current_conditional_dict = dict(self.state["conditional_info"]["unconditional_dict"])
+            disable_crossattn_cache = True
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                print(f"[StreamingTrain-Model] text-dropout: NULL text at chunk {chunk_start_frame}")
+                print(f"[StreamingTrain-Model] text-dropout: null text at chunk {chunk_start_frame}")
 
         # Prepare generation parameters
         kwargs = {
@@ -267,6 +316,8 @@ class StreamingTrainingModel:
             "current_start_frame": chunk_start_frame,
             "requires_grad": requires_grad,
             "return_sim_step": False,
+            "disable_crossattn_cache": disable_crossattn_cache,
+            "keep_last_write_grad": keep_last_write_grad,
         }
         
         # Add switching logic for DMDSwitch models
@@ -302,8 +353,11 @@ class StreamingTrainingModel:
                 if MY_VISUAL_DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                     print("[StreamingTrain-Model] switch_frame_index is {}".format(switch_frame_index))
 
+                # no switch this sequence keeps the far-future sentinel so the switch gate never fires
+                # (clear_prompt_cache zeroes switch_frame, which would spuriously trigger the gate)
+                fill_val = switch_frame_index if switch_frame_index is not None else int(1e8)
                 for block_index in range(self.inference_pipeline.num_transformer_blocks):
-                    self.inference_pipeline.prompt_cache[block_index]["switch_frame"].fill_(switch_frame_index)
+                    self.inference_pipeline.prompt_cache[block_index]["switch_frame"].fill_(fill_val)
 
         # the TTT state is carried chunk->chunk by reference, but training backwards once per chunk
         # (its graph is then freed). detach_state=True detaches the entering state so each chunk's
@@ -498,9 +552,76 @@ class StreamingTrainingModel:
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] can_generate_more: current_length={current_length}, temp_max_length={temp_max_length}, global_max_length={self.max_length}, can_generate={can_generate}")
-            
+
         return can_generate
-    def generate_next_chunk(self, requires_grad: bool = True, detach_state: bool = True) -> Tuple[torch.Tensor, Dict[str, Any]]:
+
+    # ---- counterfactual-twin machinery (e3): snapshot/restore everything one chunk mutates ----
+    def _twin_snapshot(self):
+        """Clone every piece of state a chunk generation mutates (KV / cross-attn / flow / prompt
+        caches, fast-weight state, RNG streams, switch flag) so a mem-OFF twin of the SAME chunk can
+        be generated and then fully undone. Tensor clones go to CPU to spare VRAM. Completeness is
+        validated empirically by E3_TWIN_SELFTEST=1 (twin with memory ON must equal the real chunk
+        bitwise)."""
+        import random as _pyrand
+        p = self.inference_pipeline
+        tensors = []
+
+        def _walk(obj):
+            if torch.is_tensor(obj):
+                tensors.append((obj, obj.detach().to("cpu", copy=True)))
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    _walk(v)
+            elif isinstance(obj, (list, tuple)):
+                for v in obj:
+                    _walk(v)
+
+        for c in (getattr(p, "kv_cache1", None), getattr(p, "crossattn_cache", None),
+                  getattr(p, "flow_cache", None), getattr(p, "prompt_cache", None)):
+            if c is not None:
+                _walk(c)
+        ttt = None
+        ttt_ema = None
+        ttt_fifo = None
+        if getattr(p, "ttt_cache", None):
+            # state tuples are REPLACED per write (never mutated in place) -> keeping refs suffices
+            ttt = [None if getattr(c, "state", None) is None else tuple(c.state) for c in p.ttt_cache]
+            # e4: the EMA buffers are new mutable state a chunk mutates -> snapshot them too, else the
+            # mem-OFF twin's buffer writes leak into the real rollout (breaks the counterfactual). Dict
+            # entries are REPLACED per update (never mutated in place), so a shallow dict() copy suffices.
+            ttt_ema = [dict(getattr(c, "ema", {}) or {}) for c in p.ttt_cache]
+            # c2 eviction-feed: the fifo is appended/popped per write chunk ((idx, tensor) tuples,
+            # tensors never mutated in place) -> a shallow list() copy suffices, like the EMA dicts.
+            ttt_fifo = [list(getattr(c, "fifo", []) or []) for c in p.ttt_cache]
+        return {
+            "tensors": tensors, "ttt": ttt, "ttt_ema": ttt_ema, "ttt_fifo": ttt_fifo,
+            "has_switched": self.state.get("has_switched", False),
+            "rng_cpu": torch.get_rng_state(),
+            "rng_cuda": torch.cuda.get_rng_state(self.device),
+            "rng_py": _pyrand.getstate(),
+        }
+
+    def _twin_restore(self, snap):
+        import random as _pyrand
+        p = self.inference_pipeline
+        with torch.no_grad():
+            for ref, saved in snap["tensors"]:
+                ref.copy_(saved.to(ref.device))
+        if snap["ttt"] is not None and getattr(p, "ttt_cache", None):
+            for c, s in zip(p.ttt_cache, snap["ttt"]):
+                c.state = s
+        if snap.get("ttt_ema") is not None and getattr(p, "ttt_cache", None):
+            for c, e in zip(p.ttt_cache, snap["ttt_ema"]):
+                c.ema = dict(e)   # fresh dict so later mutations do not touch the snapshot
+        if snap.get("ttt_fifo") is not None and getattr(p, "ttt_cache", None):
+            for c, f in zip(p.ttt_cache, snap["ttt_fifo"]):
+                c.fifo = list(f)  # fresh list so later appends/pops do not touch the snapshot
+        self.state["has_switched"] = snap["has_switched"]
+        torch.set_rng_state(snap["rng_cpu"])
+        torch.cuda.set_rng_state(snap["rng_cuda"], self.device)
+        _pyrand.setstate(snap["rng_py"])
+
+    def generate_next_chunk(self, requires_grad: bool = True, detach_state: bool = True, keep_last_write_grad: bool = False, make_twin: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Generate the next chunk, supporting overlap to ensure temporal continuity.
 
@@ -581,14 +702,51 @@ class StreamingTrainingModel:
             device=self.device,
             dtype=self.dtype
         )
-        
+
+        # ---- counterfactual mem-OFF twin (e3 advantage objective) ----
+        # Same pre-chunk state, same noise, same RNG stream, injection zeroed -> the ONLY difference
+        # vs the real chunk is the memory's injection during THIS chunk. Generated FIRST, then every
+        # mutated state is restored, so the real rollout below is bit-identical to a no-twin run.
+        # Selftest (mandatory before launch): E3_TWIN_SELFTEST=1 keeps the memory ON in the twin and
+        # the code below asserts twin == real, which validates snapshot completeness + RNG pairing.
+        twin_new_frames = None
+        if make_twin and self.state.get("previous_frames") is not None:
+            _selftest = os.environ.get("E3_TWIN_SELFTEST", "0") == "1"
+            _snap = self._twin_snapshot()
+            _prev_mz = os.environ.get("MEM_ZERO_ALL")
+            if not _selftest:
+                os.environ["MEM_ZERO_ALL"] = "1"
+            try:
+                with torch.no_grad():
+                    twin_new_frames, _, _ = self._generate_chunk(
+                        noise_chunk=noise_chunk,
+                        chunk_start_frame=current_length,
+                        requires_grad=False,
+                        detach_state=True,
+                        keep_last_write_grad=False,
+                    )
+                twin_new_frames = twin_new_frames.detach()
+            finally:
+                if _prev_mz is None:
+                    os.environ.pop("MEM_ZERO_ALL", None)
+                else:
+                    os.environ["MEM_ZERO_ALL"] = _prev_mz
+                self._twin_restore(_snap)
+                del _snap
+
         # Generate new frames - note chunk_start_frame should consider overlap
         generated_new_frames, denoised_timestep_from, denoised_timestep_to = self._generate_chunk(
             noise_chunk=noise_chunk,
             chunk_start_frame=current_length,
             requires_grad=requires_grad,
             detach_state=detach_state,
+            keep_last_write_grad=keep_last_write_grad,
         )
+
+        if twin_new_frames is not None and os.environ.get("E3_TWIN_SELFTEST", "0") == "1":
+            _diff = (generated_new_frames.detach() - twin_new_frames).abs().max().item()
+            print(f"[E3-TWIN-SELFTEST] rank{dist.get_rank() if dist.is_initialized() else 0} "
+                  f"max|real - twin(mem ON)| = {_diff:.3e} (MUST be 0.0)", flush=True)
 
         # Build the full chunk for loss computation
         if previous_frames is not None:
@@ -668,6 +826,7 @@ class StreamingTrainingModel:
             "current_length": self.state["current_length"],
             "gradient_mask": gradient_mask,  # Mask frames that do not require gradients for loss computation
             "overlap_frames_used": overlap_frames_to_use,
+            "twin_new_frames": twin_new_frames,  # mem-OFF counterfactual of the NEW frames (e3), or None
         }
         if (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] current_training_chunk: ({self.state['current_length'] - new_frames_to_generate} -> {self.state['current_length']})/{self.state['temp_max_length']}")
@@ -707,12 +866,14 @@ class StreamingTrainingModel:
 
     def _set_id_anchor(self, chunk):
         """Cache the chunk-0 subject identity anchor (no grad), called from the rollout on the first
-        chunk so it is populated whether a generator or a critic step rolls frame 0."""
-        if self.id_loss_weight <= 0.0:
+        chunk. Uses the HEAD frames (highest prompt fidelity, last to degrade under collapse) so the
+        anchor is a real subject; supervised chunks compare their tail frames, so id_cos=1.0 becomes a
+        genuine static-video alarm instead of a vacuous garbage-vs-garbage fixed point."""
+        if self.id_loss_weight <= 0.0 and not self._e3_anchor_on:
             return
         k = max(1, int(self.id_decode_frames))
         with torch.no_grad():
-            px = self.base_model.vae.decode_to_pixel(chunk[:, -k:, ...], use_cache=False)
+            px = self.base_model.vae.decode_to_pixel(chunk[:, :k, ...], use_cache=False)  # head, pre-collapse
             emb = self._dino_embed_pixels(px)
             self._id_anchor = F.normalize(emb.mean(0, keepdim=True), dim=-1).detach()
 
@@ -740,7 +901,9 @@ class StreamingTrainingModel:
 
         # frame-level identity: decode a few frames -> DINO -> cosine to the chunk-0 anchor, on later
         # chunks only, with grad through decode -> gate -> read -> write (anchor cached in the rollout).
-        if self.id_loss_weight > 0.0 and chunk_start_frame > 0 and self._id_anchor is not None:
+        # Skip after a real prompt switch: the anchor is the pre-switch subject, penalizing the new one.
+        if (self.id_loss_weight > 0.0 and chunk_start_frame > 0 and self._id_anchor is not None
+                and not self.state.get("has_switched", False)):
             k = max(1, int(self.id_decode_frames))
             px = self.base_model.vae.decode_to_pixel(chunk[:, -k:, ...], use_cache=False)
             emb = self._dino_embed_pixels(px)
@@ -749,6 +912,162 @@ class StreamingTrainingModel:
             log["e1_id_cos"] = cos.mean().detach()
             log["e1_id_loss"] = id_loss.detach()
         return id_loss, tv_loss, log
+
+    # ---- e3: counterfactual, motion-gated, clamped identity advantage over the mem-OFF twin ----
+    def _motion_target_index(self, chunk_start_frame):
+        """chunk_start (0, 21, 39, 57, ...) -> index (0, 1, 2, 3, ...) into the motion-target curve."""
+        if chunk_start_frame <= 0:
+            return 0
+        return (chunk_start_frame - self.chunk_size) // self.min_new_frame + 1
+
+    def _get_motion_target(self, chunk_start_frame):
+        """Per-prompt (fallback: _global) stock-AF latent-motion target for this chunk position.
+        Keys = sha1(prompt.strip())[:16]; the trainer stores the prompt in state["current_prompt"]."""
+        if self._motion_targets is None:
+            return None
+        import hashlib
+        p = self.state.get("current_prompt")
+        key = hashlib.sha1(p.strip().encode()).hexdigest()[:16] if isinstance(p, str) else None
+        curve = self._motion_targets.get(key) if key else None
+        if curve is None:
+            curve = self._motion_targets.get("_global")
+        if not curve:
+            return None
+        i = min(self._motion_target_index(chunk_start_frame), len(curve) - 1)
+        return torch.tensor(float(curve[i]), device=self.device)
+
+    def _compute_advantage_loss(self, chunk, chunk_info):
+        """e3 objective: clean + ACTIVE + do-no-harm + dynamic, via the mem-OFF counterfactual twin.
+            L = w_dnh * relu(cos_CF - cos_ON - deadband)            (do-no-harm identity hinge)
+              + w_act * relu(act_floor - D_ac)                      (activity floor: not inert)
+              + w_rel * (log m_ON - log m_CF)^2                     (motion two-sided vs twin)
+              + w_ext * relu(log(frac * m_stock) - log m_ON)^2      (anti-co-freeze vs stock curve)
+              [ - w_adv * g * clamp(cos_ON - cos_CF, -neg, +pos)    BONUS mode only, default OFF ]
+        with D_ac = RMS((c_ON - c_CF) - per-channel-mean) / RMS_ac(c_CF): the injection's causal
+        dose, DC/global-style component removed.
+        Anti-degeneracy structure (each blocked in-construction, not by tuning):
+        - The twin is no-grad and shares history + KV + noise: the ONLY differential lever is the
+          memory injection during this chunk; nothing can be earned by degrading the baseline, and
+          the paired design cancels prompt/noise variance.
+        - NOTHING pays for identity self-similarity anymore (id_loss removed, reward off): freeze has
+          no payer, and mm_rel/mm_ext punish it; a frozen chunk also zeroes the dnh hinge trivially,
+          so freeze buys nothing that neutrality does not already buy, at strictly higher mm cost.
+        - The activity floor is a RELU: zero gradient once D_ac >= act_floor -> a floor, never a
+          maximizer -> no runaway (contrast: e2_amp's rel_norm pinned a FIXED dose at every chunk;
+          here the floor only forbids ~zero dose, the envelope bounds it above, and D_ac's mean
+          removal forbids satisfying it with the resurrected DC bias).
+        - Under the box {identity not-worse, motion matched, DMD on-manifold, dose >= floor}, the
+          cheapest admissible behavior is an active-but-neutral content/detail difference: ACTIVE by
+          construction, harmless by constraint. Wallpaper (static texture watermark) is the residual
+          gaming channel -> judged at eval (visual + dcfrac), escalation = temporal-mean removal in D_ac.
+        - Decoded frames are position-randomized in the tail so the read cannot position-lock.
+        Returns (loss, log). All log keys present on every chunk (merge_dict_list keys off chunk 0)."""
+        device = chunk.device
+        _z = lambda: torch.zeros((), device=device)
+        log = {
+            "e3_adv_loss": _z(), "e3_adv_raw": _z(), "e3_gate": _z(),
+            "e3_dnh": _z(), "e3_act": _z(), "e3_dose": _z(),
+            "e3_mm_rel": _z(), "e3_mm_ext": _z(), "e3_flick": _z(),
+            "e3_cos_on": torch.ones((), device=device), "e3_cos_cf": torch.ones((), device=device),
+            "e3_motion_on": _z(), "e3_motion_cf": _z(), "e3_motion_tgt": _z(),
+            "e3_active": _z(), "e3_oom_skip": _z(),
+        }
+        twin = chunk_info.get("twin_new_frames")
+        chunk_start_frame = chunk_info["chunk_start_frame"]
+        if twin is None or chunk_start_frame <= 0 or self._id_anchor is None:
+            return _z(), log
+        eps = 1e-6
+        ov = int(chunk_info.get("overlap_frames_used", 0))
+        new_real = chunk[:, ov:]                        # newly generated frames only (grad); twin spans
+        # the same global frames and is decode-comparable (no first-frame re-encode contamination)
+        # e4: lag-2 (frame-rate-blind) motion statistic -- frame-rate alternation contributes ~0 to a
+        # lag-2 delta while smooth motion contributes fully, so the memory can no longer counterfeit
+        # motion credit with shimmer. Falls back to the e3 first-difference when the flag is off OR the
+        # chunk is too short for a lag-2 window. (motion_targets.json must be regenerated to match.)
+        if getattr(self, "motion_lag2", False) and new_real.shape[1] >= 3:
+            m_on = (new_real[:, 2:] - new_real[:, :-2]).abs().mean() * 0.5
+            with torch.no_grad():
+                m_cf = (twin[:, 2:] - twin[:, :-2]).abs().mean() * 0.5
+        else:
+            m_on = (new_real[:, 1:] - new_real[:, :-1]).abs().mean()
+            with torch.no_grad():
+                m_cf = (twin[:, 1:] - twin[:, :-1]).abs().mean()
+        m_tgt = self._get_motion_target(chunk_start_frame)
+        # (1) two-sided motion match to the twin: the injection may not change motion either way
+        mm_rel = (torch.log(m_on + eps) - torch.log(m_cf + eps)) ** 2
+        # (2) absolute anti-co-freeze floor vs the external stock-AF curve (catches a co-frozen twin)
+        if m_tgt is not None:
+            mm_ext = F.relu(torch.log(self.adv_floor_frac * m_tgt + eps) - torch.log(m_on + eps)) ** 2
+        else:
+            mm_ext = _z()
+        # (3) activity floor on the injection's causal AC-dose (be measurably non-inert)
+        d = new_real - twin                                             # [B, T, C, H, W]
+        d_ac = d - d.mean(dim=(1, 3, 4), keepdim=True)                  # remove global per-channel bias
+        with torch.no_grad():
+            cf_ac = twin - twin.mean(dim=(1, 3, 4), keepdim=True)
+            if getattr(self, "dose_tmean_remove", False):
+                cf_ac = cf_ac - cf_ac.mean(dim=1, keepdim=True)         # match the per-site temporal removal
+            cf_rms = cf_ac.float().pow(2).mean().sqrt().clamp_min(eps)
+        # e4: also remove the per-site TEMPORAL mean so a static overlay (wallpaper) earns ZERO dose;
+        # only a slow, state-evolving, spatially-structured change can satisfy the floor.
+        if getattr(self, "dose_tmean_remove", False):
+            d_ac = d_ac - d_ac.mean(dim=1, keepdim=True)                # per (B,C,H,W) site temporal mean
+        dose = d_ac.float().pow(2).mean().sqrt() / cf_rms
+        act = F.relu(self.act_floor - dose)
+        # (3b) e4 anti-flicker tripwire: penalize the per-site SECOND-temporal-difference roughness the
+        # injection adds BEYOND the mem-OFF twin. One-sided hinge, paired (real acceleration in the twin
+        # is priced in), relative to the twin's own roughness. D2 (not D1) maximizes on frame-rate
+        # alternation while smooth constant-velocity motion contributes ~0. Latent-space (covers all new
+        # frames, free); the EMA low-pass should make this structurally ~0 -> a rise flags conversion of
+        # slow injection into fast output downstream (a reportable finding), hence "tripwire" weight.
+        if self.flick_weight > 0.0 and new_real.shape[1] >= 3:
+            d2_on = new_real[:, 2:] - 2 * new_real[:, 1:-1] + new_real[:, :-2]
+            r_on = d2_on.float().pow(2).mean(dim=2).clamp_min(1e-12).sqrt()               # [B, T-2, H, W] per-site
+            with torch.no_grad():
+                d2_cf = twin[:, 2:] - 2 * twin[:, 1:-1] + twin[:, :-2]
+                r_cf = d2_cf.float().pow(2).mean(dim=2).clamp_min(1e-12).sqrt()
+                r_ref = r_cf.mean().clamp_min(eps)
+            flick = F.relu(r_on - r_cf - self.flick_deadband * r_ref).mean() / r_ref
+        else:
+            flick = _z()
+        # (4) paired identity terms on decoded frames, position-randomized in the tail
+        k = max(1, int(self.id_decode_frames))
+        span = min(6, new_real.shape[1])
+        off = int(torch.randint(0, max(1, span - k + 1), (1,)).item())
+        s0, s1 = new_real.shape[1] - off - k, new_real.shape[1] - off
+        px_on = self.base_model.vae.decode_to_pixel(new_real[:, s0:s1], use_cache=False)
+        cos_on = (self._dino_embed_pixels(px_on) * self._id_anchor).sum(-1).mean()
+        with torch.no_grad():
+            px_cf = self.base_model.vae.decode_to_pixel(twin[:, s0:s1], use_cache=False)
+            cos_cf = (self._dino_embed_pixels(px_cf) * self._id_anchor).sum(-1).mean()
+        A = cos_on - cos_cf
+        # do-no-harm hinge: fires only when the injection makes identity WORSE than mem-OFF (beyond
+        # the noise deadband); no gate needed -- under freeze it is zero, and the mm terms own freeze.
+        dnh = F.relu(-A - self.dnh_deadband)
+        # BONUS-mode clamped reward (default OFF): motion-validity gate DETACHED (never a lever)
+        with torch.no_grad():
+            ref = m_tgt if m_tgt is not None else m_cf
+            gate = torch.exp(-((torch.log(m_on.detach() + eps) - torch.log(ref + eps)) ** 2)
+                             / (2.0 * self.adv_gate_sigma ** 2))
+        adv = gate * torch.clamp(A, min=-self.adv_clamp_neg, max=self.adv_clamp_pos)
+        loss = (self.dnh_weight * dnh
+                + self.act_weight * act
+                + self.mm_rel_weight * mm_rel
+                + self.mm_ext_weight * mm_ext
+                + self.flick_weight * flick
+                + self.adv_loss_weight * (-adv))
+        log.update({
+            "e3_adv_loss": (self.adv_loss_weight * (-adv)).detach(),
+            "e3_adv_raw": A.detach(), "e3_gate": gate.detach(),
+            "e3_dnh": dnh.detach(), "e3_act": act.detach(), "e3_dose": dose.detach(),
+            "e3_mm_rel": mm_rel.detach(), "e3_mm_ext": mm_ext.detach(),
+            "e3_flick": flick.detach(),
+            "e3_cos_on": cos_on.detach(), "e3_cos_cf": cos_cf.detach(),
+            "e3_motion_on": m_on.detach(), "e3_motion_cf": m_cf.detach(),
+            "e3_motion_tgt": (m_tgt.detach() if m_tgt is not None else m_cf.detach()),
+            "e3_active": torch.ones((), device=device),
+        })
+        return loss, log
 
     def compute_generator_loss(self,
         chunk: torch.Tensor,
@@ -818,8 +1137,46 @@ class StreamingTrainingModel:
                 dmd_log_dict.update(e1_log)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
+                # keep the log keys present so merge_dict_list (keyed off chunk 0) does not raise
+                dmd_log_dict.update({
+                    "e1_latent_motion": torch.zeros((), device=self.device),
+                    "e1_tv_loss": torch.zeros((), device=self.device),
+                    "e1_id_cos": torch.ones((), device=self.device),
+                    "e1_id_loss": torch.zeros((), device=self.device),
+                })
                 if (not dist.is_initialized() or dist.get_rank() == 0):
-                    print("[StreamingTrain-Model] E1 identity/tv loss OOM -> skipped this step")
+                    print("[StreamingTrain-Model] identity/tv loss OOM, skipped this step")
+
+        ###### e3 counterfactual objective (do-no-harm + activity floor + motion match) ######
+        if self._e3_on:
+            try:
+                adv_loss, e3_log = self._compute_advantage_loss(chunk, chunk_info)
+                dmd_loss = dmd_loss + adv_loss
+                dmd_log_dict.update(e3_log)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                # keep the log keys present so merge_dict_list (keyed off chunk 0) does not raise;
+                # e3_oom_skip=1 makes silent skipping visible in wandb (e1 lesson)
+                dmd_log_dict.update({
+                    "e3_adv_loss": torch.zeros((), device=self.device),
+                    "e3_adv_raw": torch.zeros((), device=self.device),
+                    "e3_gate": torch.zeros((), device=self.device),
+                    "e3_dnh": torch.zeros((), device=self.device),
+                    "e3_act": torch.zeros((), device=self.device),
+                    "e3_dose": torch.zeros((), device=self.device),
+                    "e3_mm_rel": torch.zeros((), device=self.device),
+                    "e3_mm_ext": torch.zeros((), device=self.device),
+                    "e3_flick": torch.zeros((), device=self.device),
+                    "e3_cos_on": torch.ones((), device=self.device),
+                    "e3_cos_cf": torch.ones((), device=self.device),
+                    "e3_motion_on": torch.zeros((), device=self.device),
+                    "e3_motion_cf": torch.zeros((), device=self.device),
+                    "e3_motion_tgt": torch.zeros((), device=self.device),
+                    "e3_active": torch.zeros((), device=self.device),
+                    "e3_oom_skip": torch.ones((), device=self.device),
+                })
+                if (not dist.is_initialized() or dist.get_rank() == 0):
+                    print("[StreamingTrain-Model] e3 advantage loss OOM, skipped this chunk")
 
         ###### gan process #####
         if self.use_gan:

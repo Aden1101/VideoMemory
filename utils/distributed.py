@@ -101,6 +101,11 @@ class EMA_FSDP:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         with FSDP.summon_full_params(fsdp_module, writeback=False):
             for n, p in fsdp_module.module.named_parameters():
+                # trainable-only shadow: in full-finetune every param requires grad (no-op skip),
+                # in LoRA mode this keeps ONLY the LoRA adapters + (FSDP-ignored) memory params,
+                # so the shadow is tiny and the frozen base is never mirrored (5GB CPU saved).
+                if not p.requires_grad:
+                    continue
                 self.shadow[n] = p.detach().clone().float().cpu()
 
     @torch.no_grad()
@@ -109,6 +114,8 @@ class EMA_FSDP:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         with FSDP.summon_full_params(fsdp_module, writeback=False):
             for n, p in fsdp_module.module.named_parameters():
+                if not p.requires_grad:
+                    continue
                 self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
 
     # Optional helpers ---------------------------------------------------

@@ -1,0 +1,34 @@
+# LongLive-STOCK arm for the l1 revisit probe: memory_layers [] => no memory graft, LongLive's
+# own released lora.pt on the byte-identical base.pt = the released LongLive model under OUR
+# inference code, at its NATIVE sink_size 3 (this arm answers "what does stock LongLive do on
+# A->B->A", so it runs its own deployed config; the memon-vs-memzero causal delta is measured
+# at sink 1 like every l1 eval). lora.pt has no generator_memory and no generator_ema ->
+# use_ema: false, and the probe skips the memory-load asserts when memory_layers is empty.
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: wan_models/Wan2.1-T2V-1.3B
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+  memory_layers: []
+use_ema: false
+seed: 42
+global_sink: true
+context_noise: 0
+rope_enhance: true
+use_prompt_cache: true
+generator_ckpt: ckpt/base.pt
+lora_ckpt: /shared/ssd_14T_project/adenelmi/longlive_ckpt/models/lora.pt
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  verbose: false

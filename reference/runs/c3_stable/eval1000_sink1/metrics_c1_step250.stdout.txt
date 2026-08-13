@@ -1,0 +1,50 @@
+[metrics] arm=memon dir=/shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/c3_stable/eval1000_sink1/videos/memon -> 6 videos
+[metrics] loaded frozen DINOv2-vitb14 on cuda:0
+    0-0: lag1=0.0436 lag2=0.0702 id_cos(f0,fL)=0.659 T=957
+    1-0: lag1=0.0382 lag2=0.0609 id_cos(f0,fL)=0.548 T=957
+    2-0: lag1=0.0178 lag2=0.0308 id_cos(f0,fL)=0.894 T=957
+    3-0: lag1=0.0360 lag2=0.0587 id_cos(f0,fL)=0.753 T=957
+    4-0: lag1=0.0109 lag2=0.0182 id_cos(f0,fL)=0.655 T=957
+    5-0: lag1=0.0204 lag2=0.0334 id_cos(f0,fL)=0.525 T=957
+[metrics] arm=memzero dir=/shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/c3_stable/eval1000_sink1/videos/memzero -> 6 videos
+    0-0: lag1=0.0573 lag2=0.0889 id_cos(f0,fL)=0.602 T=957
+    1-0: lag1=0.0597 lag2=0.0950 id_cos(f0,fL)=0.535 T=957
+    2-0: lag1=0.0205 lag2=0.0349 id_cos(f0,fL)=0.842 T=957
+    3-0: lag1=0.0486 lag2=0.0760 id_cos(f0,fL)=0.546 T=957
+    4-0: lag1=0.0144 lag2=0.0242 id_cos(f0,fL)=0.493 T=957
+    5-0: lag1=0.0368 lag2=0.0594 id_cos(f0,fL)=0.572 T=957
+[metrics] arm=stock dir=/shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e3_antifreeze/heldout/videos/stockaf -> 6 videos
+    0-0: lag1=0.0643 lag2=0.0922 id_cos(f0,fL)=0.663 T=957
+    1-0: lag1=0.0769 lag2=0.1091 id_cos(f0,fL)=0.719 T=957
+    2-0: lag1=0.0192 lag2=0.0301 id_cos(f0,fL)=0.864 T=957
+    3-0: lag1=0.0859 lag2=0.1187 id_cos(f0,fL)=0.757 T=957
+    4-0: lag1=0.0193 lag2=0.0309 id_cos(f0,fL)=0.780 T=957
+    5-0: lag1=0.0506 lag2=0.0728 id_cos(f0,fL)=0.676 T=957
+============================================================================================
+c1_cotrain step-250  ::  3-way memory eval  (memon | memzero=LoRA-drift-only | AF-stock)
+============================================================================================
+pre-registered thresholds: NOISE_FLOOR(DINO cos-dist)=0.18  FREEZE_LAG=0.01  VBENCH_PARITY_TOL=0.02  DRIFT_PARITY_TOL=0.03
+
+arm         n      lag1  lag2(flkblind)     flow   id_cos(f0,fL)
+memon       6    0.0278          0.0454      n/a           0.672
+memzero     6    0.0395          0.0631      n/a           0.598
+stock       6    0.0527          0.0756      n/a           0.743
+
+VBench (aggregate; higher=better for SC/BC/DD):
+dim       memon  memzero    stock  memon-stock
+SC       0.9639   0.9581   0.9510      +0.0129
+BC       0.9592   0.9575   0.9485      +0.0107
+DD       0.7111   0.9000   0.9944      -0.2833
+
+PAIRED deltas (same seed 42, per-frame):
+  delta(memon, memzero)  DINO cos-dist = 0.2933   pixel-L2 = 0.5281   (n=6 paired)   [PRIMARY vs floor 0.18]
+      per-prompt DINO cos-dist: {'0-0': 0.4041, '1-0': 0.272, '2-0': 0.0886, '3-0': 0.2848, '4-0': 0.2468, '5-0': 0.4633}
+  delta(memzero, AF-stock) DINO cos-dist = 0.3010   pixel-L2 = 0.5417   (n=6 paired)   [pure LoRA co-train drift, attribution guard]
+
+identity-drift(memon) - drift(stock) = -0.0709   (parity=False)
+
+--------------------------------------------------------------------------------------------
+VERDICT: ACTIVE-POSITIVE (delta > floor + a VBench/drift difference vs AF-stock). FLAG FOR HUMAN EYE (ship côte-à-côte).
+--------------------------------------------------------------------------------------------
+
+[metrics] wrote /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/c3_stable/eval1000_sink1/metrics_c1_step250.json and /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/c3_stable/eval1000_sink1/metrics_c1_step250.txt

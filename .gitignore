@@ -31,7 +31,25 @@ venv/
 .claude/
 
 # --- Figures/plots and other unecessary files ---
-reference/
+# reference/ contient a la fois des ARTEFACTS lourds (videos, planches, poids, dumps) et le
+# CODE + les NOTES du projet (registre d'experiences, scripts de sondage, campagnes, plans).
+# On exclut tout par defaut, puis on re-inclut explicitement le code et les documents.
+reference/**
+!reference/**/
+!reference/**/*.py
+!reference/**/*.sh
+!reference/**/*.md
+!reference/**/*.yaml
+!reference/**/*.yml
+!reference/**/*.txt
+# les artefacts lourds restent exclus meme s'ils portent une extension re-incluse
+reference/**/*.jpg
+reference/**/*.jpeg
+reference/**/*.png
+reference/**/*.mp4
+reference/**/*.pt
+reference/**/*.npz
+reference/**/*.safetensors
 
 # --- wandb local cache ---
 wandb/

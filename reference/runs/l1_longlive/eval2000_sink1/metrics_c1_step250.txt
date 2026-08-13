@@ -1,0 +1,26 @@
+============================================================================================
+c1_cotrain step-250  ::  3-way memory eval  (memon | memzero=LoRA-drift-only | AF-stock)
+============================================================================================
+pre-registered thresholds: NOISE_FLOOR(DINO cos-dist)=0.18  FREEZE_LAG=0.01  VBENCH_PARITY_TOL=0.02  DRIFT_PARITY_TOL=0.03
+
+arm         n      lag1  lag2(flkblind)     flow   id_cos(f0,fL)
+memon       6    0.0265          0.0427      n/a           0.569
+memzero     6    0.0270          0.0422      n/a           0.690
+stock       6    0.0253          0.0407      n/a           0.710
+
+VBench (aggregate; higher=better for SC/BC/DD):
+dim       memon  memzero    stock  memon-stock
+SC       0.9701   0.9746   0.9700      +0.0001
+BC       0.9604   0.9654   0.9645      -0.0041
+DD       0.5889   0.5667   0.4889      +0.1000
+
+PAIRED deltas (same seed 42, per-frame):
+  delta(memon, memzero)  DINO cos-dist = 0.2469   pixel-L2 = 0.4944   (n=6 paired)   [PRIMARY vs floor 0.18]
+      per-prompt DINO cos-dist: {'0-0': 0.2179, '1-0': 0.2954, '2-0': 0.1586, '3-0': 0.1903, '4-0': 0.3028, '5-0': 0.3166}
+  delta(memzero, AF-stock) DINO cos-dist = 0.2654   pixel-L2 = 0.5022   (n=6 paired)   [pure LoRA co-train drift, attribution guard]
+
+identity-drift(memon) - drift(stock) = -0.1415   (parity=False)
+
+--------------------------------------------------------------------------------------------
+VERDICT: ACTIVE-POSITIVE (delta > floor + a VBench/drift difference vs AF-stock). FLAG FOR HUMAN EYE (ship côte-à-côte).
+--------------------------------------------------------------------------------------------

@@ -139,7 +139,15 @@ class WanDiffusionWrapper(torch.nn.Module):
             decay_init=0.95,
             bounded_gate=False,
             single_norm=False,
-            muon_update_steps=5
+            bounded_mod=False,
+            rel_norm=False,
+            dc_remove=False,
+            muon_update_steps=5,
+            mem_stream_scale=0.0,
+            ema_alpha=0.0,
+            eviction_feed=False,
+            mem_state_type="swiglu",   # P0: "linear_delta" = matrix-state delta-rule memory
+            mem_linear_beta=0.5
     ):
         super().__init__()
         # 修改为模型路径，方便修改
@@ -151,7 +159,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 model_name, local_attn_size=local_attn_size, sink_size=sink_size,
                 memory_layers=memory_layers, gate_init=gate_init, ckpt_write=ckpt_write,
                 gate_extra=gate_extra, use_decay=use_decay, decay_init=decay_init,
-                bounded_gate=bounded_gate, single_norm=single_norm, muon_update_steps=muon_update_steps,
+                bounded_gate=bounded_gate, single_norm=single_norm, bounded_mod=bounded_mod, rel_norm=rel_norm, dc_remove=dc_remove, muon_update_steps=muon_update_steps,
+                mem_stream_scale=mem_stream_scale, ema_alpha=ema_alpha,
+                eviction_feed=eviction_feed,
+                mem_state_type=mem_state_type, mem_linear_beta=mem_linear_beta,
                 low_cpu_mem_usage=False, device_map=None)
         else:
             self.model = WanModel.from_pretrained(model_name)

@@ -1,0 +1,109 @@
+trainer: score_distillation
+max_iters: 3000
+log_iters: 500
+mixed_precision: true
+seed: 0
+distribution_loss: dmd_switch
+load_raw_video: false
+gradient_accumulation_steps: 1
+max_checkpoints: 0
+auto_resume: false
+logdir: /shared/ssd_14T_project/adenelmi/e1_ro_5L_agreement
+use_wandb: true
+wandb_project: anchor-forcing-memory
+ema_weight: 0.99
+ema_start_step: 200
+generator_ckpt: ckpt/base.pt
+lora_ckpt: ckpt/final.pt
+resume_step: false
+data_path: ckpt/prompts/train/vidprom_filtered_extended_switch.txt
+switch_prompt_path: ckpt/prompts/train/vidprom_filtered_extended_switch.txt
+batch_size: 1
+total_batch_size: 64
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+sharding_strategy: full
+text_encoder_cpu_offload: true
+real_score_cpu_offload: true
+log_memory_stats: true
+assert_memory_drift: true
+lr: 0.0
+beta1: 0.0
+beta2: 0.999
+lr_critic: 2.0e-06
+beta1_critic: 0.0
+beta2_critic: 0.999
+lr_mem: 0.0001
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 240
+- 16
+- 60
+- 104
+negative_prompt: 色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走
+gradient_checkpointing: true
+num_frame_per_block: 3
+same_step_across_blocks: true
+num_train_timestep: 1000
+timestep_shift: 5.0
+real_name: wan_models/Wan2.1-T2V-1.3B
+fake_name: wan_models/Wan2.1-T2V-1.3B
+generator_name: wan_models/Wan2.1-T2V-1.3B
+ts_schedule: false
+denoising_loss_type: flow
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+  memory_layers:
+  - 5
+  - 11
+  - 17
+  - 23
+  - 29
+  gate_init: 0.1
+  ckpt_write: false
+  gate_extra:
+  - agreement
+guidance_scale: 3.0
+global_sink: true
+slice_last_frames: 9
+rope_enhance: true
+streaming_training: true
+sink_update_ratio: 0.0
+use_prompt_cache: true
+use_decouple_dmd: false
+use_gan: false
+vis_interval: -1
+vis_ema: false
+vis_video_lengths:
+- 60
+val_batch_size: 1
+val_data_path: ckpt/prompts/train/vidprom_filtered_extended.txt
+val_switch_prompt_path: ckpt/prompts/train/vidprom_filtered_extended_switch.txt
+switch_mode: random_choice
+switch_choices:
+- 21
+- 39
+streaming_chunk_size: 21
+streaming_max_length: 60
+streaming_min_new_frame: 18
+train_first_chunk: true
+last_step_only: false
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  apply_to_critic: true
+  verbose: false

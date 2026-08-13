@@ -1,0 +1,173 @@
+# e3_antifreeze: counterfactual do-no-harm + ACTIVITY-FLOOR objective at the freeze horizon.
+# TARGET (user, revised): mem-ON must be CLEAN + ACTIVE (measurable, not inert) + DO-NO-HARM
+# (drift <= mem-OFF within noise) + DYNAMIC (motion ~ baseline). Beating baseline = bonus only.
+# Base = e2_amp2_streamgate.yaml. Diff summary:
+#   - id_loss_weight 2.0 -> 0.0   (freeze-ally REMOVED: it paid cos(tail, anchor) unconditionally)
+#   - tv_loss 0.5/floor 0.3 -> 0  (subsumed by the two-sided motion-match, which fires AT the horizon)
+#   - NEW dnh_* (do-no-harm hinge vs the mem-OFF twin), act_* (AC-dose activity floor), mm_*
+#     (motion match twin + stock curve); adv_* reward = BONUS mode, kept OFF (freeze-risk)
+#     -> see model/streaming_training.py::_compute_advantage_loss
+#   - streaming_max_length 81 -> 300, bptt_window 4 -> 14 (+ bptt_window_min 4, K ~ U{4..14}/step)
+#     grad_tail_W stays 1 (W>=2 OOMs on 4x48GB: e1_rerun_crosschunk datum; randomized K replaces
+#     the multi-chunk tail of the earlier design at proven VRAM)
+#   - mem_stream_scale 1.0 in model_kwargs (envelope in-config, not only env; streamgate proved it)
+# PRE-LAUNCH GATES (mandatory, in order):
+#   1. precompute motion_targets.json (gen_stock_motion.sh in this dir)
+#   2. calibrate act_floor: precompute_motion_targets.py --pair_dose on the EXISTING eval1000
+#      memdc-vs-memoff same-seed pairs = the INERT dose reference; act_floor ~ 3-5x that value
+#      (keep 0.05 if the inert reference is <= 0.015)
+#   3. twin selftest on 1 GPU: E3_TWIN_SELFTEST=1, 1 step -> printed max|real-twin| MUST be 0.0
+#   4. grad probe steps {0,5,10,15,20,30}: qkv/proj/lrs grads nonzero
+#   5. wandb live from step 0; watch e3_dose (must rise to >= act_floor and PLATEAU there, not run),
+#      e3_dnh (~0 after warmup), e3_oom_skip (=0), gatemean (>0.05, unsaturated), dbg_inj_stream
+#      (0.05-0.3), e3_motion_on vs e3_motion_tgt (if systematically off >1.3x at healthy EARLY
+#      chunks, rescale the JSON by the measured constant and relaunch -- max one recalibration)
+trainer: score_distillation
+max_iters: 2000
+log_iters: 250
+mixed_precision: true
+seed: 0
+distribution_loss: dmd_switch
+load_raw_video: false
+gradient_accumulation_steps: 1
+max_checkpoints: 3
+auto_resume: false
+logdir: /shared/ssd_14T_project/adenelmi/e3_antifreeze
+use_wandb: true
+wandb_project: anchor-forcing-memory
+wandb_name: e3_antifreeze
+ema_weight: 0.99
+ema_start_step: 200
+generator_ckpt: ckpt/base.pt
+lora_ckpt: ckpt/final.pt
+resume_step: false
+data_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+switch_prompt_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+batch_size: 1
+total_batch_size: 64
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+sharding_strategy: full
+text_encoder_cpu_offload: true
+real_score_cpu_offload: true
+log_memory_stats: true
+assert_memory_drift: true
+lr: 1.0e-05
+beta1: 0.0
+beta2: 0.999
+lr_critic: 2.0e-06
+beta1_critic: 0.0
+beta2_critic: 0.999
+lr_mem: 0.0001
+lora_unfreeze_from_block: 0
+train_write: true
+text_dropout_prob: 0.3
+# ---- objective swap ----
+id_loss_weight: 0.0            # REMOVED (freeze-ally)
+id_decode_frames: 2            # kept: used by the adv term + the chunk-0 anchor
+tv_loss_weight: 0.0            # REMOVED (subsumed by mm terms)
+tv_motion_floor: 0.0
+adv_loss_weight: 0.0           # BONUS mode (clamped beat-the-twin reward) OFF: freeze-risk, not needed
+adv_clamp_pos: 0.05            # (bonus mode only)
+adv_clamp_neg: 0.20            # (bonus mode only)
+adv_gate_sigma: 0.405          # (bonus-mode gate; also logged as e3_gate diagnostics)
+adv_floor_frac: 0.5            # absolute anti-co-freeze floor fires below 0.5x stock-AF motion
+dnh_weight: 10.0               # do-no-harm hinge: relu(cos_CF - cos_ON - deadband); unbounded repair
+dnh_deadband: 0.01             # tolerated paired-cos noise (cos units)
+act_weight: 1.0                # activity floor: relu(act_floor - AC_dose); the ONLY pro-active force
+act_floor: 0.05                # provisional; pair_dose 0.976 was INVALID (compounded-rollout divergence, not inert).
+                               # CALIBRATE IN-RUN: read e3_dose at step 0-20 (near-inert init); floor should force ~10x it.
+mm_rel_weight: 1.0             # two-sided log-motion match to the twin (blocks inject-alters-motion)
+mm_ext_weight: 1.0             # one-sided log floor vs the external stock curve (blocks co-freeze)
+motion_target_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e3_antifreeze/motion_targets.json
+# ---- horizon ----
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 240
+- 16
+- 60
+- 104
+negative_prompt: "色调艳丽，过曝，静态，\
+  细节模糊不清，字幕，风格，作\
+  品，画作，画面，静止，整体发\
+  灰，最差质量，低质量，JPEG压缩\
+  残留，丑陋的，残缺的，多余的\
+  手指，画得不好的手部，画得不\
+  好的脸部，畸形的，毁容的，形\
+  态畸形的肢体，手指融合，静止\
+  不动的画面，杂乱的背景，三条\
+  腿，背景人很多，倒着走"
+gradient_checkpointing: true
+num_frame_per_block: 3
+same_step_across_blocks: true
+num_train_timestep: 1000
+timestep_shift: 5.0
+real_name: wan_models/Wan2.1-T2V-1.3B
+fake_name: wan_models/Wan2.1-T2V-1.3B
+generator_name: wan_models/Wan2.1-T2V-1.3B
+ts_schedule: false
+denoising_loss_type: flow
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+  memory_layers:
+  - 5
+  - 16
+  - 27
+  gate_init: 0.01
+  bounded_gate: true
+  single_norm: false
+  use_decay: false
+  muon_update_steps: 5
+  ckpt_write: true
+  gate_extra: []
+  bounded_mod: true
+  rel_norm: true
+  dc_remove: true
+  mem_stream_scale: 1.0        # stream-RMS envelope IN-CONFIG (launcher also exports MEM_STREAM_SCALE=1.0)
+guidance_scale: 3.0
+global_sink: true
+slice_last_frames: 27
+rope_enhance: true
+streaming_training: true
+sink_update_ratio: 0.0
+use_prompt_cache: true
+use_decouple_dmd: false
+use_gan: false
+vis_interval: 50
+vis_ema: false
+vis_video_lengths:
+- 60
+val_batch_size: 1
+val_data_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+val_switch_prompt_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+switch_mode: random_choice
+switch_choices:
+- 1000
+streaming_chunk_size: 21
+streaming_max_length: 300      # rollout reaches past the freeze horizon (240+ latent)
+streaming_min_new_frame: 18
+train_first_chunk: true
+last_step_only: false
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  apply_to_critic: true
+  verbose: false
+bptt_window: 14                # tail (grad) chunk lands at latent 237-255 when K=14
+bptt_window_min: 4             # K ~ U{4..14} per gen step: many horizons, W=1 VRAM
+grad_tail_W: 1                 # PROVEN footprint; W>=2 OOMs at 4x48GB (e1_rerun_crosschunk)
+train_seed_every: 4

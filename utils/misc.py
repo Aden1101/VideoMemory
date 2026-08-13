@@ -26,8 +26,14 @@ def merge_dict_list(dict_list):
     if len(dict_list) == 1:
         return dict_list[0]
 
+    # only merge keys present in every dict (windowed/oom steps can omit some log keys)
+    common_keys = set(dict_list[0].keys())
+    for d in dict_list[1:]:
+        common_keys &= d.keys()
     merged_dict = {}
     for k, v in dict_list[0].items():
+        if k not in common_keys:
+            continue
         if isinstance(v, torch.Tensor):
             if v.ndim == 0:
                 merged_dict[k] = torch.stack([d[k] for d in dict_list], dim=0)

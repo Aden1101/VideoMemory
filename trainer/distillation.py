@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
 import logging
+import math
 import random
 import re
 from pathlib import Path
@@ -268,6 +269,14 @@ class Trainer:
                     still_missing_mem = [k for k in result.missing_keys if "memory" in k]
                     assert not still_missing_mem, f"Memory NOT loaded (would stay at init!): {still_missing_mem[:5]}"
 
+                # c3: stash the EMA shadow (crash-resume must keep the accumulated smoothing, not
+                # re-snapshot the raw resumed weights). Applied after the EMA is (re)created below.
+                if "generator_ema" in lora_checkpoint:
+                    self._resumed_ema_shadow = lora_checkpoint["generator_ema"]
+                    if self.is_main_process:
+                        print(f"Stashed EMA shadow from checkpoint: {len(self._resumed_ema_shadow)} keys "
+                              f"(applied after EMA setup)")
+
                 # Load training step
                 resume_step = getattr(config, "resume_step", True)
                 if "step" in lora_checkpoint and resume_step:
@@ -314,6 +323,13 @@ class Trainer:
                            if type(m).__name__ == "VideoMemoryLayer"]
             for m in mem_ignored:
                 m.to(device=self.device, dtype=self.dtype)
+            # memory is excluded from FSDP: sync the per-rank divergent init from rank 0 so all ranks
+            # share one memory (its grads are averaged before each optimizer step)
+            for m in mem_ignored:
+                for _p in m.parameters():
+                    dist.broadcast(_p.data, src=0)
+                for _b in m.buffers():
+                    dist.broadcast(_b.data, src=0)
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -374,13 +390,22 @@ class Trainer:
         ema_weight = config.ema_weight
         self.generator_ema = None
         if (ema_weight is not None) and (ema_weight > 0.0):
-            if self.is_lora_enabled:
+            # c3: EMA now runs in LoRA mode too, as a TRAINABLE-ONLY shadow (EMA_FSDP skips
+            # non-requires_grad params). It damps the late-training slow-mem-param ramp that
+            # drives the c2 flicker. It does NOT alter the training trajectory (a read-only CPU
+            # shadow updated after optimizer.step); eval must set use_ema:true to load it.
+            if self.is_main_process:
+                _mode = "trainable-only (LoRA)" if self.is_lora_enabled else "full"
+                print(f"Setting up {_mode} EMA with weight {ema_weight}")
+            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+            # c3: restore a stashed shadow from a resume checkpoint (keeps accumulated smoothing
+            # instead of the raw resumed weights EMA_FSDP just snapshotted).
+            _stashed = getattr(self, "_resumed_ema_shadow", None)
+            if _stashed is not None:
+                self.generator_ema.load_state_dict(_stashed)
+                self._resumed_ema_shadow = None
                 if self.is_main_process:
-                    print(f"EMA disabled in LoRA mode (LoRA provides efficient parameter updates without EMA)")
-                self.generator_ema = None
-            else:
-                print(f"Setting up EMA with weight {ema_weight}")
-                self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+                    print(f"Restored EMA shadow from resume checkpoint ({len(_stashed)} keys)")
 
         
         
@@ -400,6 +425,17 @@ class Trainer:
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
+        # c3: handles for (C) explicit mem-grad clip and (B) cosine lr schedule.
+        # mem params are FSDP-IGNORED, so generator.clip_grad_norm_() (an FSDP method) SKIPS them
+        # -> they were unclipped in c1/c2. Default max_grad_norm_mem is effectively-off (1e9).
+        self.mem_params = mem_params
+        self.max_grad_norm_mem = float(getattr(config, "max_grad_norm_mem", 1e9))
+        # per-group base lrs [LoRA, (mem)]; the cosine multiplier is applied to these each step.
+        self._base_lrs = [g["lr"] for g in self.generator_optimizer.param_groups]
+        # lr_decay_start defaults BEYOND max_iters => schedule never fires => lr constant (byte-identical).
+        self._lr_decay_start = int(getattr(config, "lr_decay_start", 10**9))
+        self._lr_floor_frac = float(getattr(config, "lr_floor_frac", 1.0))       # LoRA group floor
+        self._lr_mem_floor_frac = float(getattr(config, "lr_mem_floor_frac", 1.0))  # mem group floor
 
         self.critic_optimizer = torch.optim.AdamW(
             [param for param in self.model.fake_score.parameters()
@@ -746,9 +782,10 @@ class Trainer:
                 raise ValueError("switch_choices is empty")
             else:
                 if max_length is not None:
-                    switch_choices = [choice for choice in switch_choices if choice < max_length]
-                    if len(switch_choices) == 0:
-                        raise ValueError(f"No valid switch choices available (all choices >= max_length {max_length})")
+                    valid = [choice for choice in switch_choices if choice < max_length]
+                    # all choices beyond the video = deliberate no-switch (plain-long): keep the
+                    # out-of-range sentinel so _should_switch_prompt never fires, instead of crashing
+                    switch_choices = valid if valid else [max(switch_choices)]
                 
                 if dist.get_rank() == 0:
                     switch_idx = random.choice(switch_choices)
@@ -780,6 +817,10 @@ class Trainer:
             }
             if gen_memory_sd:
                 state_dict["generator_memory"] = gen_memory_sd
+            # c3: persist the trainable-only EMA shadow so eval (use_ema) and crash-resume can
+            # recover it. Without this the LoRA-EMA mechanism leaves nothing on disk.
+            if self.generator_ema is not None:
+                state_dict["generator_ema"] = self.generator_ema.state_dict()
         else:
             with FSDP.state_dict_type(
                 self.model.generator,
@@ -1090,7 +1131,9 @@ class Trainer:
             gt_pairs=gt_pairs,
             mismatch_pairs=mismatch_pairs
         )
-        
+        # e3: the model needs the prompt text to key the per-prompt stock-AF motion-target curve
+        self.streaming_model.state["current_prompt"] = text_prompts[0] if text_prompts else None
+
         self.streaming_active = True
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -1136,6 +1179,19 @@ class Trainer:
             # only at the window start, sum the per-chunk losses, one backward over the window (trains
             # the write across chunk boundaries; graph alive for one backward, freed after = no leak).
             K_bptt = int(getattr(self.config, "bptt_window", 1))
+            # e3: per-step random horizon K ~ U{bptt_window_min .. bptt_window} so the single grad
+            # chunk (W=1) supervises MANY horizons up to the freeze horizon, at proven W=1 VRAM.
+            # Rank-synced: FSDP collectives require every rank to run the same number of forwards.
+            K_min = int(getattr(self.config, "bptt_window_min", K_bptt))
+            if K_bptt > K_min:
+                if not dist.is_initialized():
+                    K_bptt = int(torch.randint(K_min, K_bptt + 1, (1,)).item())
+                else:
+                    _K = torch.tensor(
+                        int(torch.randint(K_min, K_bptt + 1, (1,)).item()) if dist.get_rank() == 0 else 0,
+                        device=self.device, dtype=torch.int32)
+                    dist.broadcast(_K, src=0)
+                    K_bptt = int(_K.item())
             if K_bptt > 1:
                 # roll K_bptt chunks: the first (K_bptt - W) under no_grad (deep state past KV-eviction,
                 # cheap), the last W with grad = the supervised tail. W=1 avoids the cross-chunk
@@ -1147,23 +1203,56 @@ class Trainer:
                 _used = 0
                 # force a fresh sequence so the K-chunk window always starts at frame 0 (chunk 0 sets the
                 # identity anchor, the grad tail lands in the same sequence).
-                if self.id_loss_weight > 0.0:
+                # seed step: every train_seed_every steps also put chunk 0 in-graph so the fast-weight
+                # seed w0/w1/w2 (only reachable via init_state at chunk 0) receives gradient.
+                _seed_every = int(getattr(self.config, "train_seed_every", 0))
+                _gen_idx = self.step // max(1, int(getattr(self.config, "dfake_gen_update_ratio", 1)))
+                seed_step = _seed_every > 0 and (_gen_idx % _seed_every == 0)   # every N-th generator step
+                _e3_on = any(float(getattr(self.config, _k, 0.0)) > 0.0
+                             for _k in ("adv_loss_weight", "dnh_weight", "act_weight", "flick_weight"))
+                if getattr(self.config, "id_loss_weight", 0.0) > 0.0 or _e3_on or seed_step:
                     self.streaming_active = False
                     self.start_new_sequence()
+                # seed steps also grad chunk 0 -> more grad chunks; normalize each per-chunk backward so
+                # the total gradient equals the normal path's mean(losses)/gas
+                _n_grad = W + (1 if (seed_step and K_bptt - W > 0) else 0)
                 for _k in range(K_bptt):
                     if _k > 0 and not self.streaming_model.can_generate_more():
                         break
                     _used += 1
-                    rg = (_k >= K_bptt - W)                      # grad only on the last W chunks
+                    rg = (_k >= K_bptt - W) or (seed_step and _k == 0)   # +chunk 0 on seed steps
+                    # e3: build the mem-OFF counterfactual twin only for the LAST (grad-tail) chunk
+                    _mk_twin = (rg and _k == K_bptt - 1 and _e3_on)
                     _gc, _ci = self.streaming_model.generate_next_chunk(
-                        requires_grad=rg, detach_state=(_k == K_bptt - W))
+                        requires_grad=rg, detach_state=(_k == K_bptt - W),
+                        keep_last_write_grad=(rg and _k < K_bptt - 1 and _k + 1 > K_bptt - W),
+                        make_twin=_mk_twin)
                     if rg:
                         _l, _ld = self.streaming_model.compute_generator_loss(chunk=_gc, chunk_info=_ci)
-                        _losses.append(_l)
                         _logs.append(_ld)
+                        if seed_step:   # per-chunk backward; sever the KV-cache grad link between chunks
+                            _snap = self._snapshot_ttt_state()
+                            torch.cuda.empty_cache()   # e4: reclaim the ~800MB reserved-but-unallocated cache
+                                                       # at the post-forward low-water mark, BEFORE chunk-0's
+                                                       # backward peak (seed step only ~1/20). Fits the 4-GPU budget.
+                            try:
+                                (_l / (self.gradient_accumulation_steps * _n_grad)).backward()
+                            finally:
+                                self._restore_ttt_state(_snap)
+                            self.streaming_model._clear_cache_gradients()
+                            del _snap
+                            torch.cuda.empty_cache()
+                            _losses.append(_l.detach())
+                        else:
+                            _losses.append(_l)
                 if _losses:
                     generator_loss = sum(_losses) / len(_losses)
-                    (generator_loss / self.gradient_accumulation_steps).backward()
+                    if not seed_step:                             # normal step: one backward over the window
+                        _ttt_snap = self._snapshot_ttt_state()
+                        try:
+                            (generator_loss / self.gradient_accumulation_steps).backward()
+                        finally:
+                            self._restore_ttt_state(_ttt_snap)
                     # grad probe (first few steps): confirm read (qkv/proj) + write (lrs/decay) memory grads exist
                     if self.step in (0, 5, 10, 15, 20, 30) and (not dist.is_initialized() or dist.get_rank() == 0):
                         try:
@@ -1217,10 +1306,11 @@ class Trainer:
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[DEBUG] Scaled generator loss: {scaled_generator_loss.item()}")
 
+            _ttt_snap = self._snapshot_ttt_state()
             try:
                 scaled_generator_loss.backward()
-            except RuntimeError as e:
-                raise
+            finally:
+                self._restore_ttt_state(_ttt_snap)
 
             generator_log_dict.update({
                 "generator_loss": generator_loss,
@@ -1295,6 +1385,28 @@ class Trainer:
                 dist.barrier()
             os._exit(0)
 
+    def _clip_mem_grads(self):
+        """c3 (C): explicit grad clip on the FSDP-IGNORED memory params. The generator FSDP
+        clip_grad_norm_ does NOT cover them. Called after the mem-grad hand-allreduce and before
+        the optimizer step. Default max_grad_norm_mem ~1e9 => no-op (byte-identical)."""
+        if getattr(self, "mem_params", None) and self.max_grad_norm_mem < 1e8:
+            torch.nn.utils.clip_grad_norm_(self.mem_params, self.max_grad_norm_mem)
+
+    def _lr_sched_step(self):
+        """c3 (B): cosine lr decay for both generator groups (LoRA + mem) from lr_decay_start to
+        max_iters, each to its own floor fraction. lr_decay_start defaults beyond max_iters =>
+        never fires => lr stays at its base value (byte-identical)."""
+        s0 = self._lr_decay_start
+        if self.step < s0:
+            return
+        T = self.config.max_iters
+        prog = min(1.0, (self.step - s0) / max(1, T - s0))
+        cos = 0.5 * (1.0 + math.cos(math.pi * prog))           # 1 -> 0 over [s0, T]
+        fracs = [self._lr_floor_frac, self._lr_mem_floor_frac]  # [LoRA, mem]; mem group is index 1
+        for i, (g, base) in enumerate(zip(self.generator_optimizer.param_groups, self._base_lrs)):
+            fl = fracs[i] if i < len(fracs) else fracs[-1]
+            g["lr"] = base * (fl + (1.0 - fl) * cos)
+
     def train(self):
         start_step = self.step
         pbar_total = max(0, self.config.max_iters - self.step)
@@ -1317,6 +1429,13 @@ class Trainer:
                     print(f"[Debug] Step {self.step}: switch_mode={getattr(self.config,'switch_mode','fixed')}")
 
                 if self.streaming_training:
+                    # c3 (D): push the global step to the rollout pipeline so it can anneal
+                    # cache_dropout_prob (no-op when the anneal window is off). The pipeline is the
+                    # StreamingSwitchTrainingPipeline reached via streaming_model.inference_pipeline;
+                    # its clear_kv_cache() -> _maybe_cache_dropout() reads this step.
+                    _ip = getattr(self.streaming_model, "inference_pipeline", None)
+                    if _ip is not None and hasattr(_ip, "set_train_step"):
+                        _ip.set_train_step(self.step)
                     # Zero-out all optimizer gradients
                     if TRAIN_GENERATOR:
                         self.generator_optimizer.zero_grad(set_to_none=True)
@@ -1351,6 +1470,11 @@ class Trainer:
                     
                     # Compute grad norm and update parameters
                     if TRAIN_GENERATOR:
+                        if self.world_size > 1:
+                            # memory is FSDP-ignored (replicated): average its grads across ranks by hand
+                            for _n, _p in self.model.generator.named_parameters():
+                                if "memory" in _n and _p.grad is not None:
+                                    dist.all_reduce(_p.grad, op=dist.ReduceOp.AVG)
                         generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
                         generator_log_dict["generator_grad_norm"] = generator_grad_norm
@@ -1358,7 +1482,9 @@ class Trainer:
                         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                             print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={generator_grad_norm.item()}")
 
+                        self._clip_mem_grads()                 # c3 (C): clip FSDP-ignored mem grads
                         self.generator_optimizer.step()
+                        self._lr_sched_step()                  # c3 (B): cosine lr decay (no-op pre-decay_start)
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                         self._log_memory_stats()
@@ -1412,11 +1538,18 @@ class Trainer:
                     
                     # Compute grad norm and update parameters
                     if TRAIN_GENERATOR:
+                        if self.world_size > 1:
+                            # memory is FSDP-ignored (replicated): average its grads across ranks by hand
+                            for _n, _p in self.model.generator.named_parameters():
+                                if "memory" in _n and _p.grad is not None:
+                                    dist.all_reduce(_p.grad, op=dist.ReduceOp.AVG)
                         generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
                         generator_log_dict["generator_grad_norm"] = generator_grad_norm
-                        
+
+                        self._clip_mem_grads()                 # c3 (C): clip FSDP-ignored mem grads
                         self.generator_optimizer.step()
+                        self._lr_sched_step()                  # c3 (B): cosine lr decay (no-op pre-decay_start)
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -1431,16 +1564,13 @@ class Trainer:
                     # Increment the step since we finished gradient update
                     self.step += 1
 
-                # Create EMA params (if not already created)
+                # Create EMA params (if not already created). c3: also in LoRA mode (trainable-only).
                 if (self.step >= self.config.ema_start_step) and \
                         (self.generator_ema is None) and (self.config.ema_weight > 0):
-                    if not self.is_lora_enabled:
-                        self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
-                        if self.is_main_process:
-                            print(f"EMA created at step {self.step} with weight {self.config.ema_weight}")
-                    else:
-                        if self.is_main_process:
-                            print(f"EMA creation skipped at step {self.step} (disabled in LoRA mode)")
+                    self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+                    if self.is_main_process:
+                        _mode = "trainable-only (LoRA)" if self.is_lora_enabled else "full"
+                        print(f"{_mode} EMA created at step {self.step} with weight {self.config.ema_weight}")
 
                 # Save the model
                 if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
@@ -1467,6 +1597,15 @@ class Trainer:
                             if _k in generator_log_dict:
                                 try:
                                     self.writer.add_scalar(f"generator/{_k}", generator_log_dict[_k].mean().item(), self.step)
+                                except Exception:
+                                    pass
+                        # e3 counterfactual-objective terms (dose/dnh/motion-match) -- logged every
+                        # generator step so act_floor is calibratable and mm_ext/motion is observable
+                        for _k, _v in generator_log_dict.items():
+                            if _k.startswith("e3_"):
+                                try:
+                                    _val = _v.mean().item() if hasattr(_v, "mean") else float(_v)
+                                    self.writer.add_scalar(f"e3/{_k}", _val, self.step)
                                 except Exception:
                                     pass
 
@@ -1507,11 +1646,11 @@ class Trainer:
             pbar.close()
         
         except Exception as e:
-            if self.is_main_process:
-                print(f"[ERROR] Training crashed at step {self.step} with exception: {e}")
-                print(f"[ERROR] Exception traceback:", flush=True)
-                import traceback
-                traceback.print_exc()
+            _rk = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[ERROR] rank {_rk} training crashed at step {self.step}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
 
 
     def _configure_lora_for_model(self, transformer, model_name):
@@ -1642,6 +1781,18 @@ class Trainer:
                         self.writer.add_scalar(f"memory/memout_b{li}", float(mod.dbg_out_rms), self.step)
                     if getattr(mod, "dbg_read_rms", None) is not None:
                         self.writer.add_scalar(f"memory/read_b{li}", float(mod.dbg_read_rms), self.step)
+                    if getattr(mod, "dbg_dc_frac", None) is not None:
+                        self.writer.add_scalar(f"memory/dcfrac_b{li}", float(mod.dbg_dc_frac), self.step)
+                    if getattr(mod, "dbg_amp_disp", None) is not None:
+                        self.writer.add_scalar(f"memory/ampdisp_b{li}", float(mod.dbg_amp_disp), self.step)
+                    if getattr(mod, "dbg_ampdisp_spatial", None) is not None:
+                        self.writer.add_scalar(f"memory/ampdisp_spatial_b{li}", float(mod.dbg_ampdisp_spatial), self.step)
+                    if getattr(mod, "dbg_ampdisp_temporal", None) is not None:
+                        self.writer.add_scalar(f"memory/ampdisp_temporal_b{li}", float(mod.dbg_ampdisp_temporal), self.step)
+                    if getattr(mod, "dbg_gate_mean", None) is not None:
+                        self.writer.add_scalar(f"memory/gatemean_b{li}", float(mod.dbg_gate_mean), self.step)
+                    if getattr(mod, "dbg_inj_stream", None) is not None:
+                        self.writer.add_scalar(f"memory/injstream_b{li}", float(mod.dbg_inj_stream), self.step)
                     if getattr(mod, "dbg_agreement", None) is not None:
                         self.writer.add_scalar(f"memory/agree_b{li}", float(mod.dbg_agreement), self.step)
                 if first_gate is not None:
@@ -1652,9 +1803,14 @@ class Trainer:
                 if do_log:
                     print(f"mem stats step={self.step} no ttt_cache")
                 return
-            inits = {n.rsplit(".", 1)[-1]: p.detach()
-                     for n, p in self.model.generator.named_parameters()
-                     if "memory" in n and n.rsplit(".", 1)[-1] in ("w0", "w1", "w2")}
+            import re as _re
+            inits = {}
+            for _n, _p in self.model.generator.named_parameters():
+                _key = _n.rsplit(".", 1)[-1]
+                if "memory" not in _n or _key not in ("w0", "w1", "w2"):
+                    continue
+                _mb = _re.search(r"blocks\.(\d+)\.", _n)
+                inits.setdefault(int(_mb.group(1)) if _mb else -1, {})[_key] = _p.detach()
             found = False
             max_drift = 0.0
             for i, blk in enumerate(ttt):
@@ -1662,10 +1818,11 @@ class Trainer:
                 if st is None:
                     continue
                 found = True
+                blk_inits = inits.get(i, {})
                 drifts = []; d_block = 0.0
                 for w, key in zip(st, ("w0", "w1", "w2")):
-                    if key in inits:
-                        d = (w.detach().float() - inits[key].float()).norm().item()
+                    if key in blk_inits:
+                        d = (w.detach().float() - blk_inits[key].float()).norm().item()
                         max_drift = max(max_drift, d); d_block = max(d_block, d)
                         drifts.append(f"{d:.3e}")
                     else:
@@ -1680,8 +1837,8 @@ class Trainer:
                 sn_ratios = []
                 col_ratios = []
                 for w, key in zip(st, ("w0", "w1", "w2")):
-                    if key in inits:
-                        wf = w.detach().float(); inf = inits[key].float()
+                    if key in blk_inits:
+                        wf = w.detach().float(); inf = blk_inits[key].float()
                         sn_ratios.append(wf.norm().item() / (inf.norm().item() + 1e-9))
                         try:
                             cr = (wf.norm(dim=-2) / (inf.norm(dim=-2) + 1e-9)).mean().item()
@@ -1708,6 +1865,42 @@ class Trainer:
             raise
         except Exception as e:  # never let logging kill a training run
             print(f"mem stats logging failed: {e}")
+
+    def _snapshot_ttt_state(self):
+        # the fast-weight state is mutated inside the gradient-checkpointed block, so backward-time
+        # recompute re-runs the write and leaves the cache holding an earlier chunk's state. Snapshot
+        # the post-generation state before backward, restore it after. The e4 injection EMA buffer is
+        # mutated the same way (recompute rewrites ttt_cache.ema[key]), so snapshot/restore it too --
+        # else the per-chunk (seed-step) backward corrupts the EMA going into the next chunk's forward.
+        pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
+        cache = getattr(pipe, "ttt_cache", None) if pipe is not None else None
+        if not cache:
+            return None
+        return [
+            {
+                "state": (None if getattr(c, "state", None) is None
+                          else tuple(t.detach().to("cpu") for t in c.state)),
+                "ema": {k: v.detach().to("cpu") for k, v in (getattr(c, "ema", {}) or {}).items()},
+                # c2 eviction-feed fifo: backward recompute re-appends inside the checkpointed
+                # block, so restore the pre-backward list. Entries are (idx, tensor) tuples
+                # REPLACED per write (tensors never mutated in place) -> a shallow list copy
+                # of refs suffices, no device round-trip needed.
+                "fifo": list(getattr(c, "fifo", []) or []),
+            }
+            for c in cache
+        ]
+
+    def _restore_ttt_state(self, snap):
+        if snap is None:
+            return
+        pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
+        cache = getattr(pipe, "ttt_cache", None) if pipe is not None else None
+        if not cache:
+            return
+        for c, s in zip(cache, snap):
+            c.state = None if s["state"] is None else tuple(t.to(self.device) for t in s["state"])
+            c.ema = {k: v.to(self.device) for k, v in s["ema"].items()}
+            c.fifo = list(s.get("fifo", []))  # c2: undo recompute-time appends
 
     def _gather_memory_state_dict(self, fsdp_model):
         "gather the full state dict on rank 0 and keep only the memory params (full-rank, not lora)"
@@ -1758,6 +1951,14 @@ class Trainer:
             print("[Warning] No fixed validation batch available for visualization.")
             return
 
+        # c2 cache-dropout: the vis pipeline SHARES the generator modules, so force the full
+        # config sink for visualization and re-assert the training rollout's runtime sink
+        # afterwards (a dropout rollout may be mid-sequence). No-op when the flag is off.
+        _cd_pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
+        _cd_on = _cd_pipe is not None and getattr(_cd_pipe, "cache_dropout_prob", 0.0) > 0.0
+        if _cd_on:
+            _cd_pipe._set_runtime_sink(None)
+
         step_vis_dir = os.path.join(self.vis_output_dir, f"step_{self.step:07d}")
         os.makedirs(step_vis_dir, exist_ok=True)
         batch = self.fixed_vis_batch
@@ -1803,6 +2004,15 @@ class Trainer:
             del videos, video_np, video_tensor  # type: ignore
             torch.cuda.empty_cache()
 
+        # drop the persistent inference caches (kv/crossattn/ttt, ~3.4GB) so the next training
+        # step gets its VRAM back; they are re-allocated on the next _visualize call.
+        for _attr in ("kv_cache1", "crossattn_cache", "ttt_cache"):
+            if hasattr(self.vis_pipeline, _attr):
+                setattr(self.vis_pipeline, _attr, None)
         torch.cuda.empty_cache()
         import gc
         gc.collect()
+
+        # c2 cache-dropout: put the training rollout's runtime sink back (see above)
+        if _cd_on and getattr(_cd_pipe, "_cache_dropout_active", False):
+            _cd_pipe._set_runtime_sink(_cd_pipe.cache_dropout_sink)

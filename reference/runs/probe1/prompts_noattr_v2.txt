@@ -1,0 +1,65 @@
+# ============================================================================================
+# 30 PROMPTS SANS AUCUN ATTRIBUT D'APPARENCE -- les MATERIAUX v2 du sondage (mission 04/08).
+#
+# POURQUOI. Le plafond humain scelle le 05/08 dit que les 30 paires v1 sont un mauvais
+# materiau : leurs prompts DECRIVENT l'individu ("a brave firefighter clad in a red helmet and
+# reflective vest", "a little girl with curly blonde hair and a blue floral dress"), donc les
+# deux graines d'une meme paire produisent deux instances QUASI IDENTIQUES (5 paires jugees
+# indistinguables par l'oeil d'Aden, 4 seulement "legerement" differentes). Aucun instrument ne
+# peut separer ce que le texte a deja fixe. Ici le texte ne fixe RIEN de l'apparence : le nom
+# du sujet est NU, et c'est le tirage de la graine qui invente l'individu -> les deux jumeaux
+# d'une paire divergent LIBREMENT. C'est le materiau sur lequel "l'identite est-elle dans les
+# poids rapides ?" est une question qui a un sens.
+#
+# REGLE DE REDACTION (verifiee mecaniquement par selftest_probe1.T12) :
+#   un nom de sujet NU + une action + un lieu. AUCUN attribut d'apparence : pas de couleur,
+#   pas de taille, pas de vetement, pas de matiere, pas de race/variete, pas d'age.
+#   Le sujet est le PREMIER syntagme nominal (jamais un complement de lieu introductif), et sa
+#   tete appartient au vocabulaire de categories de probe1_common.HEAD_NOUNS (sinon la
+#   segmentation guidee par le texte n'a pas de requete a donner au detecteur).
+#   Categories variees : 10 personnes, 10 animaux, 6 objets, 4 vehicules.
+#
+# HELD-OUT : verifie a la lecture (collect_pairs.load_prompts_file) contre les 16 prompts de
+# sonde ET contre les ~1M lignes du corpus vidprom que l'entrainement l1 a consommees, dans les
+# DEUX directions (sous-chaine). Aucune de ces 30 lignes n'est un prompt du corpus.
+#
+# Lignes vides et '#' ignorees. L'ORDRE EST LA CLE : corpus_idx = 9000000 + rang de la ligne.
+# ============================================================================================
+
+# --- personnes (10) ---
+a firefighter walks through smoke near a fire truck
+a chef stirs a pot in a restaurant kitchen
+a worker repairs a car in a garage
+a musician plays a violin on a stage
+a farmer walks between rows of crops in a field
+a fisherman pulls a net onto a boat
+a woman pours milk into a cup behind a counter
+a skater rolls across a plaza
+a nurse walks along a hospital corridor
+a painter works at an easel in a studio
+
+# --- animaux (10) ---
+a parrot lands on a fence in a garden
+a goat climbs a slope above a valley
+a dog runs along a beach
+a cat jumps onto a counter in a kitchen
+a horse trots across a paddock
+an owl perches on a branch in a forest
+a rabbit hops across a lawn
+a monkey swings between branches in a jungle
+a swan glides across a pond in a park
+a camel walks across a dune in a desert
+
+# --- objets (6) ---
+a bottle stands on a windowsill in a kitchen
+a lamp sits on a desk in an office
+a guitar leans against a wall in a rehearsal room
+a kettle whistles on a stove in a cabin
+a suitcase sits on a platform at a train station
+an umbrella opens on a sidewalk during rain
+
+# --- vehicules (4) ---
+a scooter waits at a traffic light on a street
+a tractor crosses a field at sunrise
+a bus pulls up to a stop on a city street
+a sailboat crosses a bay

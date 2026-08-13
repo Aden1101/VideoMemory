@@ -1,0 +1,44 @@
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: wan_models/Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+  memory_layers:
+  - 5
+  - 16
+  - 27
+  gate_init: 0.0
+  gate_extra: []
+  use_decay: false
+  bounded_gate: true
+  muon_update_steps: 5
+  ckpt_write: true
+  single_norm: true
+data_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+output_folder: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e1_identity/eval/videos/ck300_memon
+inference_iter: -1
+num_output_frames: 480
+use_ema: false
+seed: 42
+num_samples: 1
+save_with_index: true
+global_sink: true
+context_noise: 0
+rope_enhance: true
+use_prompt_cache: true
+generator_ckpt: ckpt/base.pt
+lora_ckpt: /shared/ssd_14T_project/adenelmi/e1_overfit_v1/checkpoint_model_000300/model.pt
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  verbose: false

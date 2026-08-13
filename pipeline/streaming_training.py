@@ -76,6 +76,74 @@ class StreamingTrainingPipeline:
                         m.detach_state = False
             print("[train_write] ENABLED")
 
+        # c2 cache-dropout co-training: with prob cache_dropout_prob, a WHOLE rollout runs
+        # with a starved runtime sink (cache_dropout_sink frames, default 0) and the memory
+        # ON, so the memory is the only carrier of the early-video anchor. 0.0 = off
+        # (default, byte-identical: the sink attribute is never touched).
+        self.cache_dropout_prob = float(kwargs.get("cache_dropout_prob", 0.0) or 0.0)
+        self.cache_dropout_sink = int(kwargs.get("cache_dropout_sink", 0) or 0)
+        self._cache_dropout_active = False
+        # c3: linear anneal of the dropout prob from cache_dropout_prob (start) to
+        # cache_dropout_prob_end over cache_dropout_anneal_steps. When end is None or the anneal
+        # window is <= 0, the prob is CONSTANT at the start value = byte-identical to c2.
+        _cd_end = kwargs.get("cache_dropout_prob_end", None)
+        self.cache_dropout_prob_end = (float(_cd_end) if _cd_end is not None
+                                       else self.cache_dropout_prob)
+        self.cache_dropout_anneal_steps = int(kwargs.get("cache_dropout_anneal_steps", 0) or 0)
+        self._train_step = 0  # pushed by the trainer each step; drives the anneal
+        if self.cache_dropout_prob > 0.0:
+            _msg = f"[cache-dropout policy] prob={self.cache_dropout_prob} dropped_sink={self.cache_dropout_sink}"
+            if self.cache_dropout_anneal_steps > 0 and self.cache_dropout_prob_end != self.cache_dropout_prob:
+                _msg += (f" ANNEAL-> {self.cache_dropout_prob_end} over "
+                         f"{self.cache_dropout_anneal_steps} steps")
+            print(_msg)
+
+    def set_train_step(self, step):
+        """c3: the trainer pushes its global step so _maybe_cache_dropout can anneal the prob."""
+        self._train_step = int(step)
+
+    def _effective_cache_dropout_prob(self):
+        """c3: linearly interpolated dropout prob at the current train step. Constant (== start)
+        when the anneal window is <= 0 or end == start => byte-identical to c2."""
+        p0, p1, Ta = self.cache_dropout_prob, self.cache_dropout_prob_end, self.cache_dropout_anneal_steps
+        if Ta <= 0 or p1 == p0:
+            return p0
+        frac = min(1.0, max(0.0, self._train_step / Ta))
+        return p0 + (p1 - p0) * frac
+
+    def _set_runtime_sink(self, sink_size=None):
+        """c2: set the runtime attention sink on every self-attn module (None = config value)."""
+        model = self.generator.model
+        setter = getattr(model, "set_runtime_sink_size", None)
+        if callable(setter):
+            setter(sink_size)
+            return
+        for _, m in model.named_modules():  # fallback: attribute walk (FSDP-safe)
+            if hasattr(m, "_sink_runtime") and hasattr(m, "sink_size"):
+                m._sink_runtime = int(m.sink_size if sink_size is None else sink_size)
+
+    def _maybe_cache_dropout(self):
+        """c2: roll the per-rollout cache-dropout coin (rank-synced) and set the runtime sink.
+        The override stays in place for the whole rollout (all chunks AND their backwards:
+        gradient-checkpoint recompute must see the same sink the forward saw); the next
+        rollout re-decides, restoring the full sink on a no-drop draw."""
+        if self.cache_dropout_prob <= 0.0:
+            return  # default: never touches the sink -> byte-identical
+        _p = self._effective_cache_dropout_prob()   # c3: annealed (== cache_dropout_prob when no anneal)
+        if dist.is_initialized():
+            flag = torch.zeros(1, device="cuda")
+            if dist.get_rank() == 0:
+                flag.fill_(float(torch.rand(()).item() < _p))
+            dist.broadcast(flag, src=0)
+            drop = bool(flag.item())
+        else:
+            drop = bool(torch.rand(()).item() < _p)
+        self._cache_dropout_active = drop
+        self._set_runtime_sink(self.cache_dropout_sink if drop else None)
+        if drop and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[cache-dropout] rollout with runtime sink={self.cache_dropout_sink} "
+                  f"(memory must carry the anchor)", flush=True)
+
     def _write_context(self, requires_grad: bool = True):
         # Only build the write graph when this chunk will actually be backpropped.
         # On critic steps generate_chunk runs with requires_grad=False (chunk is detached,
@@ -110,6 +178,8 @@ class StreamingTrainingPipeline:
         current_start_frame: int = 0,
         requires_grad: bool = True,
         return_sim_step: bool = False,
+        keep_last_write_grad: bool = False,
+        disable_crossattn_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """
         Chunk generation method tailored for sequential training
@@ -172,6 +242,7 @@ class StreamingTrainingPipeline:
             log_gpu_memory(f"SeqTrain-Pipeline: Before block generation loop", device=noise.device, rank=dist.get_rank() if dist.is_initialized() else 0)
         
         local_start_frame = 0
+        _xattn = None if disable_crossattn_cache else self.crossattn_cache
         self.generator.model.local_attn_size = int(self.local_attn_size)
         self._set_all_modules_max_attention_size(int(self.local_attn_size))
 
@@ -209,7 +280,7 @@ class StreamingTrainingPipeline:
                             conditional_dict=conditional_dict,
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
+                            crossattn_cache=_xattn,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                             flow_cache=self.flow_cache,
                             rope_enhance=self.rope_enhance,
@@ -217,6 +288,7 @@ class StreamingTrainingPipeline:
                             new_prompt_chunk_flag=False,
                             ttt_cache=self.ttt_cache,
                             ttt_update=False,  # read only on noisy denoising passes
+                            switch_global_frame=getattr(self, "_switch_global_frame", None),
                         )
                         if self.flow_cache is not None and dist.get_rank() == 0 and MY_VISUAL_DEBUG:
                             print("[SeqTrain-Pipeline] flow_pred update, flow_pred.sum is {}".format(flow_pred.sum()))
@@ -249,7 +321,7 @@ class StreamingTrainingPipeline:
                             conditional_dict=conditional_dict,
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
+                            crossattn_cache=_xattn,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                             flow_cache=self.flow_cache,
                             rope_enhance=self.rope_enhance,
@@ -257,6 +329,7 @@ class StreamingTrainingPipeline:
                             new_prompt_chunk_flag=False,
                             ttt_cache=self.ttt_cache,
                             ttt_update=False,  # read only on noisy denoising passes
+                            switch_global_frame=getattr(self, "_switch_global_frame", None),
                         )
                         if self.flow_cache is not None and dist.get_rank() == 0 and MY_VISUAL_DEBUG:
                             print("[SeqTrain-Pipeline] flow_pred update, flow_pred.sum is {}".format(flow_pred.sum()))
@@ -278,17 +351,18 @@ class StreamingTrainingPipeline:
             if DEBUG and block_index == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Pipeline] Updating cache with context_noise={self.context_noise}")
             
-            # The last block's write is never read within the chunk and it is detached cross-chunk
-            # -> its enable_grad graph is never backpropped and never freed (+1 write-forward leaked
-            # per generator step). Run it under no_grad (never trained anyway).
-            _write_grad = requires_grad and (block_index < len(all_num_frames) - 1)
+            # The last sub-block's write is not read within the chunk, so by default it runs under
+            # no_grad (its graph would never be backpropped and would leak one write-forward per step).
+            # keep_last_write_grad overrides this when the outgoing state must carry grad into the next
+            # chunk (cross-chunk bptt window).
+            _write_grad = requires_grad and (block_index < len(all_num_frames) - 1 or keep_last_write_grad)
             with self._write_context(_write_grad):
                 self.generator(
                     noisy_image_or_video=context_noisy,
                     conditional_dict=conditional_dict,
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
+                    crossattn_cache=_xattn,
                     current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                     flow_cache=self.flow_cache,
                     rope_enhance=self.rope_enhance,
@@ -296,6 +370,7 @@ class StreamingTrainingPipeline:
                     new_prompt_chunk_flag=False,
                     ttt_cache=self.ttt_cache,
                     ttt_update=True,  # write the clean chunk into memory
+                    switch_global_frame=getattr(self, "_switch_global_frame", None),
                 )
             
             local_start_frame += current_num_frames
@@ -393,7 +468,7 @@ class StreamingTrainingPipeline:
                 blk["k"].zero_()
                 blk["v"].zero_()
                 blk["rope_start_frame"].zero_()
-                blk["switch_frame"].zero_()
+                blk["switch_frame"].fill_(int(1e8))   # far-future sentinel, matches init (no switch)
 
     def clear_kv_cache(self):
         """
@@ -414,6 +489,7 @@ class StreamingTrainingPipeline:
         # Clear the memory fast-weight state
         if getattr(self, "ttt_cache", None) is not None:
             self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
+        self._switch_global_frame = None
 
         # Clear cross-attention cache
         if getattr(self, "crossattn_cache", None) is not None:
@@ -421,6 +497,9 @@ class StreamingTrainingPipeline:
                 blk["k"].zero_()
                 blk["v"].zero_()
                 blk["is_init"] = False
+
+        # c2 cache-dropout: decide for the upcoming rollout (no-op when prob == 0.0)
+        self._maybe_cache_dropout()
 
     def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
         """

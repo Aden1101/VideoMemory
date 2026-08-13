@@ -1,0 +1,3 @@
+left  = main:10440 seed 510482
+right = twin:10440 seed 610482
+prompt: A brave firefighter, clad in a red helmet and reflective vest over dark pants and boots, shifts position to aim the hose more precisely, water jetting forcefully against the towering flames. Thick, dark smoke billows up towards a hazy, fiery sky; the intense heat causes the air to shimmer around him. Flames lick at the edges of the dense trees, casting flickering shadows across the ground. The firefighter's muscles tense with effort, sweat mixing with soot on his face. In the background, other firefighters can be seen working in the distance, their figures barely visible through the choking smoke. medium‑wide slow‑pan

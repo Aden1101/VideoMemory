@@ -1,0 +1,35 @@
+# Stock Anchor-Forcing (NO memory) generation for the e3 motion-target curves.
+# Run 3x with seed/output_folder overridden by gen_stock_motion.sh.
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: wan_models/Wan2.1-T2V-1.3B
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+data_path: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e0_reid/prompts/e0_dynamic8.txt
+output_folder: /shared/ssd_14T/home/adenelmi/Anchor-Forcing/reference/runs/e3_antifreeze/stock_videos/seed42
+inference_iter: -1
+num_output_frames: 300
+use_ema: false
+seed: 42
+num_samples: 1
+save_with_index: true
+global_sink: true
+context_noise: 0
+rope_enhance: true
+use_prompt_cache: true
+generator_ckpt: ckpt/base.pt
+lora_ckpt: ckpt/final.pt
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  verbose: false

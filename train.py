@@ -27,7 +27,10 @@ def main():
     # config_name = os.path.basename(args.config_path).split(".")[0]
     config_name = os.path.dirname(args.config_path).split("/")[-1]
     config.config_name = config_name
-    config.auto_resume = not args.no_auto_resume  # Default to True unless --no-auto-resume is specified
+    if args.no_auto_resume:
+        config.auto_resume = False
+    elif not hasattr(config, "auto_resume"):
+        config.auto_resume = True   # default on only when neither the flag nor the config say otherwise
     config.use_one_logger = not args.no_one_logger
 
     if config.trainer == "score_distillation":

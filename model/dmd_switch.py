@@ -27,4 +27,8 @@ class DMDSwitch(DMD):
             global_sink=getattr(self.args, "global_sink", False),
             rope_enhance=getattr(self.args, "rope_enhance", False),
             train_write=getattr(self.args, "train_write", False),
+            cache_dropout_prob=getattr(self.args, "cache_dropout_prob", 0.0),
+            cache_dropout_sink=getattr(self.args, "cache_dropout_sink", 0),
+            cache_dropout_prob_end=getattr(self.args, "cache_dropout_prob_end", None),
+            cache_dropout_anneal_steps=getattr(self.args, "cache_dropout_anneal_steps", 0),
         )

@@ -32,7 +32,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.global_sink = getattr(args, "global_sink", False)
+        self.global_sink = kwargs.get("global_sink", False)
 
     def generate_chunk_with_cache(
         self,
@@ -45,6 +45,8 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         switch_conditional_dict: Optional[dict] = None,
         switch_recache_frames: Optional[torch.Tensor] = None,
         return_sim_step: bool = False,
+        keep_last_write_grad: bool = False,
+        disable_crossattn_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """
         Chunk generation method tailored for sequential training with prompt switching.
@@ -84,6 +86,8 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 current_start_frame=current_start_frame,
                 requires_grad=requires_grad,
                 return_sim_step=return_sim_step,
+                keep_last_write_grad=keep_last_write_grad,
+                disable_crossattn_cache=disable_crossattn_cache,
             )
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -97,10 +101,15 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         # global frame index of the switch (for frames_since_switch). switch_frame_index is
         # relative to this chunk start; current_start_frame is the chunk's global offset.
         switch_global_frame = current_start_frame + switch_frame_index
+        # persist it so later chunks (which take the parent no-switch path) keep resetting
+        # frames_since_switch to the switch instead of to the video start
+        self._switch_global_frame = switch_global_frame
 
         # fast-weight state threaded like the KV cache.
         if getattr(self, "ttt_cache", None) is None:
             self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
+
+        _xattn = None if disable_crossattn_cache else self.crossattn_cache
 
         # Prepare output
         output = torch.zeros_like(noise)
@@ -174,7 +183,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             conditional_dict=cond_in_use,
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
+                            crossattn_cache=_xattn,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                             flow_cache=self.flow_cache,
                             rope_enhance=self.rope_enhance,
@@ -213,7 +222,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             conditional_dict=cond_in_use,
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
+                            crossattn_cache=_xattn,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                             flow_cache=self.flow_cache,
                             rope_enhance=self.rope_enhance,
@@ -247,18 +256,18 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 context_timestep.flatten(0, 1),
             ).unflatten(0, denoised_pred.shape[:2])
             
-            # The last block's write is never read within the chunk (next-block read trains the
-            # earlier writes) and it is detached cross-chunk -> its enable_grad graph is never
-            # backpropped and never freed = +1 full write-forward leaked per generator step.
-            # Run it under no_grad (it is never trained anyway).
-            _write_grad = requires_grad and (block_index < len(all_num_frames) - 1)
+            # The last sub-block's write is not read within the chunk, so by default it runs under
+            # no_grad (its graph would never be backpropped and would leak one write-forward per step).
+            # keep_last_write_grad overrides this when the outgoing state must carry grad into the next
+            # chunk (cross-chunk bptt window).
+            _write_grad = requires_grad and (block_index < len(all_num_frames) - 1 or keep_last_write_grad)
             with self._write_context(_write_grad):
                 self.generator(
                     noisy_image_or_video=context_noisy,
                     conditional_dict=cond_in_use,
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
+                    crossattn_cache=_xattn,
                     current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                     flow_cache=self.flow_cache,
                     rope_enhance=self.rope_enhance,
