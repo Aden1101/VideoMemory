@@ -2,7 +2,9 @@
 import logging
 
 import torch
-import torch.cuda.amp as amp
+# 2026-09-09 : torch.cuda.amp est a la fois specifique NVIDIA et deprecie en amont ; on passe
+# par torch.amp, dont le premier argument nomme le peripherique.
+import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -642,9 +644,11 @@ class WanVAE:
                  z_dim=16,
                  vae_pth='cache/vae_step_411000.pth',
                  dtype=torch.float,
-                 device="cuda"):
+                 device=None):
+        from utils.device import device as af_device
         self.dtype = dtype
-        self.device = device
+        self.device = af_device if device is None else device
+        self._amp_device = torch.device(self.device).type
 
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -668,14 +672,14 @@ class WanVAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
-        with amp.autocast(dtype=self.dtype):
+        with amp.autocast(self._amp_device, dtype=self.dtype):
             return [
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
 
     def decode(self, zs):
-        with amp.autocast(dtype=self.dtype):
+        with amp.autocast(self._amp_device, dtype=self.dtype):
             return [
                 self.model.decode(u.unsqueeze(0),
                                   self.scale).float().clamp_(-1, 1).squeeze(0)

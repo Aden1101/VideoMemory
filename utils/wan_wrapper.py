@@ -13,12 +13,53 @@ from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 import torch.distributed as dist
 from utils.debug_option import DEBUG, MY_VISUAL_DEBUG
+from utils.device import device as af_device, hp
+from utils import prompt_cache
+import os
 
 
 class WanTextEncoder(torch.nn.Module):
+    """Encodeur de texte, avec cache disque et chargement optionnellement paresseux.
+
+    DEUX AJOUTS (2026-09-09), tous deux inertes par defaut sur l'installation d'origine :
+
+    1. `forward` consulte d'abord le cache d'embeddings (utils/prompt_cache). Un prompt en
+       cache rend le tenseur EXACTEMENT tel qu'il avait ete produit, meme dtype, donc la
+       sortie est identique au bit pres a un run sans cache. Toujours actif : c'est un gain
+       de temps pur (l'encodage d'un prompt coute ~90 s ici), sans effet sur les resultats.
+
+    2. AF_LAZY_TEXT_ENCODER=1 differe la CONSTRUCTION des 11.4 Go jusqu'au premier prompt
+       absent du cache. Avec un cache complet, l'encodeur n'est jamais construit et la
+       memoire reste au generateur. Par defaut le drapeau est absent et le chargement reste
+       AVIDE, exactement comme avant -- la voie CUDA n'est pas touchee, y compris son
+       interaction avec DynamicSwapInstaller, qui parcourt les sous-modules a l'installation.
+    """
+
     def __init__(self) -> None:
         super().__init__()
+        self.cache_dir = os.environ.get("AF_PROMPT_CACHE") or prompt_cache.DEFAULT_DIR
+        self._lazy = os.environ.get("AF_LAZY_TEXT_ENCODER", "") == "1"
+        self.text_encoder = None
+        self._resident_device = af_device
+        # SONDE DE DTYPE. inference.py fait `pipeline = pipeline.to(dtype=torch.bfloat16)`, ce
+        # qui convertit aussi cet encodeur. En mode paresseux il n'existe pas encore a cet
+        # instant et echapperait donc a la conversion : ce tampon, lui, la subit, et nous dit
+        # dans quelle precision le pipeline veut travailler. Sans lui, le cache rendrait du
+        # float32 a un modele bfloat16 (assertion Metal, ou pire, promotion silencieuse).
+        self.register_buffer("_dtype_probe", torch.zeros((), dtype=torch.float32),
+                             persistent=False)
+        self.tokenizer = HuggingfaceTokenizer(
+            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+        if not self._lazy:
+            self._build()
 
+    def _build(self) -> None:
+        """Construit et charge les poids. Appele a l'init (defaut) ou au premier defaut de
+        cache (mode paresseux)."""
+        if self.text_encoder is not None:
+            return
+        if self._lazy and (not dist.is_initialized() or dist.get_rank() == 0):
+            print("[text_encoder] defaut de cache -> chargement des 11.4 Go", flush=True)
         self.text_encoder = umt5_xxl(
             encoder_only=True,
             return_tokenizer=False,
@@ -30,19 +71,41 @@ class WanTextEncoder(torch.nn.Module):
                        map_location='cpu', weights_only=False)
         )
         
-        # Move text encoder to GPU if available
+        # L'encodeur de texte reste sur le CPU sauf sur CUDA -- c'est la semantique D'ORIGINE
+        # (`if torch.cuda.is_available()`), et elle etait juste.
+        #
+        # 2026-09-09, correction d'une erreur que j'ai introduite le matin meme : j'avais
+        # generalise ce test en "tout accelerateur", ce qui pose les 11 Go de umT5-XXL dans le
+        # pool de l'accelerateur. Sur une carte de 48 Go c'est indolore ; sur les 17.8 Go de
+        # pool d'un Mac ca affame le generateur et le decodeur d'image tombe en OOM. C'est
+        # precisement ce que DynamicSwapInstaller est la pour eviter : il diffuse les poids
+        # depuis la RAM a chaque acces, et il ne peut rien faire si le modele y est deja.
         if torch.cuda.is_available():
             self.text_encoder = self.text_encoder.cuda()
+        # ou les poids RESIDENT reellement, pour y envoyer les entrees
+        self._resident_device = next(self.text_encoder.parameters()).device
 
-        self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
-        # Assume we are always on GPU
-        return torch.cuda.current_device()
+        """Le peripherique ou envoyer les entrees. Ce n'est PAS forcement l'accelerateur.
 
-    def forward(self, text_prompts: List[str]) -> dict:
+        Trois cas, et les confondre donne "Passed CPU tensor to MPS op" :
+          - modele pas encore construit (mode paresseux) -> l'accelerateur, par defaut ;
+          - modele enveloppe par DynamicSwapInstaller -> ses poids sont diffuses vers
+            l'accelerateur a CHAQUE acces, donc les entrees doivent y etre aussi ;
+          - sinon -> la ou le modele reside vraiment (CPU hors CUDA, depuis qu'on a retabli
+            la semantique d'origine).
+        """
+        if self.text_encoder is None:
+            return af_device
+        if "forge_backup_original_class" in self.text_encoder.__dict__:
+            return af_device
+        return self._resident_device
+
+    def encode(self, text_prompts: List[str]) -> torch.Tensor:
+        """L'encodage reel, sans cache. C'est le corps historique de `forward`."""
+        self._build()
         ids, mask = self.tokenizer(
             text_prompts, return_mask=True, add_special_tokens=True)
         ids = ids.to(self.device)
@@ -53,7 +116,24 @@ class WanTextEncoder(torch.nn.Module):
         # mask = mask.to(torch.device('cpu'))
         for u, v in zip(context, seq_lens):
             u[v:] = 0.0  # set padding to 0.0
+        return context
 
+    def forward(self, text_prompts: List[str]) -> dict:
+        """Cache d'abord, encodeur ensuite, et UNIQUEMENT pour les prompts manquants.
+
+        Les prompts absents sont encodes en un seul lot (l'encodeur travaille par lot) puis
+        ecrits au cache. Le resultat est reassemble dans l'ORDRE D'ENTREE : melanger les lignes
+        associerait un prompt au conditionnement d'un autre, une erreur qui ne leverait aucune
+        exception et fausserait toute une campagne."""
+        want = self._dtype_probe.dtype
+        cached, missing = prompt_cache.get_many(text_prompts, self.cache_dir, want)
+        if missing:
+            fresh = self.encode([text_prompts[i] for i in missing]).to(want)
+            for slot, i in enumerate(missing):
+                e = fresh[slot]
+                prompt_cache.put(text_prompts[i], e, self.cache_dir)
+                cached[i] = e
+        context = torch.stack([e.to(device=self.device, dtype=want) for e in cached], dim=0)
         return {
             "prompt_embeds": context
         }
@@ -225,7 +305,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # use higher precision for calculations
         original_dtype = flow_pred.dtype
         flow_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(flow_pred.device), [flow_pred, xt,
+            lambda x: hp(x, flow_pred.device), [flow_pred, xt,
                                                         self.scheduler.sigmas,
                                                         self.scheduler.timesteps]
         )
@@ -249,7 +329,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # use higher precision for calculations
         original_dtype = x0_pred.dtype
         x0_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(x0_pred.device), [x0_pred, xt,
+            lambda x: hp(x, x0_pred.device), [x0_pred, xt,
                                                       scheduler.sigmas,
                                                       scheduler.timesteps]
         )

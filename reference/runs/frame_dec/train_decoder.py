@@ -38,7 +38,10 @@ import random
 import sys
 import time
 
-REPO = "/shared/ssd_14T/home/adenelmi/Anchor-Forcing"
+# The cluster path stays the default, but a moved checkout (or an audit box) only needs
+# AF_REPO=/path/to/Anchor-Forcing in the environment. Added 2026-09-09 with the v2 fixes,
+# after the working tree was lost and every hardcoded /shared/... path became a wall.
+REPO = os.environ.get("AF_REPO", "/shared/ssd_14T/home/adenelmi/Anchor-Forcing")
 sys.path.insert(0, REPO)
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # house GPU rule
@@ -46,6 +49,10 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # house GPU rule
 import torch
 
 from wan.modules.video_memory import AnchorFrameDecoder
+
+sys.path.insert(0, HERE)
+from decoder_v2 import (BestTracker, EmaWeights, assert_mixer_warm_start,  # noqa: E402
+                        binom_p_two_sided, grad_match_loss, pair_discrimination)
 
 
 # ----------------------------- loss ---------------------------------------------------------
@@ -237,6 +244,29 @@ def parse_args():
                     help="v1.0 decoder ckpt to warm-start from: loads all matching weights, "
                          "new cond/FiLM params keep their zero-init (exact v1.0 function at "
                          "step 0); optimizer/scheduler fresh. Exclusive with --resume.")
+    # ---- v2 (2026-09-09): the three fixes named by the 17/08 eye board. Every default
+    # below reproduces v1 EXACTLY: sharp_w 0 => the term is not built, mixer off => no module
+    # created, ema off => no shadow, patience 0 => no early stop.
+    ap.add_argument("--mixer", action="store_true",
+                    help="v2 cause 2 (the mosaic): enable the spatial mixer on the token grid. "
+                         "Zero-init => identity at init => a v1 ckpt warm-starts bitwise.")
+    ap.add_argument("--mixer_blocks", type=int, default=2)
+    ap.add_argument("--mixer_hidden", type=int, default=768)
+    ap.add_argument("--sharp_w", type=float, default=0.0,
+                    help="v2 cause 3 (no sharpness pressure): weight of grad_match_loss, which "
+                         "MATCHES the target's spatial gradients (a maximizer would be gamed "
+                         "by noise). Both terms are 1.0 at the zero-init head, so this is a "
+                         "true ratio. Suggested first value: 0.3.")
+    ap.add_argument("--ema", action="store_true",
+                    help="v2 cause 1: keep an EMA of the weights and checkpoint it too.")
+    ap.add_argument("--ema_decay", type=float, default=0.999)
+    ap.add_argument("--patience", type=int, default=0,
+                    help="v2 cause 1: stop after N evals without a new best (0 = never stop; "
+                         "prefer a full run plus best.pt, they are not the same experiment).")
+    ap.add_argument("--select_on", default="pair", choices=["pair", "val_loss"],
+                    help="which validation quantity selects best.pt. `pair` is the board's own "
+                         "metric (right subject vs its twin); `val_loss` is the v1 quantity "
+                         "that kept improving while the eye verdict went negative.")
     ap.add_argument("--dino", action="store_true",
                     help="v2 placeholder: DINO perceptual loss on the decoded frame. "
                          "NOT implemented in v1 (arg exists so launch scripts are stable).")
@@ -285,7 +315,9 @@ def main():
     # fp32 params; bf16 autocast for the matmuls. cond_dim=0 (no --cond) is the STRICT v1.0
     # module (no cond params created, state_dict identical).
     decoder = AnchorFrameDecoder(cond_dim=(args.cond_dim if args.cond else 0),
-                                 cond_hidden=args.cond_hidden).to(device)
+                                 cond_hidden=args.cond_hidden,
+                                 mixer=args.mixer, mixer_blocks=args.mixer_blocks,
+                                 mixer_hidden=args.mixer_hidden).to(device)
     n_params = decoder.num_params()
     print(f"[frame_dec] AnchorFrameDecoder params: {n_params:,} (~{n_params/1e6:.1f}M)", flush=True)
 
@@ -296,8 +328,17 @@ def main():
         sd = ck["decoder"] if isinstance(ck, dict) and "decoder" in ck else ck
         missing, unexpected = decoder.load_state_dict(sd, strict=False)
         assert not unexpected, f"warm_start ckpt has unexpected keys: {list(unexpected)[:5]}"
-        bad = [k for k in missing if not k.startswith(("cond_norm.", "cond_in.", "cond_out."))]
-        assert not bad, f"warm_start missing NON-cond keys (wrong ckpt?): {bad[:5]}"
+        bad = [k for k in missing
+               if not k.startswith(("cond_norm.", "cond_in.", "cond_out.", "mixer."))]
+        assert not bad, f"warm_start missing NON-cond/NON-mixer keys (wrong ckpt?): {bad[:5]}"
+        if args.mixer:
+            # the contract of v2 cause 2: turning the mixer on must NEVER silently mean
+            # "restart from a partly random decoder"
+            new_mix = assert_mixer_warm_start(
+                [k for k in missing if not k.startswith(("cond_norm.", "cond_in.", "cond_out."))],
+                unexpected)
+            print(f"[frame_dec] mixer warm-start OK: {len(new_mix)} new `mixer.*` params, "
+                  f"identity at init", flush=True)
         print(f"[frame_dec] warm-started from {args.warm_start}: {len(sd)} keys loaded; "
               f"{len(missing)} new cond/FiLM params keep their zero-init"
               + (" (step-0 function == the v1.0 model exactly)" if missing else ""), flush=True)
@@ -315,6 +356,22 @@ def main():
         start_step = ck["step"]
         print(f"[frame_dec] resumed from {args.resume} @ step {start_step}", flush=True)
 
+    ema = EmaWeights(decoder, decay=args.ema_decay) if args.ema else None
+    val_prompts = [it.get("prompt", f"_u{i}") for i, it in enumerate(stream.holdout_items)]
+    # Decide the selection criterion ONCE, here, from the holdout itself -- never mid-run:
+    # flipping the tracker's polarity after it already holds a best would compare a loss to
+    # an accuracy. If --select_on pair is asked for but the holdout has no same-prompt twin,
+    # the metric is not merely absent, it is UNCOMPUTABLE, and we say so instead of scoring 0.
+    from decoder_v2 import twin_groups  # noqa: E402
+    select_on = args.select_on
+    if select_on == "pair" and not twin_groups(val_prompts):
+        print("[frame_dec] WARNING: --select_on pair but the holdout contains no same-prompt "
+              "twin -> the board metric cannot be computed. Falling back to val_loss. Fix the "
+              "holdout (keep both members of a pair) to select on what the eye actually judged.",
+              flush=True)
+        select_on = "val_loss"
+    tracker = BestTracker(higher_is_better=(select_on == "pair"))
+
     vae = build_vae(device)
 
     import wandb  # mandatory, key in ~/.netrc (longlive env)
@@ -322,6 +379,7 @@ def main():
                config=dict(vars(args), n_params=n_params))
 
     amp = not args.no_amp
+    stop_now = False
     step = start_step
     t0 = time.time()
     for items, epoch in stream.batches():
@@ -330,23 +388,30 @@ def main():
         states, target, cond = collate(items, device, want_cond=args.cond)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
             pred = decoder(states, cond=cond)   # cond=None == the exact v1.0 call
-        loss = norm_mse(pred, target, subject_weight=args.subject_weight)
+        rec = norm_mse(pred, target, subject_weight=args.subject_weight)
+        sharp = grad_match_loss(pred, target) if args.sharp_w > 0.0 else None
+        loss = rec if sharp is None else rec + args.sharp_w * sharp
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(decoder.parameters(), args.clip)
         opt.step()
         sched.step()
+        if ema is not None:
+            ema.update(decoder)
         step += 1
 
         if step % args.log_every == 0 or step == 1:
             dt = time.time() - t0
             sps = args.log_every * args.bs / max(dt, 1e-6) if step > 1 else 0.0
             t0 = time.time()
-            log = {"train/loss": loss.item(), "train/grad_norm": float(gnorm),
+            log = {"train/loss": loss.item(), "train/rec": rec.item(),
+                   "train/grad_norm": float(gnorm),
                    "train/lr": sched.get_last_lr()[0], "train/epoch": epoch,
                    "train/pred_rms": pred.detach().float().pow(2).mean().sqrt().item(),
                    "train/target_rms": target.float().pow(2).mean().sqrt().item(),
                    "train/samples_per_s": sps}
+            if sharp is not None:
+                log["train/sharp"] = sharp.item()
             if args.cond:
                 # FiLM leaving its zero-init = the conditioning is actually being used
                 log["train/cond_out_wrms"] = \
@@ -363,8 +428,40 @@ def main():
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                         vpred = decoder(val_states, cond=val_cond)
                     vloss = norm_mse(vpred, val_target)
-                    wandb.log({"val/loss": vloss.item()}, step=step)
-                    print(f"[frame_dec] step {step} val/loss {vloss.item():.4f}", flush=True)
+                    vlog = {"val/loss": vloss.item()}
+                    if args.sharp_w > 0.0:
+                        vlog["val/sharp"] = grad_match_loss(vpred, val_target).item()
+                    # THE board metric: right subject rather than its twin, chance 0.5.
+                    # This is the 62-68 % of the 17/08 page, which the v1 trainer never saw.
+                    pd = pair_discrimination(vpred.float(), val_target, val_prompts)
+                    if pd["acc"] is not None:
+                        k = round(pd["acc"] * pd["n_pairs"])
+                        vlog.update({"val/pair_acc": pd["acc"], "val/pair_margin": pd["margin"],
+                                     "val/pair_n": pd["n_pairs"],
+                                     "val/pair_p": binom_p_two_sided(k, pd["n_pairs"])})
+                    wandb.log(vlog, step=step)
+                    print(f"[frame_dec] step {step} val/loss {vloss.item():.4f}"
+                          + (f" pair {pd['acc']:.3f} (n={pd['n_pairs']}, "
+                             f"p={binom_p_two_sided(round(pd['acc']*pd['n_pairs']), pd['n_pairs']):.3g})"
+                             if pd["acc"] is not None else " pair n/a"), flush=True)
+
+                    # cause 1: ship the best point, not the last one
+                    crit = pd["acc"] if select_on == "pair" else vloss.item()
+                    if tracker.update(crit, step):
+                        save_ckpt(os.path.join(ckpt_dir, "best.pt"), decoder, opt, sched,
+                                  step, args)
+                        if ema is not None:
+                            torch.save({"decoder": ema.state_dict(decoder), "step": step,
+                                        "args": vars(args), "ema": True},
+                                       os.path.join(ckpt_dir, "best_ema.pt"))
+                        print(f"[frame_dec] NEW BEST ({select_on}={crit:.4f}) @ step {step}",
+                              flush=True)
+                    wandb.log({"val/best": tracker.best, "val/best_step": tracker.best_step},
+                              step=step)
+                    if tracker.should_stop(args.patience):
+                        print(f"[frame_dec] early stop: {args.patience} evals without a best "
+                              f"(best was step {tracker.best_step})", flush=True)
+                        stop_now = True
                     viz_pred, viz_tgt = vpred.float(), val_target
                 else:
                     viz_pred, viz_tgt = pred.detach().float(), target
@@ -378,9 +475,18 @@ def main():
             save_ckpt(os.path.join(ckpt_dir, f"dec_step{step}.pt"), decoder, opt, sched, step, args)
             save_ckpt(os.path.join(ckpt_dir, "latest.pt"), decoder, opt, sched, step, args)
 
+        if stop_now:
+            break
+
     save_ckpt(os.path.join(ckpt_dir, "final.pt"), decoder, opt, sched, step, args)
+    if ema is not None:
+        torch.save({"decoder": ema.state_dict(decoder), "step": step, "args": vars(args),
+                    "ema": True}, os.path.join(ckpt_dir, "final_ema.pt"))
     wandb.finish()
-    print(f"[frame_dec] done at step {step}", flush=True)
+    print(f"[frame_dec] done at step {step}; BEST {select_on}={tracker.best} "
+          f"@ step {tracker.best_step} -> ckpt/best.pt "
+          f"(final.pt is the LAST step, which the 17/08 board showed is not the best one)",
+          flush=True)
 
 
 if __name__ == "__main__":

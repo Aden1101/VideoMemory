@@ -4,9 +4,22 @@ from torch.utils.data import Dataset
 import torch
 import datasets
 import json, os, random
-import decord
-from decord import VideoReader
-decord.bridge.set_bridge("torch")  # make VideoReader.get_batch return torch tensors
+# 2026-09-09 : `decord` etait importe ICI, au chargement du module. Or il ne sert qu'a
+# TwoTextVideoPairDataset (lecture de vraies videos, entrainement), pas a TextDataset, que le
+# chemin d'INFERENCE importe. Et decord n'a aucune roue pour macOS arm64 : un import en tete
+# de module bloquait donc toute l'inference pour une dependance qu'elle n'utilise jamais.
+# Import paresseux, avec un message qui dit quoi faire si on en a vraiment besoin.
+def _decord():
+    try:
+        import decord
+    except ImportError as e:                                             # pragma: no cover
+        raise ImportError(
+            "decord est requis pour lire de vraies videos (TwoTextVideoPairDataset) mais n'est "
+            "pas installe, et il n'existe pas pour macOS arm64. Le chemin d'inference n'en a "
+            "pas besoin : n'importe cette classe que sur une machine ou decord est disponible."
+        ) from e
+    decord.bridge.set_bridge("torch")   # VideoReader.get_batch rend des tenseurs torch
+    return decord
 from collections import defaultdict
 
 
@@ -214,7 +227,7 @@ class TwoTextVideoPairDataset(Dataset):
         if not os.path.exists(vp):
             raise FileNotFoundError(vp)
 
-        vr = VideoReader(vp)
+        vr = _decord().VideoReader(vp)
         n = len(vr)
 
         if n <= 1:

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 import os
 from wan.modules.attention import attention
+from wan.modules.model import rope_freqs_to, rope_phase_dtype
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,
@@ -48,7 +49,7 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+        x_i = torch.view_as_complex(x[i, :seq_len].to(rope_phase_dtype(freqs[0])).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -1362,7 +1363,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+            self.freqs = rope_freqs_to(self.freqs, device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -1599,7 +1600,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+            self.freqs = rope_freqs_to(self.freqs, device)
 
         # Construct blockwise causal attn mask
         if self.block_mask is None:

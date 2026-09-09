@@ -475,14 +475,16 @@ class T5EncoderModel:
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device=None,   # 2026-09-09 : etait torch.cuda.current_device(), evalue A L'IMPORT
+                       # (argument par defaut) -> plantait le chargement du module sans NVIDIA
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
     ):
         self.text_len = text_len
         self.dtype = dtype
-        self.device = device
+        from utils.device import device as af_device
+        self.device = af_device if device is None else device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
 

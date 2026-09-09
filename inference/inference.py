@@ -6,7 +6,7 @@ import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
-from torchvision.io import write_video
+from utils.video_io import write_video  # torchvision si dispo, sinon imageio
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
@@ -20,6 +20,7 @@ from utils.dataset import TextDataset
 from utils.misc import set_seed
 
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+from utils.device import device as af_device, describe as af_describe
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -28,7 +29,12 @@ args = parser.parse_args()
 config = OmegaConf.load(args.config_path)
 
 # Initialize distributed inference
-if "LOCAL_RANK" in os.environ:
+# 2026-09-09 : la branche distribuee est CUDA + NCCL par construction (le multi-cartes n'existe
+# que la). inference.sh appelle torchrun meme pour un seul processus, ce qui positionne
+# LOCAL_RANK et menait donc a un "torch.cuda.set_device" sur une machine sans NVIDIA. On exige
+# CUDA pour l'emprunter, sinon on prend la voie mono-peripherique, qui est de toute facon ce
+# qu'un seul processus veut dire.
+if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
     os.environ["NCCL_CROSS_NIC"] = "1"
     os.environ["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "INFO")
     os.environ["NCCL_TIMEOUT"] = os.environ.get("NCCL_TIMEOUT", "1800")
@@ -52,12 +58,17 @@ if "LOCAL_RANK" in os.environ:
     if rank == 0:
         print(f"[Rank {rank}] Initialized distributed processing on device {device}")
 else:
+    if "LOCAL_RANK" in os.environ:
+        print("[inference] LOCAL_RANK est defini mais CUDA est absent : voie mono-peripherique.")
     local_rank = 0
     rank = 0
-    device = torch.device("cuda")
+    # 2026-09-09 : etait torch.device("cuda") en dur. utils/device rend la meme chose sur une
+    # machine NVIDIA, et le bon peripherique ailleurs. La branche distribuee ci-dessus reste
+    # CUDA + NCCL : le multi-cartes n'existe de toute facon que la.
+    device = af_device
     set_seed(config.seed)
     config.distributed = False  # Mark as non-distributed
-    print(f"Single GPU mode on device {device}")
+    print(f"Single device mode | {af_describe()}")
 
 print(f'Free VRAM {get_cuda_free_memory_gb(device)} GB')
 low_memory = get_cuda_free_memory_gb(device) < 40

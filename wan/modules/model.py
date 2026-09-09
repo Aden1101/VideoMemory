@@ -7,16 +7,29 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
 
-from .attention import flash_attention
+# 2026-09-09 : ces classes appelaient flash_attention DIRECTEMENT, en contournant le
+# repartiteur `attention` du meme module. Consequence : l'attention croisee exigeait
+# flash-attn -- sur n'importe quelle machine, y compris une NVIDIA ou le paquet n'est pas
+# installe, elle levait "assert q.device.type == 'cuda'". Le repartiteur choisit flash quand
+# il est disponible (donc comportement identique sur l'installation du README) et l'attention
+# standard de PyTorch sinon.
+from .attention import attention, flash_attention  # noqa: F401  (flash_attention reste exporte)
 
 __all__ = ['WanModel']
+
+
+def high_precision_dtype(ref):
+    """Le dtype des calculs de phase : float64 partout ou il existe, float32 sur Metal, qui
+    ne le supporte pas du tout. Sur CUDA et CPU la valeur rendue est float64, donc le calcul
+    est celui d'origine, au bit pres. (2026-09-09)"""
+    return torch.float32 if ref.device.type == "mps" else torch.float64
 
 
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    position = position.type(high_precision_dtype(position))
 
     # calculation
     sinusoid = torch.outer(
@@ -36,6 +49,26 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
+def rope_freqs_to(freqs, device):
+    """Deplace la table de frequences du RoPE sur `device`, en abaissant la precision UNIQUEMENT
+    la ou le float64 n'existe pas.
+
+    2026-09-09. `rope_params` construit la table en complex128 (phases calculees en float64).
+    Metal ne supporte pas du tout le float64, donc un simple .to("mps") leve une TypeError.
+    Sur CUDA et CPU rien ne change : la table reste en complex128 et le RoPE continue de
+    convertir x en float64, donc les chiffres deja mesures sont intacts au bit pres.
+    """
+    if device.type == "mps" and freqs.dtype == torch.complex128:
+        return freqs.to(torch.complex64).to(device)
+    return freqs.to(device)
+
+
+def rope_phase_dtype(freqs):
+    """Le dtype dans lequel convertir x avant view_as_complex : il doit s'accorder a la table.
+    complex128 -> float64 (le comportement d'origine), complex64 -> float32."""
+    return torch.float64 if freqs.dtype == torch.complex128 else torch.float32
+
+
 # @amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
@@ -49,7 +82,7 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+        x_i = torch.view_as_complex(x[i, :seq_len].to(rope_phase_dtype(freqs[0])).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -143,7 +176,7 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
+        x = attention(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
@@ -186,7 +219,7 @@ class WanT2VCrossAttention(WanSelfAttention):
             v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -213,7 +246,7 @@ class WanGanCrossAttention(WanSelfAttention):
         vv = self.v(x).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(qq, kk, vv)
+        x = attention(qq, kk, vv)
 
         # output
         x = x.flatten(2)
@@ -254,9 +287,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        img_x = attention(q, k_img, v_img, k_lens=None)
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -674,7 +707,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+            self.freqs = rope_freqs_to(self.freqs, device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -807,7 +840,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+            self.freqs = rope_freqs_to(self.freqs, device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]

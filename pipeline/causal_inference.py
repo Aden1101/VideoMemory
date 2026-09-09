@@ -8,6 +8,11 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from wan.modules.video_memory import TTTBlockCache
 
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
+# 2026-09-09 : les chronometres etaient des evenements CUDA et les barrieres des appels
+# torch.cuda. utils.device.Timer a la meme interface (record / elapsed_time en ms) et delegue
+# a torch.cuda.Event quand CUDA est la -- profilage inchange sur une carte NVIDIA.
+from utils.device import Timer as DeviceTimer, empty_cache as device_empty_cache, \
+    synchronize as device_synchronize
 from utils.debug_option import DEBUG
 import torch.distributed as dist
 import math
@@ -102,15 +107,15 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Set up profiling if requested
         if profile:
-            init_start = torch.cuda.Event(enable_timing=True)
-            init_end = torch.cuda.Event(enable_timing=True)
-            diffusion_start = torch.cuda.Event(enable_timing=True)
-            diffusion_end = torch.cuda.Event(enable_timing=True)
-            vae_start = torch.cuda.Event(enable_timing=True)
-            vae_end = torch.cuda.Event(enable_timing=True)
+            init_start = DeviceTimer(enable_timing=True)
+            init_end = DeviceTimer(enable_timing=True)
+            diffusion_start = DeviceTimer(enable_timing=True)
+            diffusion_end = DeviceTimer(enable_timing=True)
+            vae_start = DeviceTimer(enable_timing=True)
+            vae_end = DeviceTimer(enable_timing=True)
             block_times = []
-            block_start = torch.cuda.Event(enable_timing=True)
-            block_end = torch.cuda.Event(enable_timing=True)
+            block_start = DeviceTimer(enable_timing=True)
+            block_end = DeviceTimer(enable_timing=True)
             init_start.record()
 
         # Step 1: Initialize KV cache to all zeros
@@ -161,7 +166,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if profile:
             init_end.record()
-            torch.cuda.synchronize()
+            device_synchronize()
             diffusion_start.record()
 
         # Step 2: Temporal denoising loop
@@ -239,7 +244,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
             if profile:
                 block_end.record()
-                torch.cuda.synchronize()
+                device_synchronize()
                 block_time = block_start.elapsed_time(block_end)
                 block_times.append(block_time)
 
@@ -249,7 +254,7 @@ class CausalInferencePipeline(torch.nn.Module):
         if profile:
             # End diffusion timing and synchronize CUDA
             diffusion_end.record()
-            torch.cuda.synchronize()
+            device_synchronize()
             diffusion_time = diffusion_start.elapsed_time(diffusion_end)
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
@@ -262,14 +267,14 @@ class CausalInferencePipeline(torch.nn.Module):
             self.prompt_cache = None
             self.ttt_cache = None
             import gc; gc.collect()
-            torch.cuda.empty_cache()
+            device_empty_cache()
         # stack decoded chunks in RAM instead of VRAM (240s videos OOM otherwise)
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False, to_cpu=low_memory)
         video = (video * 0.5 + 0.5).clamp(0, 1)
         if profile:
             # End VAE timing and synchronize CUDA
             vae_end.record()
-            torch.cuda.synchronize()
+            device_synchronize()
             vae_time = vae_start.elapsed_time(vae_end)
             total_time = init_time + diffusion_time + vae_time
 

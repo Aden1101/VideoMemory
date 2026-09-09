@@ -13,6 +13,7 @@ import utils.debug_option as dbg
 from einops import rearrange
 from torchvision.io import write_video
 import os
+from utils.device import hp
 
 
 class DMD(SelfForcingModel):
@@ -220,10 +221,10 @@ class DMD(SelfForcingModel):
 
         if gradient_mask is not None:
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
+            )[gradient_mask], (hp(original_latent) - hp(grad)).detach()[gradient_mask], reduction="mean")
         else:
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            ), (original_latent.double() - grad.double()).detach(), reduction="mean")
+            ), (hp(original_latent) - hp(grad)).detach(), reduction="mean")
         return dmd_loss, dmd_log_dict
 
     def generator_loss(
@@ -599,11 +600,11 @@ class DMD(SelfForcingModel):
             )
 
         if gradient_mask is not None:
-            ca_loss = F.mse_loss(original_latent.double()[gradient_mask], (original_latent.double() + ca_update_vector.double()).detach()[gradient_mask])
-            dm_loss = F.mse_loss(original_latent.double()[gradient_mask], (original_latent.double() + dm_update_vector.double()).detach()[gradient_mask])
+            ca_loss = F.mse_loss(hp(original_latent)[gradient_mask], (hp(original_latent) + hp(ca_update_vector)).detach()[gradient_mask])
+            dm_loss = F.mse_loss(hp(original_latent)[gradient_mask], (hp(original_latent) + hp(dm_update_vector)).detach()[gradient_mask])
         else:
-            ca_loss = F.mse_loss(original_latent.double(), (original_latent.double() + ca_update_vector.double()).detach())
-            dm_loss = F.mse_loss(original_latent.double(), (original_latent.double() + dm_update_vector.double()).detach())
+            ca_loss = F.mse_loss(hp(original_latent), (hp(original_latent) + hp(ca_update_vector)).detach())
+            dm_loss = F.mse_loss(hp(original_latent), (hp(original_latent) + hp(dm_update_vector)).detach())
         dmd_loss = ca_loss + dm_loss
 
         return dmd_loss, dmd_log_dict

@@ -1,5 +1,6 @@
 from abc import abstractmethod, ABC
 import torch
+from utils.device import hp
 
 
 class SchedulerInterface(ABC):
@@ -38,7 +39,7 @@ class SchedulerInterface(ABC):
         # use higher precision for calculations
         original_dtype = x0.dtype
         x0, xt, alphas_cumprod = map(
-            lambda x: x.double().to(x0.device), [x0, xt,
+            lambda x: hp(x, x0.device), [x0, xt,
                                                  self.alphas_cumprod]
         )
 
@@ -64,7 +65,7 @@ class SchedulerInterface(ABC):
         # use higher precision for calculations
         original_dtype = noise.dtype
         noise, xt, alphas_cumprod = map(
-            lambda x: x.double().to(noise.device), [noise, xt,
+            lambda x: hp(x, noise.device), [noise, xt,
                                                     self.alphas_cumprod]
         )
         alpha_prod_t = alphas_cumprod[timestep].reshape(-1, 1, 1, 1)
@@ -93,7 +94,7 @@ class SchedulerInterface(ABC):
         # use higher precision for calculations
         original_dtype = velocity.dtype
         velocity, xt, alphas_cumprod = map(
-            lambda x: x.double().to(velocity.device), [velocity, xt,
+            lambda x: hp(x, velocity.device), [velocity, xt,
                                                        self.alphas_cumprod]
         )
         alpha_prod_t = alphas_cumprod[timestep].reshape(-1, 1, 1, 1)
