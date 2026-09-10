@@ -1,1 +1,0 @@
-/shared/ssd_14T_project/adenelmi/e3_real3_gate01_scal3r/checkpoint_model_000750/model.pt

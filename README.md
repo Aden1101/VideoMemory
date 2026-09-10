@@ -1,113 +1,108 @@
-# Anchor Forcing: Anchor Memory and Tri-Region RoPE for Interactive Streaming Video Diffusion
+# Fast-weight memory for long-form video generation
 
-<a href="https://arxiv.org/abs/2603.13405"><img src='https://img.shields.io/badge/arXiv-2603.13405-red?style=flat&logo=arXiv&logoColor=red' alt='arxiv'></a>&nbsp;
-<a href="https://vivocameraresearch.github.io/anchorforcing/"><img src='https://img.shields.io/badge/Project-Page-Green' alt='page'></a>&nbsp;
-<a href="http://www.apache.org/licenses/LICENSE-2.0"><img src='https://img.shields.io/badge/License-CC BY--NC--SA--4.0-lightgreen?style=flat&logo=Lisence' alt='License'></a><br>
+A research fork of [Anchor-Forcing](https://github.com/vivoCameraResearch/Anchor-Forcing)
+(Wan2.1-T2V-1.3B, causal streaming, DMD self-rollout) that grafts a **fast-weight / test-time
+training memory** into the backbone, to attack identity drift over minutes of generated video.
 
-![overview](assets/motivation.jpg)
-<p>
-      📖<strong>TL;DR</strong>: <strong>Anchor Forcing</strong>  enables prompt switches to introduce new subjects and actions while preserving context, motion quality, and temporal coherence; prior methods often degrade over time and miss newly specified interactions.
-</p>
+The upstream project's own README is preserved at [`reference/UPSTREAM_README.md`](reference/UPSTREAM_README.md).
 
-## 📢 News
-- **[2026-03-18]** 🎉 We have officially released the code for public use!  
+---
 
+## The question
 
-## ✅ ToDo List for Any-to-Bokeh Release
+Autoregressive video models keep a fixed attention window. Anything older than that window is
+literally evicted from the context. Identity is precisely long-range information: if the subject
+established at second 0 is out of context at second 60, nothing constrains the model to preserve
+it except the prompt — and the prompt only specifies a *category* ("a woman in a red coat"),
+never the *instance*. Those under-specified attributes drift freely.
 
-- [x] Release the code
-- [x] Release the inference pipeline
-- [x] Release the training files
-- [x] Release the model weights
+Can a learnable fast-weight memory carry the instance across the eviction boundary?
 
-## :wrench: Installation
-We tested this repo on the following setup:
-* Nvidia GPU with at least 40 GB memory (A100 tested).
-* Linux operating system.
-* 64 GB RAM.
+## The answer, honestly
 
-Other hardware setup could also work but hasn't been tested.
+**No, not under this training objective — and the reason generalises.** The headline is not the
+memory module; it is a methodology finding, demonstrated three times over:
 
-**Environment**
+> The training objective (DMD, chunk-local) and the standard evaluation metrics (VBench subject
+> consistency, naive DINO drift) reward **the same wrong thing: temporal self-similarity**. A
+> learnable memory therefore converges to a freeze or a DC-injection degeneracy that the
+> dashboard scores as *healthy*. VBench rates a dissolving clip at 0.94. "Consistent because
+> frozen."
 
-Create a conda environment and install dependencies:
-```
-git clone https://github.com/vivoCameraResearch/Anchor-Forcing.git
-cd Anchor-Forcing
-conda create -n af python=3.10 -y
-conda activate af
-pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements.txt
-pip install flash-attn --no-build-isolation
+Three positive results were killed by their own authors along the way: a "memory is toxic"
+finding that turned out to be a DC-injection artifact, a "do-no-harm" improvement that turned
+out to be a freeze artifact, and a channel-content claim falsified by the observation that an
+anchor decoded from **someone else's** video works just as well as our own.
 
-# Manual installation flash-attention. Recommended version: 2.7.4.post1
-https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
-```
+What survived is a measured negative with a validated instrument, plus one live lead: a
+training-free **delta write rule** that reads the subject where the deployed SwiGLU write does
+not (median 13.5/19 vs 7.0 over 10 seeds, non-overlapping distributions, with a background
+control at chance to rule out scene memorisation).
 
-## ⏬ Demo Inference 
+## If you read three files
 
-**Download Wan2.1-T2V-1.3B**
-```
-huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir wan_models/Wan2.1-T2V-1.3B
-```
+1. **[`wan/modules/video_memory.py`](wan/modules/video_memory.py)** — the mechanism. The
+   fast-weight cell (SwiGLU state, Muon write, renorm-to-init), the training-free `linear_delta`
+   write rule bit-locked to its offline oracle, and the state→frame decoder.
+2. **[`model/streaming_training.py`](model/streaming_training.py)** — the experimental design,
+   from `_twin_snapshot` down. A counterfactual mem-OFF twin of the *same chunk*, sharing
+   history, KV cache and noise, so the only differential lever is the injection. Then four
+   objective terms whose anti-degeneracy structure is blocked *in construction* rather than by
+   tuning — each guard documented against the failure that actually produced it.
+3. **[`reference/memory2_probes_registry.md`](reference/memory2_probes_registry.md)** — the
+   method. Thresholds sealed before each run, predictions recorded with their refutations, a
+   10-seed annex that downgrades the project's own best number, and a device-variability control
+   that makes small differences explicitly uninterpretable.
 
-**Download checkpoints**
+[`reference/README.md`](reference/README.md) indexes the rest of the research record.
 
-```
-huggingface-cli download young98/AnchorForcing --local-dir ckpt
-```
+## What is mine
 
-**Single Prompt Video Generation**
-```
-bash inference/inference.sh
-```
-**Interactive Long Video Generation**
-```
-bash inference/interactive_inference.py
-```
+The base import (commit `392b3f8`) is byte-identical to upstream
+`vivoCameraResearch/Anchor-Forcing@25bdfba`, verified over the full tree, and the checkpoints
+sha256-match the published release. Everything after that commit is this work: the memory cell
+and its write rules, the identity and anti-degeneracy objectives, the evaluation harness, the
+probing pipeline, the blind judging boards, and the device-agnostic pass described below.
 
+The video backbone, the DMD distillation and the streaming pipeline are upstream's.
 
-## Training
-**Download checkpoints**
+## Running it
 
-Please follow [Self-Forcing](https://github.com/guandeh17/Self-Forcing) to download text prompts and ODE initialized checkpoint.
+Weights (~26 GB) and a two-pass launch, because the text encoder and the generator do not fit in
+memory together on a consumer machine:
 
-Download Wan2.1-T2V-14B as the teacher model.
-
-```
-huggingface-cli download Wan-AI/Wan2.1-T2V-14B --local-dir wan_models/Wan2.1-T2V-14B
-```
-
-**Step1: Self-Forcing Initialization for Short Window and Frame Sink**
-
-Please follow [LongLive](https://nvlabs.github.io/LongLive/docs/#training:~:text=Step1%3A%20Self%2DForcing%20Initialization%20for%20Short%20Window%20and%20Frame%20Sink) 
-
-**Step2: Streaming Long Tuning**
-```
-bash train.sh
+```bash
+python download_weights.py                    # Wan2.1-T2V-1.3B + Anchor-Forcing checkpoints
+python encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
+AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path configs/inference.yaml
 ```
 
-**Hints**
+Pass 1 encodes the prompts and **exits** — only ending the process actually returns the 11.4 GB
+to the OS on unified memory. Pass 2 never constructs the encoder.
 
-This repository only provides the training code for step 2. We default to following the training method of LongLive's step 1. Therefore, you can directly train step 2 using LongLive's checkpoints.
+Training needs CUDA and two 48 GB cards; see [`reference/vram_recap.md`](reference/vram_recap.md)
+for the measured ceilings.
 
-## 📜 Acknowledgement
-This codebase builds on [LongLive](https://github.com/NVlabs/LongLive). Thanks for open-sourcing! Besides, we acknowledge following great open-sourcing projects:
-- [MemFlow](https://github.com/KlingAIResearch/MemFlow): We followed its interactive video benchmark.
-- [Self-Forcing](https://github.com/guandeh17/Self-Forcing): We followed its vbench prompt and checkpoints.
+### Devices
 
+The code runs on CUDA, on Apple Metal and on CPU. On CUDA every device call delegates to the
+original `torch.cuda` one, so no previously measured number moves — `tests/test_device.py`
+asserts that by reimplementing the pre-patch RoPE and demanding bitwise equality. Off CUDA,
+float64 falls back to float32 where Metal has no float64 at all; that trade-off is declared, and
+its effect over a long rollout is not yet measured.
 
-## 🌏 Citation
-
-```bibtex
-@article{yang2026anchor,
-  title={Anchor Forcing: Anchor Memory and Tri-Region RoPE for Interactive Streaming Video Diffusion},
-  author={Yang, Yang and Zhang, Tianyi and Huang, Wei and Chen, Jinwei and Wu, Boxi and He, Xiaofei and Cai, Deng and Li, Bo and Jiang, Peng-Tao},
-  journal={arXiv preprint arXiv:2603.13405},
-  year={2026}
-}
+```bash
+python tests/test_device.py            # device layer, incl. the bitwise check
+python tests/test_inference_smoke.py   # real model, streaming, no weights needed
+python tests/test_prompt_cache.py      # prompt cache, incl. bitwise read-back
 ```
 
-## 📧 Contact
+## Status
 
-If you have any questions and improvement suggestions, please email Yang Yang (yangyang98@zju.edu.cn), or open an issue.
+The memory work is closed on plain drift and documented as a negative result. The open lead is
+the delta write rule and the state→frame decoder, whose three known defects are diagnosed and
+fixed but not yet retrained. See [`reference/RESEARCH_STATUS.md`](reference/RESEARCH_STATUS.md).
+
+## License
+
+Upstream is CC BY-NC-SA 4.0; this fork inherits it. Non-commercial, share-alike.

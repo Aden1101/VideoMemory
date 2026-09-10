@@ -1,3 +1,7 @@
+# Install torch/torchvision first, matching your platform (see README).
+# torchvision < 0.24 keeps `write_video`; on newer versions utils/video_io falls back
+# to imageio automatically, so either works.
+
 opencv-python>=4.9.0.80
 diffusers==0.31.0
 transformers>=4.49.0
@@ -29,7 +33,9 @@ huggingface_hub[cli]
 dominate
 # nvidia-pyindex
 # nvidia-tensorrt
-pycuda
+# pycuda needs the NVIDIA toolchain (nvcc): skip it where there is no CUDA, otherwise
+# `pip install -r requirements.txt` fails on the first line for every non-NVIDIA machine.
+pycuda; platform_system == "Linux" and platform_machine == "x86_64"
 # onnx
 # onnxruntime
 # onnxscript
@@ -38,5 +44,7 @@ flask
 flask-socketio
 torchao
 peft
-decord
+# decord publishes no wheel for macOS arm64. utils/dataset.py imports it lazily, so only the
+# real-video training path actually needs it.
+decord; platform_system != "Darwin"
 tensorboard
