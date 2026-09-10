@@ -475,8 +475,8 @@ class T5EncoderModel:
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=None,   # 2026-09-09 : etait torch.cuda.current_device(), evalue A L'IMPORT
-                       # (argument par defaut) -> plantait le chargement du module sans NVIDIA
+        device=None,   # 2026-09-09: was torch.cuda.current_device(), evaluated AT IMPORT TIME
+                       # (default argument) -> crashed module loading without NVIDIA
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,

@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # ============================================================================================
-# Le cache d'embeddings de prompt, verifie -- CPU, sans encodeur reel (11.4 Go), ~1 s.
+# The prompt-embedding cache, verified -- CPU, no real encoder (11.4 GB), ~1 s.
 #
-# LE test est P3 : un prompt relu du cache doit rendre le tenseur AU BIT PRES. Ce depot compare
-# des effets de la taille du bruit de chaine (±2 paires sur 19, mesure du 07/08) ; un arrondi
-# introduit par le cache serait invisible et fausserait tout. Aucune quantification n'est donc
-# permise ici, meme "inoffensive".
+# THE test is P3: a prompt read back from the cache must return the tensor BIT FOR BIT. This
+# project compares effects the size of its own chain noise (+/-2 pairs out of 19, measured
+# 07/08); a rounding error introduced by the cache would be invisible and would falsify
+# everything. No quantization is permitted here, not even a "harmless" one.
 #
 #   python tests/test_prompt_cache.py
 # ============================================================================================
@@ -33,72 +33,72 @@ try:
     A = "a woman in a red coat walks along a canal at dusk"
     B = "a baker kneading dough in a warm bakery"
 
-    # --- P1 : la cle est stable et distingue ce qui doit l'etre -------------------------------
-    check("P1 cle stable", pc.key_of(A) == pc.key_of(A))
-    # LE piege que la cle doit couvrir : la passe 1 et la passe 2 doivent travailler dans la
-    # meme precision, parce que inference.py convertit tout le pipeline en bfloat16. Un cache
-    # float32 servi a un modele bfloat16 donne un conditionnement faux, sans erreur.
-    check("P1d le dtype fait partie de la cle",
+    # --- P1: the key is stable and distinguishes what it must ---------------------------------
+    check("P1 stable key", pc.key_of(A) == pc.key_of(A))
+    # THE trap the key has to cover: pass 1 and pass 2 must work in the same precision, because
+    # inference.py casts the whole pipeline to bfloat16. A float32 cache served to a bfloat16
+    # model gives a wrong conditioning, with no error raised.
+    check("P1d dtype is part of the key",
           pc.key_of(A, torch.float32) != pc.key_of(A, torch.bfloat16))
-    check("P1b prompts differents -> cles differentes", pc.key_of(A) != pc.key_of(B))
-    check("P1c une espace change la cle (pas de normalisation silencieuse)",
+    check("P1b different prompts -> different keys", pc.key_of(A) != pc.key_of(B))
+    check("P1c a space changes the key (no silent normalization)",
           pc.key_of(A) != pc.key_of(A + " "))
 
-    # --- P2 : absent avant, present apres ------------------------------------------------------
-    check("P2 absent au depart", not pc.has(A, TMP, torch.float32)
+    # --- P2: absent before, present after ------------------------------------------------------
+    check("P2 absent at the start", not pc.has(A, TMP, torch.float32)
           and pc.get(A, TMP, torch.float32) is None)
     emb = torch.randn(512, 4096, dtype=torch.float32)
     pc.put(A, emb, TMP)
-    check("P2b present apres ecriture", pc.has(A, TMP, torch.float32))
+    check("P2b present after write", pc.has(A, TMP, torch.float32))
 
-    # --- P3 : LE test -- relecture bit a bit ---------------------------------------------------
+    # --- P3: THE test -- bitwise read-back -----------------------------------------------------
     back = pc.get(A, TMP, torch.float32)
-    check("P3 relecture identique AU BIT PRES", torch.equal(back, emb),
+    check("P3 read-back BITWISE identical", torch.equal(back, emb),
           f"max|diff| = {float((back-emb).abs().max())}")
-    check("P3b dtype preserve", back.dtype == emb.dtype)
-    check("P3c forme preservee", back.shape == emb.shape)
+    check("P3b dtype preserved", back.dtype == emb.dtype)
+    check("P3c shape preserved", back.shape == emb.shape)
     for dt in (torch.float16, torch.bfloat16):
         e2 = torch.randn(8, 16).to(dt)
         pc.put("x" + str(dt), e2, TMP)
-        check(f"P3d {str(dt).split('.')[-1]} aussi bit a bit",
+        check(f"P3d {str(dt).split('.')[-1]} bitwise too",
               torch.equal(pc.get("x" + str(dt), TMP, dt), e2))
 
-    # --- P4 : get_many rend l'ordre d'entree et les manquants ---------------------------------
-    # Catches l'erreur qui ne leverait aucune exception : associer un prompt au conditionnement
-    # d'un autre parce que les lignes ont ete melangees.
-    # un embedding bf16 ne doit PAS repondre a une demande float32
+    # --- P4: get_many preserves input order and reports the misses -----------------------------
+    # Catches the error that would raise no exception: pairing a prompt with another one's
+    # conditioning because the rows got shuffled.
+    # a bf16 embedding must NOT answer a float32 request
     pc.put(A, emb.to(torch.bfloat16), TMP)
-    check("P1e bf16 et f32 cohabitent sans se confondre",
+    check("P1e bf16 and f32 coexist without being confused",
           pc.get(A, TMP, torch.float32).dtype is torch.float32
           and pc.get(A, TMP, torch.bfloat16).dtype is torch.bfloat16)
 
     got, missing = pc.get_many([B, A, B], TMP, torch.float32)
-    check("P4 les manquants sont reperes", missing == [0, 2], str(missing))
-    check("P4b le present est a sa place", torch.equal(got[1], emb))
-    check("P4c les absents sont None", got[0] is None and got[2] is None)
+    check("P4 misses are located", missing == [0, 2], str(missing))
+    check("P4b the hit is in its slot", torch.equal(got[1], emb))
+    check("P4c misses are None", got[0] is None and got[2] is None)
 
-    # --- P5 : un cache incoherent est une erreur bruyante, pas un mauvais conditionnement ------
+    # --- P5: an inconsistent cache is a loud error, not a wrong conditioning --------------------
     p = pc.path_of(B, TMP, torch.float32)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     torch.save({"prompt": "un autre texte", "embed": torch.zeros(4)}, p)
     try:
         pc.get(B, TMP, torch.float32)
-        raise SystemExit("FAIL P5 : un cache contenant un autre prompt a ete accepte")
+        raise SystemExit("FAIL P5: a cache holding a different prompt was accepted")
     except RuntimeError:
-        check("P5 cache incoherent refuse bruyamment", True)
+        check("P5 inconsistent cache loudly refused", True)
 
-    # --- P6 : un fichier abime se re-encode au lieu de planter ---------------------------------
+    # --- P6: a damaged file re-encodes instead of crashing --------------------------------------
     with open(p, "wb") as f:
         f.write(b"pas un tenseur")
-    check("P6 fichier abime -> None (on re-encode)", pc.get(B, TMP, torch.float32) is None)
+    check("P6 damaged file -> None (we re-encode)", pc.get(B, TMP, torch.float32) is None)
 
-    # --- P7 : l'ecriture est atomique (aucun .tmp ne survit) -----------------------------------
+    # --- P7: the write is atomic (no .tmp survives) ---------------------------------------------
     leftovers = [f for _, _, fs in os.walk(TMP) for f in fs if ".tmp" in f]
-    check("P7 aucun fichier temporaire laisse", not leftovers, str(leftovers))
+    check("P7 no temporary file left behind", not leftovers, str(leftovers))
 
     st = pc.stats(TMP)
-    check("P8 les statistiques comptent les entrees", st["n"] >= 3 and st["bytes"] > 0, str(st))
+    check("P8 stats count the entries", st["n"] >= 3 and st["bytes"] > 0, str(st))
 
-    print(f"\n{len(OK)}/{len(OK)} tests cache de prompts PASS")
+    print(f"\n{len(OK)}/{len(OK)} prompt-cache tests PASS")
 finally:
     shutil.rmtree(TMP, ignore_errors=True)

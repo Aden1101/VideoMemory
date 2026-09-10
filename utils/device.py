@@ -1,21 +1,20 @@
 # ============================================================================================
-# UNE SEULE SOURCE DE VERITE POUR L'ACCELERATEUR.
+# ONE SOURCE OF TRUTH FOR THE ACCELERATOR.
 #
-# Ajoute le 2026-09-09. Le depot supposait partout que l'accelerateur etait une carte NVIDIA :
-# le peripherique etait construit en interrogeant le pilote CUDA a l'import (utils/memory.py),
-# les chronometres etaient des evenements CUDA, l'AMP venait de torch.cuda.amp, et le RoPE
-# passait par du float64. Aucune de ces hypotheses n'est necessaire ; elles etaient juste
-# dispersees dans six fichiers.
+# Added 2026-09-09. The repo assumed everywhere that the accelerator was an NVIDIA card: the
+# device object was built by querying the CUDA driver at import time (utils/memory.py), the
+# timers were CUDA events, AMP came from torch.cuda.amp, and RoPE went through float64. None of
+# those assumptions is necessary; they were simply scattered across six files.
 #
-# CONTRAT, non negociable : sur CUDA, chaque fonction ci-dessous delegue a l'appel torch.cuda
-# d'origine, a l'identique. Aucun chiffre deja mesure ne peut bouger. Ce module ne rend pas le
-# code "compatible Mac", il retire une hypothese materielle -- Metal et le processeur en
-# beneficient, une carte NVIDIA ne voit strictement aucune difference.
+# CONTRACT, non-negotiable: on CUDA every function below delegates to the original torch.cuda
+# call, identically. No number already measured can move. This module does not make the code
+# "Mac-compatible", it removes a hardware assumption -- Metal and CPU benefit, an NVIDIA card
+# sees strictly no difference.
 #
-# Ce que ce module n'est PAS : une couche d'abstraction generale sur les accelerateurs. Il
-# expose exactement les cinq choses que ce depot demandait au pilote, et rien de plus.
+# What this module is NOT: a general abstraction layer over accelerators. It exposes exactly
+# the five things this repo asked of the driver, and nothing more.
 #
-# Surcharge manuelle : AF_DEVICE=cpu|mps|cuda|cuda:1 dans l'environnement.
+# Manual override: AF_DEVICE=cpu|mps|cuda|cuda:1 in the environment.
 # ============================================================================================
 import os
 import time
@@ -36,10 +35,10 @@ def _detect():
     return cpu
 
 
-# Resolu une fois, a l'import, comme l'ancien `gpu` -- mais sans jamais interroger un pilote
-# absent. C'est la ligne qui faisait planter tout le chemin d'inference hors CUDA.
+# Resolved once, at import, like the old `gpu` -- but without ever querying a driver that is
+# not there. That line is what crashed the whole inference path off CUDA.
 device = _detect()
-gpu = device                      # ancien nom, garde pour ne rien casser en amont
+gpu = device                      # legacy name, kept so nothing upstream breaks
 
 
 def kind(dev=None):
@@ -51,32 +50,32 @@ def is_cuda(dev=None):
 
 
 def autocast_device_type(dev=None):
-    """Le premier argument de torch.autocast. 'cpu' n'a pas de bf16 utile partout, mais c'est
-    a l'appelant de decider d'activer ou non ; ici on ne fait que nommer le peripherique."""
+    """First argument to torch.autocast. Whether to enable autocast at all is the caller's
+    decision; here we only name the device."""
     return kind(dev)
 
 
 def supports_float64(dev=None):
-    """Metal ne supporte PAS le float64, a aucun degre : la conversion leve une TypeError.
-    Le RoPE de Wan calcule ses phases en float64 ; sur CUDA on garde ce dtype exactement (donc
-    les memes chiffres qu'avant), ailleurs on retombe en float32."""
+    """Metal does NOT support float64 at all: the conversion raises TypeError. Wan's RoPE
+    computes its phases in float64; on CUDA we therefore keep that dtype exactly (hence the same
+    numbers as before), and fall back to float32 elsewhere."""
     return kind(dev) != "mps"
 
 
 def phase_dtype(dev=None):
-    """Le dtype des calculs de phase du RoPE. float64 partout ou il existe."""
+    """Dtype for RoPE phase computations. float64 wherever it exists."""
     return torch.float64 if supports_float64(dev) else torch.float32
 
 
 def high_precision_dtype(x=None):
-    """Le dtype "haute precision" du depot : float64 partout ou il existe, float32 sur Metal.
+    """The repo's "high precision" dtype: float64 wherever it exists, float32 on Metal.
 
-    Accepte un tensor, un torch.device, une chaine, ou rien (le peripherique courant). Le code
-    fait un `.double()` a plusieurs endroits ou la precision compte reellement -- conversion
-    flux/x0, ajout de bruit du scheduler, pertes DMD -- parce qu'une erreur d'arrondi y est
-    multipliee par 1/sigma quand sigma est petit. Sur CUDA et CPU on garde donc float64 et le
-    calcul est celui d'origine ; Metal ne supportant pas du tout le float64, on y retombe en
-    float32 et ce compromis est declare, pas subi. (2026-09-09)
+    Accepts a tensor, a torch.device, a string, or nothing (the current device). The code calls
+    `.double()` in several places where precision genuinely matters -- flow/x0 conversion,
+    scheduler noise addition, DMD losses -- because a rounding error there is multiplied by
+    1/sigma when sigma is small. On CUDA and CPU we therefore keep float64 and the computation is
+    the original one; since Metal has no float64 at all, we fall back to float32 there and the
+    trade-off is declared rather than suffered. (2026-09-09)
     """
     if isinstance(x, torch.Tensor):
         dev = x.device
@@ -88,10 +87,10 @@ def high_precision_dtype(x=None):
 
 
 def hp(x, dev=None):
-    """`x` deplace sur `dev` (defaut : son propre peripherique) et converti en haute precision.
+    """`x` moved to `dev` (default: its own device) and cast to high precision.
 
-    L'ORDRE compte : convertir puis deplacer echouerait, parce qu'un tensor float64 ne peut pas
-    etre transfere vers Metal. On deplace d'abord, on convertit ensuite.
+    ORDER MATTERS: casting then moving would fail, because a float64 tensor cannot be
+    transferred to Metal. Move first, cast second.
     """
     target = torch.device(dev) if dev is not None else x.device
     return x.to(device=target, dtype=high_precision_dtype(target))
@@ -118,20 +117,20 @@ def total_memory_gb(dev=None):
     if k == "cuda":
         return torch.cuda.get_device_properties(dev).total_memory / (1024 ** 3)
     if k == "mps":
-        # le plafond de travail conseille par Metal, pas la RAM totale : c'est bien la
-        # quantite qu'un processus peut esperer utiliser sur une memoire unifiee
+        # Metal's recommended working-set ceiling, not total RAM: on unified memory this is the
+        # amount a process can actually expect to use.
         return torch.mps.recommended_max_memory() / (1024 ** 3)
     return float(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
 
 
 def free_memory_gb(dev=None):
-    """Memoire disponible en Go.
+    """Available memory in GB.
 
-    CUDA : le calcul d'origine, mot pour mot (libre selon le pilote + reserve inactive de
-    l'allocateur de PyTorch, qui est reutilisable sans passer par le pilote).
-    Metal : `mem_get_info` n'existe pas ; on prend le plafond conseille moins ce que
-    l'allocateur detient reellement. C'est une approximation, plus prudente que la verite,
-    et elle sert au meme usage : decider s'il faut deplacer des modules.
+    CUDA: the original computation, verbatim (driver-free bytes + PyTorch's inactive reserved
+    pool, which is reusable without going back to the driver).
+    Metal: `mem_get_info` does not exist; we take the recommended ceiling minus what the
+    allocator actually holds. It is an approximation, more conservative than the truth, and it
+    serves the same purpose: deciding whether modules need to be moved.
     """
     k = kind(dev)
     if k == "cuda":
@@ -147,12 +146,11 @@ def free_memory_gb(dev=None):
 
 
 class Timer:
-    """Chronometre a l'interface des evenements CUDA (record / elapsed_time en ms).
+    """Stopwatch with the CUDA-event interface (record / elapsed_time in ms).
 
-    CUDA et Metal ont tous deux de vrais evenements ; ailleurs on retombe sur l'horloge murale
-    apres synchronisation. Le point important est que `elapsed_time` rende TOUJOURS des
-    millisecondes, quelle que soit la voie : un chronometre qui change d'unite selon la machine
-    est pire que pas de chronometre.
+    CUDA and Metal both have real events; elsewhere we fall back to the wall clock after a
+    synchronize. The point is that `elapsed_time` ALWAYS returns milliseconds whichever path is
+    taken: a stopwatch that changes unit depending on the machine is worse than no stopwatch.
     """
 
     __slots__ = ("_dev", "_impl", "_t")
@@ -176,14 +174,14 @@ class Timer:
             self._t = time.perf_counter()
 
     def elapsed_time(self, end):
-        """Millisecondes entre ce chronometre et `end` (meme sens que torch.cuda.Event)."""
+        """Milliseconds between this stopwatch and `end` (same direction as torch.cuda.Event)."""
         if self._impl is not None:
             return self._impl.elapsed_time(end._impl)
         return (end._t - self._t) * 1000.0
 
 
 def describe():
-    """Une ligne pour les journaux : ce qu'on a trouve et ce qu'on va utiliser."""
+    """One line for the logs: what we found and what we are going to use."""
     k = kind()
     if k == "cuda":
         name = torch.cuda.get_device_name(device)
@@ -191,6 +189,6 @@ def describe():
         name = "Apple GPU (Metal)"
     else:
         name = "CPU"
-    return (f"peripherique={device} ({name}) | memoire {free_memory_gb():.1f}/"
-            f"{total_memory_gb():.1f} Go | float64 "
-            f"{'oui' if supports_float64() else 'non (RoPE en float32)'}")
+    return (f"device={device} ({name}) | memory {free_memory_gb():.1f}/"
+            f"{total_memory_gb():.1f} GB | float64 "
+            f"{'yes' if supports_float64() else 'no (RoPE in float32)'}")

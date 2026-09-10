@@ -19,20 +19,20 @@ import os
 
 
 class WanTextEncoder(torch.nn.Module):
-    """Encodeur de texte, avec cache disque et chargement optionnellement paresseux.
+    """Text encoder, with an on-disk cache and optionally lazy construction.
 
-    DEUX AJOUTS (2026-09-09), tous deux inertes par defaut sur l'installation d'origine :
+    TWO ADDITIONS (2026-09-09), both inert by default on the original install:
 
-    1. `forward` consulte d'abord le cache d'embeddings (utils/prompt_cache). Un prompt en
-       cache rend le tenseur EXACTEMENT tel qu'il avait ete produit, meme dtype, donc la
-       sortie est identique au bit pres a un run sans cache. Toujours actif : c'est un gain
-       de temps pur (l'encodage d'un prompt coute ~90 s ici), sans effet sur les resultats.
+    1. `forward` consults the embedding cache first (utils/prompt_cache). A cached prompt
+       returns the tensor EXACTLY as it was produced, same dtype, so the output is bitwise
+       identical to an uncached run. Always on: it is a pure time saving (encoding one prompt
+       costs ~90 s here) with no effect on results.
 
-    2. AF_LAZY_TEXT_ENCODER=1 differe la CONSTRUCTION des 11.4 Go jusqu'au premier prompt
-       absent du cache. Avec un cache complet, l'encodeur n'est jamais construit et la
-       memoire reste au generateur. Par defaut le drapeau est absent et le chargement reste
-       AVIDE, exactement comme avant -- la voie CUDA n'est pas touchee, y compris son
-       interaction avec DynamicSwapInstaller, qui parcourt les sous-modules a l'installation.
+    2. AF_LAZY_TEXT_ENCODER=1 defers CONSTRUCTION of the 11.4 GB until the first prompt that
+       misses the cache. With a full cache the encoder is never built and the memory stays with
+       the generator. By default the flag is absent and loading stays EAGER, exactly as before
+       -- the CUDA path is untouched, including its interaction with DynamicSwapInstaller, which
+       walks the submodules at install time.
     """
 
     def __init__(self) -> None:
@@ -41,11 +41,11 @@ class WanTextEncoder(torch.nn.Module):
         self._lazy = os.environ.get("AF_LAZY_TEXT_ENCODER", "") == "1"
         self.text_encoder = None
         self._resident_device = af_device
-        # SONDE DE DTYPE. inference.py fait `pipeline = pipeline.to(dtype=torch.bfloat16)`, ce
-        # qui convertit aussi cet encodeur. En mode paresseux il n'existe pas encore a cet
-        # instant et echapperait donc a la conversion : ce tampon, lui, la subit, et nous dit
-        # dans quelle precision le pipeline veut travailler. Sans lui, le cache rendrait du
-        # float32 a un modele bfloat16 (assertion Metal, ou pire, promotion silencieuse).
+        # DTYPE PROBE. inference.py does `pipeline = pipeline.to(dtype=torch.bfloat16)`, which
+        # casts this encoder too. In lazy mode it does not exist yet at that moment and would
+        # escape the cast; this buffer does undergo it, and tells us which precision the pipeline
+        # wants to work in. Without it the cache would hand float32 to a bfloat16 model (Metal
+        # assertion, or worse, a silent promotion).
         self.register_buffer("_dtype_probe", torch.zeros((), dtype=torch.float32),
                              persistent=False)
         self.tokenizer = HuggingfaceTokenizer(
@@ -54,12 +54,12 @@ class WanTextEncoder(torch.nn.Module):
             self._build()
 
     def _build(self) -> None:
-        """Construit et charge les poids. Appele a l'init (defaut) ou au premier defaut de
-        cache (mode paresseux)."""
+        """Build and load the weights. Called at init (default) or on the first cache miss
+        (lazy mode)."""
         if self.text_encoder is not None:
             return
         if self._lazy and (not dist.is_initialized() or dist.get_rank() == 0):
-            print("[text_encoder] defaut de cache -> chargement des 11.4 Go", flush=True)
+            print("[text_encoder] cache miss -> loading 11.4 GB", flush=True)
         self.text_encoder = umt5_xxl(
             encoder_only=True,
             return_tokenizer=False,
@@ -71,31 +71,30 @@ class WanTextEncoder(torch.nn.Module):
                        map_location='cpu', weights_only=False)
         )
         
-        # L'encodeur de texte reste sur le CPU sauf sur CUDA -- c'est la semantique D'ORIGINE
-        # (`if torch.cuda.is_available()`), et elle etait juste.
+        # The text encoder stays on CPU except on CUDA -- that is the ORIGINAL semantics
+        # (`if torch.cuda.is_available()`), and it was right.
         #
-        # 2026-09-09, correction d'une erreur que j'ai introduite le matin meme : j'avais
-        # generalise ce test en "tout accelerateur", ce qui pose les 11 Go de umT5-XXL dans le
-        # pool de l'accelerateur. Sur une carte de 48 Go c'est indolore ; sur les 17.8 Go de
-        # pool d'un Mac ca affame le generateur et le decodeur d'image tombe en OOM. C'est
-        # precisement ce que DynamicSwapInstaller est la pour eviter : il diffuse les poids
-        # depuis la RAM a chaque acces, et il ne peut rien faire si le modele y est deja.
+        # 2026-09-09, fixing a mistake introduced earlier the same day: generalising this test to
+        # "any accelerator" puts umT5-XXL's 11 GB into the accelerator pool. On a 48 GB card that
+        # is painless; on a Mac's 17.8 GB pool it starves the generator and the VAE decode OOMs.
+        # Avoiding exactly that is what DynamicSwapInstaller is for: it streams the weights from
+        # RAM on each access, and it can do nothing if the model is already on the device.
         if torch.cuda.is_available():
             self.text_encoder = self.text_encoder.cuda()
-        # ou les poids RESIDENT reellement, pour y envoyer les entrees
+        # where the weights actually RESIDE, so inputs can be sent there
         self._resident_device = next(self.text_encoder.parameters()).device
 
 
     @property
     def device(self):
-        """Le peripherique ou envoyer les entrees. Ce n'est PAS forcement l'accelerateur.
+        """The device to send inputs to. It is NOT necessarily the accelerator.
 
-        Trois cas, et les confondre donne "Passed CPU tensor to MPS op" :
-          - modele pas encore construit (mode paresseux) -> l'accelerateur, par defaut ;
-          - modele enveloppe par DynamicSwapInstaller -> ses poids sont diffuses vers
-            l'accelerateur a CHAQUE acces, donc les entrees doivent y etre aussi ;
-          - sinon -> la ou le modele reside vraiment (CPU hors CUDA, depuis qu'on a retabli
-            la semantique d'origine).
+        Three cases, and confusing them gives "Passed CPU tensor to MPS op":
+          - model not built yet (lazy mode) -> the accelerator, by default;
+          - model wrapped by DynamicSwapInstaller -> its weights are streamed to the accelerator
+            on EVERY access, so the inputs must be there too;
+          - otherwise -> wherever the model actually resides (CPU off CUDA, since the original
+            semantics were restored).
         """
         if self.text_encoder is None:
             return af_device
@@ -104,7 +103,7 @@ class WanTextEncoder(torch.nn.Module):
         return self._resident_device
 
     def encode(self, text_prompts: List[str]) -> torch.Tensor:
-        """L'encodage reel, sans cache. C'est le corps historique de `forward`."""
+        """The actual encoding, cache-free. This is the historical body of `forward`."""
         self._build()
         ids, mask = self.tokenizer(
             text_prompts, return_mask=True, add_special_tokens=True)
@@ -119,12 +118,12 @@ class WanTextEncoder(torch.nn.Module):
         return context
 
     def forward(self, text_prompts: List[str]) -> dict:
-        """Cache d'abord, encodeur ensuite, et UNIQUEMENT pour les prompts manquants.
+        """Cache first, encoder second, and ONLY for the missing prompts.
 
-        Les prompts absents sont encodes en un seul lot (l'encodeur travaille par lot) puis
-        ecrits au cache. Le resultat est reassemble dans l'ORDRE D'ENTREE : melanger les lignes
-        associerait un prompt au conditionnement d'un autre, une erreur qui ne leverait aucune
-        exception et fausserait toute une campagne."""
+        Missing prompts are encoded in a single batch (the encoder works batch-wise) then written
+        to the cache. The result is reassembled in INPUT ORDER: shuffling the rows would pair a
+        prompt with another one's conditioning, an error that raises no exception and would
+        falsify an entire campaign."""
         want = self._dtype_probe.dtype
         cached, missing = prompt_cache.get_many(text_prompts, self.cache_dir, want)
         if missing:

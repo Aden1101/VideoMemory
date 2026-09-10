@@ -4,10 +4,10 @@
 
 import torch
 
-# 2026-09-09 : `gpu` etait construit en interrogeant le pilote CUDA A L'IMPORT, ce qui faisait
-# planter tout le chemin d'inference sur une machine sans NVIDIA, avant meme le premier poids.
-# utils/device resout le peripherique une fois, sans jamais interroger un pilote absent, et
-# delegue a torch.cuda a l'identique quand CUDA est la.
+# 2026-09-09: `gpu` was built by querying the CUDA driver AT IMPORT TIME, which crashed the
+# whole inference path on a non-NVIDIA machine before the first weight was even loaded.
+# utils/device resolves the device once, without ever querying an absent driver, and delegates
+# to torch.cuda identically when CUDA is present.
 from utils.device import cpu, device as gpu, empty_cache, free_memory_gb, total_memory_gb
 
 gpu_complete_modules = []
@@ -73,9 +73,8 @@ def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.d
 
 
 def get_cuda_free_memory_gb(device=None):
-    """Nom historique conserve (il est importe tel quel dans cinq fichiers). Le calcul CUDA
-    est celui d'origine, mot pour mot ; les autres peripheriques ont leur equivalent dans
-    utils/device."""
+    """Legacy name kept (it is imported as-is in five files). The CUDA computation is the
+    original one, word for word; other devices have their equivalent in utils/device."""
     return free_memory_gb(device if device is not None else gpu)
 
 

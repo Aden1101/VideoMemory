@@ -1,40 +1,44 @@
 #!/usr/bin/env python
 # ============================================================================================
-# PLANCHES EN AVEUGLE -- generateur. Reconstruit le 2026-09-09 d'apres les seize planches
-# publiees entre le 13 et le 29/08 (leur code source est perdu avec l'arbre de travail ; il ne
-# restait que les pages HTML, dont on a relu le libelle exact, les options de reponse et le
-# mecanisme "copier mes reponses").
+# BLIND JUDGING BOARDS -- generator. Rebuilt 2026-09-09 from the sixteen boards published
+# between 13 and 29 August (their source is gone with the working tree; only the HTML pages
+# survived, and their exact wording, answer options and "copy my answers" mechanism were read
+# back from them).
 #
-# TROIS FORMATS, un par question que la campagne posait :
+# NOTE ON LANGUAGE: the strings SHOWN TO THE JUDGE stay in French, deliberately. They are the
+# experimental protocol -- the August campaigns were judged with that exact wording, and
+# changing it would break comparability with those judgments. Only the code is in English.
+#
+# THREE FORMATS, one per question the campaign asked:
 #
 #   pair2   "Reconnait-on la personne ?" (22/08, 30 questions)
-#           une image en haut (sortie du decodeur OU vraie image floutee), deux personnes
-#           reelles en dessous, laquelle est-ce ?  ->  mesure la FIDELITE D'INSTANCE de la
-#           sortie contre l'echelle de flou.  Options : gauche | droite | impossible a dire.
+#           one image on top (decoder output OR the real image blurred), two real people below,
+#           which one is it?  ->  measures the INSTANCE FIDELITY of the output against the blur
+#           ladder.  Options: left | right | cannot tell.
 #
-#   rank3   "La mosaique a-t-elle disparu ?" (23/08, 10 lignes x 6 reponses)
-#           la vraie personne a gauche, trois reconstructions melangees (l'ancienne + deux
-#           nouvelles) : classer les trois, puis juger chacune.  ->  compare des VARIANTES DE
-#           DECODEUR entre elles.  Options de jugement : oui | a peu pres | non.
+#   rank3   "La mosaique a-t-elle disparu ?" (23/08, 10 rows x 6 answers)
+#           the real person on the left, three shuffled reconstructions (the old one + two new):
+#           rank all three, then judge each.  ->  compares DECODER VARIANTS against each other.
+#           Judgment options: yes | roughly | no.
 #
-#   duel2   "Lequel est bien la personne du debut ?" (23 au 29/08, jusqu'a 20 scenes)
-#           deux versions APPARIEES du meme retour video, G et D, laquelle ramene la personne.
-#           ->  le test final, en video, entre deux bras.  Options : G | D | impossible a dire.
+#   duel2   "Lequel est bien la personne du debut ?" (23 to 29 August, up to 20 scenes)
+#           two PAIRED versions of the same video return, left and right, which one brings the
+#           person back.  ->  the final test, on video, between two arms.  Options: L | R |
+#           cannot tell.
 #
-# LES REGLES DE LA MAISON, toutes appliquees ici et toutes verifiees par selftest_boards.py :
-#  1. La table de correspondance vit dans key_<id>.json, JAMAIS dans la page. Le selftest lit
-#     le HTML produit et echoue s'il y trouve un nom de bras, un chemin de fichier ou l'ordre
-#     reel des colonnes.
-#  2. La permutation vient d'un hash sale FIGE (comme fidelity_common.letter_perm) : la meme
-#     planche regeneree donne le meme melange, donc une planche perdue se reconstruit.
-#  3. "Impossible a dire" est une reponse a part entiere, jamais un blanc : la consigne dit de
-#     s'en servir, et le scoreur la compte separement au lieu de la diluer dans le hasard.
-#  4. Le cote / la lettre du bon sujet est retire au sort A CHAQUE question, jamais par planche.
-#  5. La page est autonome : aucun script externe, aucune police externe, medias en data URI.
-#     Elle passe telle quelle dans un Artifact (plafond 16 Mo, verifie a la construction).
+# HOUSE RULES, all applied here and all verified by selftest_boards.py:
+#  1. The answer key lives in key_<id>.json, NEVER in the page. The selftest reads the produced
+#     HTML back and fails if it finds an arm name, a file path or the real column order.
+#  2. The permutation comes from a FROZEN salted hash (like fidelity_common.letter_perm): the
+#     same board regenerated gives the same shuffle, so a lost board can be rebuilt.
+#  3. "Cannot tell" is a first-class answer, never a blank: the instructions tell the judge to
+#     use it, and the scorer counts it separately instead of diluting it into chance.
+#  4. The side / letter of the true subject is drawn PER QUESTION, never per board.
+#  5. The page is self-contained: no external script, no external font, media as data URIs. It
+#     goes into an Artifact as is (16 MB ceiling, checked at build time).
 #
-# Usage :
-#   python boards.py demo --out /tmp/demo          # fabrique une planche de chaque type
+# Usage:
+#   python boards.py demo --out /tmp/demo          # builds one board of each type
 #   from boards import build_pair2, build_rank3, build_duel2
 # ============================================================================================
 import base64
@@ -45,7 +49,7 @@ import mimetypes
 import os
 import time
 
-# Sel FIGE. Le changer invalide toutes les planches deja jugees : ne jamais le toucher.
+# FROZEN salt. Changing it invalidates every board already judged: never touch it.
 SALT = "eyeboards-2026-09-09"
 CODE_VERSION = "1"
 ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
@@ -56,17 +60,17 @@ _JUDGE = {"o": "oui", "a": "a peu pres", "n": "non"}
 
 # ----------------------------- permutation deterministe ---------------------------------------
 def perm(board_id, item_id, n):
-    """Permutation deterministe de n slots pour (planche, question). Retourne la liste des
-    indices sources dans l'ordre d'affichage.
+    """Deterministic permutation of n slots for (board, question). Returns the list of source
+    indices in display order.
 
-    Fisher-Yates pilote par un flux d'octets sha256 : reproductible sur toute machine et sans
-    numpy, contrairement a random.shuffle dont l'implementation n'est pas un contrat."""
-    assert 1 <= n <= len(LETTERS), f"n={n} hors bornes"
+    Fisher-Yates driven by an sha256 byte stream: reproducible on any machine and without numpy,
+    unlike random.shuffle whose implementation is not a contract."""
+    assert 1 <= n <= len(LETTERS), f"n={n} out of range"
     idx = list(range(n))
     stream = hashlib.sha256(f"{SALT}|{board_id}|{item_id}".encode()).digest()
     k = 0
     for i in range(n - 1, 0, -1):
-        if k >= len(stream):                       # rallonge le flux si la planche est longue
+        if k >= len(stream):                       # extend the stream for a long board
             stream += hashlib.sha256(stream).digest()
         j = stream[k] % (i + 1)
         k += 1
@@ -80,14 +84,14 @@ def code_checksum(board_id, payload):
 
 # ----------------------------- medias --------------------------------------------------------
 def data_uri(path):
-    """Fichier local -> data URI. Le mime vient de l'extension ; un type inconnu est une erreur
-    (une planche muette parce qu'un mp4 a ete servi en octet-stream est un cout de plusieurs
-    heures de generation)."""
+    """Local file -> data URI. The MIME type comes from the extension; an unknown type is an
+    error (a mute board because an mp4 was served as octet-stream costs several hours of
+    generation)."""
     mime, _ = mimetypes.guess_type(path)
-    assert mime, f"type MIME inconnu pour {path}"
+    assert mime, f"unknown MIME type for {path}"
     with open(path, "rb") as f:
         raw = f.read()
-    assert raw, f"fichier vide : {path}"
+    assert raw, f"empty file: {path}"
     return f"data:{mime};base64," + base64.b64encode(raw).decode(), len(raw)
 
 
@@ -146,7 +150,7 @@ code#code{display:block;flex:1 1 320px;background:var(--sunk);border:1px solid v
 _JS = """
 (function(){
  var ANS={},N=%(nslots)d,BID=%(bid)s,SUM=%(sum)s,VER=%(ver)s;
- function crc(s){/* le meme sha256 tronque que code_checksum, cote page */
+ function crc(s){/* the same truncated sha256 as code_checksum, page side */
   return SUM;}
  document.addEventListener('click',function(e){
   var b=e.target.closest('button.opt'); if(!b) return;
@@ -193,8 +197,8 @@ def _page(title, lede, cells, board_id, nslots, checksum):
 
 def _finish(out_dir, board_id, title, lede, cells, slots, key, kind, nslots):
     os.makedirs(out_dir, exist_ok=True)
-    # La somme de controle ne depend QUE de la planche : elle authentifie le code renvoye
-    # (bonne planche, bonne version), elle ne chiffre rien -- la cle est ailleurs.
+    # The checksum depends ONLY on the board: it authenticates the returned code (right board,
+    # right version), it encrypts nothing -- the key lives elsewhere.
     checksum = code_checksum(board_id, kind)
     page = _page(title, lede, cells, board_id, nslots, checksum)
     html_path = os.path.join(out_dir, f"{board_id}.html")
@@ -202,8 +206,8 @@ def _finish(out_dir, board_id, title, lede, cells, slots, key, kind, nslots):
         f.write(page)
     size = os.path.getsize(html_path)
     assert size <= ARTIFACT_MAX_BYTES, (
-        f"planche {size/1e6:.1f} Mo > plafond Artifact 16 Mo : reduis les medias "
-        f"(la campagne d'aout tenait ~0.29 Mo par clip, cf. anonymize.py)")
+        f"board is {size/1e6:.1f} MB > the 16 MB Artifact ceiling: shrink the media "
+        f"(the August campaign kept ~0.29 MB per clip, cf. anonymize.py)")
     key_path = os.path.join(out_dir, f"key_{board_id}.json")
     with open(key_path, "w", encoding="utf8") as f:
         json.dump({"board_id": board_id, "kind": kind, "version": CODE_VERSION,
@@ -215,11 +219,11 @@ def _finish(out_dir, board_id, title, lede, cells, slots, key, kind, nslots):
 
 # ----------------------------- pair2 ----------------------------------------------------------
 def build_pair2(items, out_dir, board_id="pair2", title="Reconnait-on la personne ?"):
-    """items: [{id, probe, true, twin, meta?}] -- probe = l'image a juger (sortie du decodeur
-    ou vraie image floutee), true/twin = les deux personnes reelles.
+    """items: [{id, probe, true, twin, meta?}] -- probe = the image to judge (decoder output or
+    the real image blurred), true/twin = the two real people.
 
-    Le cote du vrai sujet est tire au sort PAR QUESTION (regle 4) : savoir d'ou vient la
-    sonde n'aide donc pas a repondre, ce que la consigne dit explicitement au juge."""
+    The side of the true subject is drawn PER QUESTION (rule 4): knowing where the probe comes
+    from therefore does not help, which the instructions state explicitly to the judge."""
     lede = ('<p class="lede">En haut, <b>une image</b>. En dessous, <b>deux personnes '
             'reelles</b> : l\'une est celle de l\'image, l\'autre est son sosie, genere avec '
             'le meme texte et une autre graine. Tu dis laquelle.</p>'
@@ -248,7 +252,7 @@ def build_pair2(items, out_dir, board_id="pair2", title="Reconnait-on la personn
             f'<div class="q">cette image, c\'est laquelle des deux personnes ?</div>'
             f'<div class="row">{"".join(cols)}</div>'
             f'<div class="opts">{opts}</div></div>')
-        # la cle : de quel cote se trouve le VRAI sujet
+        # the key: which side holds the TRUE subject
         true_side = "g" if order[0] == 0 else "d"
         key.append({"id": it["id"], "slot": total, "true_side": true_side,
                     "meta": it.get("meta", {})})
@@ -259,11 +263,11 @@ def build_pair2(items, out_dir, board_id="pair2", title="Reconnait-on la personn
 
 # ----------------------------- rank3 -----------------------------------------------------------
 def build_rank3(items, out_dir, board_id="rank3", title="La mosaique a-t-elle disparu ?"):
-    """items: [{id, truth, variants: {nom: chemin} (exactement 3), meta?}].
+    """items: [{id, truth, variants: {name: path} (exactly 3), meta?}].
 
-    Deux reponses par variante -- un RANG (1..3) et un jugement -- parce que la planche du
-    23/08 demandait les deux : le rang compare les variantes entre elles (ce qui survit meme
-    si aucune n'est bonne), le jugement dit si l'une passe la barre absolue."""
+    Two answers per variant -- a RANK (1..3) and a judgment -- because the 23/08 board asked for
+    both: the rank compares variants against each other (which survives even if none is good),
+    the judgment says whether one clears the absolute bar."""
     lede = ('<p class="lede">A gauche <b>la vraie personne</b>. A droite, trois '
             'reconstructions faites depuis la memoire, melangees a chaque ligne. Pour chaque '
             'ligne, <b>classe les trois</b> de la meilleure a la moins bonne, puis dis pour '
@@ -274,7 +278,7 @@ def build_rank3(items, out_dir, board_id="rank3", title="La mosaique a-t-elle di
     cells, key, slots, total = [], [], [], 0
     for n, it in enumerate(items):
         names = list(it["variants"])
-        assert len(names) == 3, f"rank3 attend 3 variantes, {it['id']} en a {len(names)}"
+        assert len(names) == 3, f"rank3 expects 3 variants, {it['id']} has {len(names)}"
         order = perm(board_id, it["id"], 3)
         truth, _ = _media_tag(it["truth"], "image", "m")
         cols = [f'<div class="col"><div class="cap">la vraie personne</div>{truth}</div>']
@@ -306,10 +310,10 @@ def build_rank3(items, out_dir, board_id="rank3", title="La mosaique a-t-elle di
 # ----------------------------- duel2 ------------------------------------------------------------
 def build_duel2(items, out_dir, board_id="duel2",
                 title="Lequel est bien la personne du debut ?"):
-    """items: [{id, arms: {nom_bras: chemin_video} (exactement 2), meta?}].
+    """items: [{id, arms: {arm_name: video_path} (exactly 2), meta?}].
 
-    C'est la planche finale du 29/08. Il n'y a pas de bonne reponse au sens du corrige : on
-    compte les preferences par bras, et le scoreur les teste contre le pile ou face."""
+    This is the final board of 29 August. There is no right answer in the answer-key sense: we
+    count preferences per arm, and the scorer tests them against a coin flip."""
     lede = ('<p class="lede">Dans chaque scene, une personne apparait, une autre scene se '
             'deroule, puis on la fait revenir. Tu vois <b>deux versions du meme retour</b>, '
             'cote a cote : a gauche (G) et a droite (D). Une seule question : <b>laquelle des '
@@ -320,7 +324,7 @@ def build_duel2(items, out_dir, board_id="duel2",
     cells, key, slots, total = [], [], [], 0
     for n, it in enumerate(items):
         arms = list(it["arms"])
-        assert len(arms) == 2, f"duel2 attend 2 bras, {it['id']} en a {len(arms)}"
+        assert len(arms) == 2, f"duel2 expects 2 arms, {it['id']} has {len(arms)}"
         order = perm(board_id, it["id"], 2)
         cols = []
         placed = {}
@@ -347,8 +351,8 @@ def build_duel2(items, out_dir, board_id="duel2",
 
 # ----------------------------- demo -------------------------------------------------------------
 def _demo(out):
-    """Fabrique une planche de chaque type avec des PNG de synthese : verifie la chaine
-    complete sans un seul rollout, et sert de reference visuelle."""
+    """Builds one board of each type from synthetic PNGs: exercises the whole chain without a
+    single rollout, and serves as a visual reference."""
     import struct
     import zlib
 
@@ -379,14 +383,14 @@ def _demo(out):
     r3 = build_duel2([{"id": f"s{i:02d}", "arms": {"memon": pb, "memoff": pc}}
                       for i in range(3)], out)
     for r in (r1, r2, r3):
-        print(f"  {os.path.basename(r['html'])}  {r['n_slots']} cases  "
-              f"{r['bytes']/1024:.0f} Ko  cle -> {os.path.basename(r['key'])}")
+        print(f"  {os.path.basename(r['html'])}  {r['n_slots']} slots  "
+              f"{r['bytes']/1024:.0f} KB  key -> {os.path.basename(r['key'])}")
     return r1, r2, r3
 
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="generateur de planches en aveugle")
+    ap = argparse.ArgumentParser(description="blind judging board generator")
     ap.add_argument("cmd", choices=["demo"])
     ap.add_argument("--out", default="/tmp/eyeboards_demo")
     a = ap.parse_args()

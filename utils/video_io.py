@@ -1,17 +1,17 @@
 # ============================================================================================
-# ECRITURE DE VIDEO -- une seule porte d'entree.
+# VIDEO WRITING -- one entry point.
 #
-# 2026-09-09. `torchvision.io.write_video` a ete deprecie puis RETIRE des versions recentes de
-# torchvision (il n'existe plus a partir de la 0.24). Le depot l'importe en haut de quatre
-# fichiers, donc sur une installation recente le chemin d'inference casse a l'import, avec un
-# message qui ne dit rien du probleme reel.
+# 2026-09-09. `torchvision.io.write_video` was deprecated and then REMOVED from recent
+# torchvision releases (gone as of 0.24). The repo imports it at the top of four files, so on
+# any recent install the inference path breaks at import time, with a message that says
+# nothing about the real problem.
 #
-# Ce module garde torchvision quand il est la (comportement et encodage strictement inchanges
-# sur une installation conforme au README, torchvision 0.21) et retombe sinon sur imageio, qui
-# est deja dans requirements.txt. Rien a epingler, rien a reinstaller.
+# This module keeps torchvision when it is there (behaviour and encoding strictly unchanged on
+# a README-conformant install, torchvision 0.21) and otherwise falls back to imageio, which is
+# already in requirements.txt. Nothing to pin, nothing to reinstall.
 #
-# Contrat commun aux deux voies : `frames` est un tenseur (T, H, W, C) en uint8, comme
-# torchvision l'exige.
+# Contract shared by both paths: `frames` is a (T, H, W, C) uint8 tensor, as torchvision
+# requires.
 # ============================================================================================
 import numpy as np
 import torch
@@ -19,7 +19,7 @@ import torch
 try:                                     # torchvision < 0.24
     from torchvision.io import write_video as _tv_write_video
     _BACKEND = "torchvision"
-except ImportError:                      # torchvision >= 0.24, ou torchvision absent
+except ImportError:                      # torchvision >= 0.24, or torchvision absent
     _tv_write_video = None
     _BACKEND = "imageio"
 
@@ -29,7 +29,7 @@ def backend():
 
 
 def write_video(filename, video_array, fps, **kwargs):
-    """Ecrit un mp4. Signature volontairement identique a torchvision.io.write_video."""
+    """Write an mp4. Signature deliberately identical to torchvision.io.write_video."""
     if _tv_write_video is not None:
         return _tv_write_video(filename, video_array, fps=fps, **kwargs)
 
@@ -41,9 +41,9 @@ def write_video(filename, video_array, fps, **kwargs):
         video_array = video_array.numpy()
     video_array = np.asarray(video_array, dtype=np.uint8)
     assert video_array.ndim == 4 and video_array.shape[-1] in (1, 3), \
-        f"attendu (T, H, W, C) uint8, recu {video_array.shape}"
-    # macro_block_size=1 : sans ca imageio redimensionne en silence vers un multiple de 16,
-    # ce qui changerait la geometrie des videos jugees a l'oeil.
+        f"expected (T, H, W, C) uint8, got {video_array.shape}"
+    # macro_block_size=1: without it imageio silently resizes to a multiple of 16, which would
+    # change the geometry of videos that get judged by eye.
     with imageio.get_writer(filename, fps=fps, macro_block_size=1,
                             codec=kwargs.pop("video_codec", "libx264")) as w:
         for frame in video_array:

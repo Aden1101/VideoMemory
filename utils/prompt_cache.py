@@ -1,29 +1,29 @@
 # ============================================================================================
-# CACHE DISQUE DES EMBEDDINGS DE PROMPT -- la passe 1 de la separation en deux passes.
+# ON-DISK PROMPT-EMBEDDING CACHE -- pass 1 of the two-pass split.
 #
-# POURQUOI (2026-09-09). L'encodeur de texte umT5-XXL pese 11.4 Go, le generateur avec son
-# LoRA 3.6 Go, le cache KV 3.2 Go. Sur une machine a memoire unifiee de 24 Go partagee avec le
-# systeme, les tenir ENSEMBLE ne rentre pas : mesure faite, le systeme a tue le processus
-# (SIGKILL) apres avoir sature 15.5 Go de fichier d'echange. Le poser sur l'accelerateur
-# affame le generateur, le poser en RAM fait deborder le systeme. Il n'y a pas de bon cote.
+# WHY (2026-09-09). The umT5-XXL text encoder weighs 11.4 GB, the generator with its LoRA
+# 3.6 GB, the KV cache 3.2 GB. On a 24 GB unified-memory machine shared with the OS, holding
+# them TOGETHER does not fit: measured, the OS killed the process (SIGKILL) after saturating
+# 15.5 GB of swap. Putting the encoder on the accelerator starves the generator; putting it in
+# RAM overflows the system. There is no good side.
 #
-# La sortie est de ne jamais les tenir en meme temps. Un processus encode les prompts et se
-# TERMINE -- c'est la seule facon de rendre vraiment la memoire, un dechargement dans le meme
-# processus laisse toujours les poids quelque part dans le pool partage. Un second processus
-# genere, sans jamais construire l'encodeur.
+# The way out is to never hold them at the same time. One process encodes the prompts and
+# EXITS -- that is the only way to actually return the memory; an in-process offload always
+# leaves the weights somewhere in the shared pool. A second process generates, without ever
+# constructing the encoder.
 #
-# CE QUE CA NE COUTE PAS. Le programme de prompts est toujours connu d'avance dans ce depot :
-# meme le chemin dit "interactif" lit ses scenarios depuis un fichier, il n'existe aucune
-# saisie clavier. Le pre-calcul ne retire donc aucune capacite.
+# WHAT IT DOES NOT COST. The prompt schedule is always known ahead of time in this repo: even
+# the so-called "interactive" path reads its scenarios from a file, there is no keyboard input
+# anywhere. Precomputing therefore removes no capability.
 #
-# GARANTIE D'IDENTITE. On stocke le tenseur EXACTEMENT tel que l'encodeur l'a produit, meme
-# dtype, sans quantification. Une lecture du cache rend donc le meme tenseur au bit pres, et
-# un run avec cache est indiscernable d'un run sans. C'est non negociable : ce depot compare
-# des effets de la taille du bruit de chaine, un arrondi introduit ici serait invisible et
-# faux.
+# IDENTITY GUARANTEE. We store the tensor EXACTLY as the encoder produced it, same dtype, no
+# quantization. A cache read therefore returns the same tensor bit for bit, and a cached run is
+# indistinguishable from an uncached one. This is non-negotiable: this project compares effects
+# the size of its own chain noise, so a rounding error introduced here would be invisible and
+# wrong.
 #
-# CLE = sha256 du texte du prompt. Donc le cache se reutilise d'un run a l'autre et d'une
-# campagne a l'autre, et deux prompts identiques ne sont encodes qu'une fois.
+# KEY = sha256 of the prompt text AND the dtype. The cache is therefore reusable across runs
+# and across campaigns, and identical prompts are encoded only once.
 # ============================================================================================
 import hashlib
 import os
@@ -34,21 +34,21 @@ DEFAULT_DIR = os.environ.get("AF_PROMPT_CACHE", "cache/prompt_embeds")
 
 
 def dtype_tag(dtype) -> str:
-    """Nom court et stable d'un dtype torch, pour la cle."""
+    """Short, stable name of a torch dtype, for the key."""
     return str(dtype).replace("torch.", "")
 
 
 def key_of(prompt: str, dtype=None) -> str:
-    """La cle d'un prompt, DTYPE COMPRIS.
+    """The key of a prompt, DTYPE INCLUDED.
 
-    Le texte est pris VERBATIM (pas de strip, pas de normalisation) : deux prompts qui different
-    d'une espace sont deux conditionnements differents.
+    The text is taken VERBATIM (no strip, no normalization): two prompts differing by one space
+    are two different conditionings.
 
-    Le dtype fait partie de la cle parce que le script d'inference convertit TOUT le pipeline en
-    bfloat16, encodeur compris (inference.py). Un embedding encode en float32 puis converti n'est
-    PAS celui qu'un encodeur bfloat16 aurait produit : poids et activations different. Les
-    melanger donnerait un conditionnement subtilement faux, sans aucune erreur -- exactement le
-    genre de bug que ce dossier a deja paye deux campagnes.
+    The dtype is part of the key because the inference script casts the WHOLE pipeline to
+    bfloat16, encoder included (inference.py). An embedding computed in float32 and then cast is
+    NOT the one a bfloat16 encoder would have produced: weights and activations both differ.
+    Mixing them would give a subtly wrong conditioning with no error raised -- exactly the class
+    of bug this project has already paid two campaigns for.
     """
     tag = dtype_tag(dtype) if dtype is not None else "float32"
     return hashlib.sha256(f"{tag}|{prompt}".encode("utf-8")).hexdigest()
@@ -57,7 +57,7 @@ def key_of(prompt: str, dtype=None) -> str:
 def path_of(prompt: str, cache_dir: str = None, dtype=None) -> str:
     k = key_of(prompt, dtype)
     d = cache_dir or DEFAULT_DIR
-    return os.path.join(d, k[:2], f"{k}.pt")            # 2 niveaux : 256 dossiers max
+    return os.path.join(d, k[:2], f"{k}.pt")            # 2 levels: at most 256 directories
 
 
 def has(prompt: str, cache_dir: str = None, dtype=None) -> bool:
@@ -65,10 +65,9 @@ def has(prompt: str, cache_dir: str = None, dtype=None) -> bool:
 
 
 def put(prompt: str, embed: torch.Tensor, cache_dir: str = None) -> str:
-    """Ecrit l'embedding d'UN prompt. Ecriture atomique (fichier temporaire + rename) : un
-    processus tue en plein ecriture ne doit pas laisser un cache a moitie ecrit qu'une lecture
-    ulterieure prendrait pour valide -- c'est exactement le correctif que le dossier avait deja
-    du appliquer au hook de dump en aout."""
+    """Write ONE prompt's embedding. Atomic write (temp file + rename): a process killed
+    mid-write must not leave a half-written cache entry that a later read would take for valid
+    -- exactly the fix this project already had to apply to its dump hook back in August."""
     p = path_of(prompt, cache_dir, embed.dtype)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     tmp = p + f".tmp{os.getpid()}"
@@ -79,23 +78,23 @@ def put(prompt: str, embed: torch.Tensor, cache_dir: str = None) -> str:
 
 
 def get(prompt: str, cache_dir: str = None, dtype=None):
-    """Rend l'embedding stocke, ou None. Verifie que le prompt enregistre est bien celui
-    demande : une collision de sha256 est impossible en pratique, mais un cache copie a la main
-    ou un fichier corrompu, non."""
+    """Return the stored embedding, or None. Checks that the recorded prompt is the one asked
+    for: a sha256 collision is impossible in practice, but a hand-copied cache or a corrupt
+    file is not."""
     p = path_of(prompt, cache_dir, dtype)
     if not os.path.exists(p):
         return None
     try:
         obj = torch.load(p, map_location="cpu", weights_only=False)
     except Exception:
-        return None                                      # cache abime -> on re-encode
+        return None                                      # damaged entry -> re-encode
     if obj.get("prompt") != prompt:
-        raise RuntimeError(f"cache incoherent : {p} contient un autre prompt que celui demande")
+        raise RuntimeError(f"inconsistent cache: {p} holds a different prompt than requested")
     return obj["embed"]
 
 
 def get_many(prompts, cache_dir: str = None, dtype=None):
-    """Rend (liste d'embeddings ou None, indices manquants)."""
+    """Return (list of embeddings or None, indices of the misses)."""
     out = [get(p, cache_dir, dtype) for p in prompts]
     missing = [i for i, e in enumerate(out) if e is None]
     return out, missing

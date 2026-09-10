@@ -823,7 +823,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
                 # cellules). On garde donc au minimum une fraction f de l'ancre PARTOUT :
                 #     w_a = max(m_a - m_b, f * m_a),  w_n = m_union - w_a,  w_bg = 1 - m_union
                 # f = 0 redonne EXACTEMENT 'priority', f = 1 redonne EXACTEMENT 'noise' : le
-                # plancher interpole entre les deux extremes deja mesures (selftest g11).
+                # floor interpolated between the two already-measured extremes (selftest g11).
                 _ff = float(os.environ.get("MEM_COMP_FILL_FLOOR", "0.4") or 0.4)
                 w_anchor = torch.maximum(m_a - m_b, _ff * m_a).clamp_min(0.0)
                 w_noise = m - w_anchor

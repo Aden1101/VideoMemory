@@ -7,21 +7,20 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
 
-# 2026-09-09 : ces classes appelaient flash_attention DIRECTEMENT, en contournant le
-# repartiteur `attention` du meme module. Consequence : l'attention croisee exigeait
-# flash-attn -- sur n'importe quelle machine, y compris une NVIDIA ou le paquet n'est pas
-# installe, elle levait "assert q.device.type == 'cuda'". Le repartiteur choisit flash quand
-# il est disponible (donc comportement identique sur l'installation du README) et l'attention
-# standard de PyTorch sinon.
-from .attention import attention, flash_attention  # noqa: F401  (flash_attention reste exporte)
+# 2026-09-09: these classes called flash_attention DIRECTLY, bypassing the `attention`
+# dispatcher in the same module. Consequence: cross-attention required flash-attn -- on ANY
+# machine, including an NVIDIA one where the package is not installed, it raised
+# "assert q.device.type == 'cuda'". The dispatcher picks flash when available (hence identical
+# behaviour on a README-conformant install) and PyTorch's standard attention otherwise.
+from .attention import attention, flash_attention  # noqa: F401  (flash_attention stays exported)
 
 __all__ = ['WanModel']
 
 
 def high_precision_dtype(ref):
-    """Le dtype des calculs de phase : float64 partout ou il existe, float32 sur Metal, qui
-    ne le supporte pas du tout. Sur CUDA et CPU la valeur rendue est float64, donc le calcul
-    est celui d'origine, au bit pres. (2026-09-09)"""
+    """Dtype for phase computations: float64 wherever it exists, float32 on Metal, which does not
+    support it at all. On CUDA and CPU the returned value is float64, so the computation is the
+    original one, bit for bit. (2026-09-09)"""
     return torch.float32 if ref.device.type == "mps" else torch.float64
 
 
@@ -50,13 +49,13 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 def rope_freqs_to(freqs, device):
-    """Deplace la table de frequences du RoPE sur `device`, en abaissant la precision UNIQUEMENT
-    la ou le float64 n'existe pas.
+    """Move the RoPE frequency table to `device`, lowering precision ONLY where float64 does not
+    exist.
 
-    2026-09-09. `rope_params` construit la table en complex128 (phases calculees en float64).
-    Metal ne supporte pas du tout le float64, donc un simple .to("mps") leve une TypeError.
-    Sur CUDA et CPU rien ne change : la table reste en complex128 et le RoPE continue de
-    convertir x en float64, donc les chiffres deja mesures sont intacts au bit pres.
+    2026-09-09. `rope_params` builds the table in complex128 (phases computed in float64). Metal
+    does not support float64 at all, so a plain .to("mps") raises TypeError. On CUDA and CPU
+    nothing changes: the table stays complex128 and RoPE keeps casting x to float64, so every
+    number already measured is intact bit for bit.
     """
     if device.type == "mps" and freqs.dtype == torch.complex128:
         return freqs.to(torch.complex64).to(device)
@@ -64,8 +63,8 @@ def rope_freqs_to(freqs, device):
 
 
 def rope_phase_dtype(freqs):
-    """Le dtype dans lequel convertir x avant view_as_complex : il doit s'accorder a la table.
-    complex128 -> float64 (le comportement d'origine), complex64 -> float32."""
+    """The dtype to cast x to before view_as_complex: it must match the table.
+    complex128 -> float64 (the original behaviour), complex64 -> float32."""
     return torch.float64 if freqs.dtype == torch.complex128 else torch.float32
 
 
