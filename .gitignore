@@ -156,3 +156,4 @@ wandb/
 # --- debug log---
 tea_debug.log
 assets/Thumbs.db
+!reference/runs/make_figure.py

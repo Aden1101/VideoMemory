@@ -15,37 +15,69 @@ prompt gives a category ("a woman in a red coat"), never the instance. Those att
 
 ## How it works
 
-A memory branch is inserted in some transformer blocks (layers 5, 16, 27). Each one keeps a
-**fast weight** `W` that is rewritten during generation, not by the optimizer.
+The backbone generates 3 latent frames per step and attends to a rolling KV cache: 3 pinned
+sink frames plus a 12-frame window. A memory branch is inserted in a few transformer blocks
+(layers 5, 16, 27 of 30). Each branch carries a **fast weight** `W` that is rewritten during
+generation, by the forward pass, not by the optimizer.
 
 ```
-read    o = f_W(q)          f_W = SwiGLU, q from the current chunk
-write   W ← Muon-orthogonalized ascent step on ⟨f_W(k), v⟩,
-          then each column renormalized to its initial norm
-inject  x ← x + gate(x) · AdaLN(o)      into the residual stream
+chunk t                    chunk t+1
+   │                          │
+   ▼                          ▼
+┌────────────────────────────────────────┐
+│  KV cache   [ sink ×3 | window ×12 ]   │  FIFO, oldest chunk evicted
+└────────────────────────────────────────┘
+                 │ evicted chunk  (what attention can no longer see)
+                 ▼
+        ┌──────────────────┐
+        │   memory cell    │   read   o = f_W(q)          q from the current chunk
+        │   fast weight W  │   write  W ← renorm(Muon(∇_W ⟨f_W(k), v⟩))
+        └──────────────────┘   inject x ← x + gate(x)·AdaLN(o)   into the residual stream
 ```
 
-The write is fed the chunk that has **just been evicted** from the attention window, so the
-memory holds what attention can no longer see rather than duplicating it.
+Three points are not obvious from the code:
 
-| file | what is in it |
-|---|---|
-| [`wan/modules/video_memory.py`](wan/modules/video_memory.py) | the memory cell: fast-weight state, the write rules, the gated injection, the state→frame decoder |
-| [`wan/modules/causal_model.py`](wan/modules/causal_model.py) | the backbone, the rolling KV cache, and the eviction feed |
-| [`model/streaming_training.py`](model/streaming_training.py) | training objectives, built around a counterfactual memory-off twin of the same chunk |
-| [`utils/device.py`](utils/device.py) | one source of truth for the device (CUDA / Metal / CPU) |
-| [`reference/`](reference/README.md) | the research record: reports, instruments, measured numbers |
+- **The write is fed the evicted chunk**, not the current one. Writing the current chunk would
+  duplicate what attention already has; the memory is only useful for what has left the window.
+- **The write is a forward-pass update**, one gradient-ascent step on an inner score, then
+  Newton–Schulz orthogonalization (Muon) and a per-column renormalization back to the initial
+  norms. The state can rotate but cannot grow.
+- **The output gate is bounded and content-dependent**, so the branch can stay silent when the
+  state holds nothing relevant — the failure mode of an unbounded gate is a constant-magnitude
+  vector added to every frame, which reads as "the memory is toxic" and is really an artifact.
+
+| tensor | shape | lives in |
+|---|---|---|
+| fast weight `w0`, `w2` | `(1, 1536, 6144)` | `TTTBlockCache.state`, carried across chunks |
+| fast weight `w1` | `(1, 6144, 1536)` | same |
+| KV cache per layer | `(1, 18720, 12, 128)` | rolling, overwritten in place |
+| one chunk of queries | `(1, 4680, 1536)` | 3 frames × 1560 tokens |
+
+Training compares each chunk against a **counterfactual twin of itself**: the same chunk
+regenerated with the memory switched off, sharing history, KV cache and noise, so the only
+difference between the two is the injection. `model/streaming_training.py` builds that twin and
+scores four terms against it — identity may not get worse, motion must match, and the injection
+must be measurably non-zero.
 
 ## Result
 
-The memory does not beat attention plus sink on plain identity drift. That is the honest
-outcome, and the reason generalises: the training objective (chunk-local DMD) and the usual
-metrics (VBench subject consistency, DINO drift) reward the **same wrong thing — temporal
-self-similarity** — so a learnable memory converges to a freeze or a constant-bias degeneracy
-that the dashboard scores as healthy. VBench rates a dissolving clip at 0.94.
+![motion vs identity](assets/motion_identity.png)
+
+The memory does not beat attention plus sink. Worse, the training itself costs motion: every
+trained arm sits left of the unmodified model, and switching the memory on does not buy identity
+back. The one point that looks like a win, top centre, is a checkpoint with a third less motion.
+
+The reason generalises. The training objective (chunk-local DMD) and the usual metrics reward
+the same thing — temporal self-similarity — so a learnable memory converges to a freeze or a
+constant-bias degeneracy that the dashboard scores as healthy. The leftmost points above are
+frozen videos, and VBench still rates their subject consistency at 0.93.
+
+Controls matter here: an anchor decoded from a **different video** helps as much as the right
+one, which is how we found that the apparent gain was never content-driven.
 
 One lead is still open: a training-free **delta write rule** reads the subject out of the state
-where the deployed rule does not (median 13.5/19 vs 7.0 over 10 seeds).
+where the deployed rule does not (median 13.5/19 vs 7.0 over 10 seeds, with a background control
+at chance).
 
 ## Running it
 
