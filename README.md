@@ -15,10 +15,9 @@ prompt gives a category ("a woman in a red coat"), never the instance. Those att
 
 ## How it works
 
-The backbone generates 3 latent frames per step and attends to a rolling KV cache: 3 pinned
-sink frames plus a 12-frame window. A memory branch is inserted in a few transformer blocks
-(layers 5, 16, 27 of 30). Each branch carries a **fast weight** `W` that is rewritten during
-generation, by the forward pass, not by the optimizer.
+A memory branch is inserted in a few transformer blocks (layers 5, 16, 27 of 30). Each branch
+carries a **fast weight** `W` that is rewritten during generation, by the forward pass, not by
+the optimizer.
 
 ```
 chunk t                    chunk t+1
@@ -86,6 +85,10 @@ python download_weights.py                    # Wan2.1-T2V-1.3B + Anchor-Forcing
 python encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
 AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path configs/inference.yaml
 ```
+
+That config runs the **unmodified** model. The memory arms carry their own configs under
+`reference/runs/`; always declare `memory_layers` explicitly, because the model default is a
+memory branch whose weights are in no checkpoint.
 
 Two passes because the text encoder (11.4 GB) and the generator do not fit in memory together on
 a consumer machine: pass 1 encodes and exits, pass 2 never loads the encoder. Training needs
