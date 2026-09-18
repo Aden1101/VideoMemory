@@ -62,6 +62,13 @@ must be measurably non-zero.
 
 ![motion vs identity](assets/motion_identity.png)
 
+One panel per training run, each traced across its checkpoints against its own baseline. The
+four share everything except what their titles name: same frozen backbone, same LoRA co-training,
+and the same objective — plain DMD distillation, with every extra loss term in the codebase
+weighted zero. Panel 4 differs from panel 3 by one line of config, the fine-tune it starts from,
+which is why its baseline sits elsewhere. Six prompts per point, one seed; EMA and 480-frame
+evaluations are left out so each line is one comparable series.
+
 The memory does not beat attention plus sink. Worse, the training itself costs motion: every
 trained arm sits left of the unmodified model, and switching the memory on does not buy identity
 back. The one point that looks like a win, top centre, is a checkpoint with a third less motion.
