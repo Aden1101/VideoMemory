@@ -38,8 +38,9 @@ RUNS = [("c1_cotrain", "1. writes the frames it is generating"),
         ("c3_stable", "3. same, plus stability fixes"),
         ("l1_longlive", "4. same, from the previous fine-tune")]
 KEEP = re.compile(r"^eval(\d+)(_sink1)?$")      # plain series only: no _ema, no _480, no _msc05
+# One shape throughout: three round dots, told apart by colour. Mixing marker shapes
+# made the legend something to decode before the chart could be read.
 C = {"memon": "#2a78d6", "memzero": "#eb6834", "stock": "#1baf7a"}
-M = {"memon": "o", "memzero": "^", "stock": "*"}
 INK, INK2, MUTED, LINE = "#0b0b0b", "#52514e", "#8a8880", "#dedad3"
 
 
@@ -78,11 +79,11 @@ for ax, (run, label) in zip(axes.ravel(), RUNS):
         xs = [d[arm] for _, _, d in pts]
         ys = [i[arm] for _, i, _ in pts]
         ax.plot(xs, ys, "-", color=C[arm], lw=1.4, alpha=.55, zorder=2)
-        ax.scatter(xs, ys, s=46, marker=M[arm], c=C[arm], linewidths=1.1,
+        ax.scatter(xs, ys, s=44, c=C[arm], linewidths=1.1,
                    edgecolors="#ffffff", zorder=3)
     sx, sy = pts[0][2]["stock"], pts[0][1]["stock"]
-    ax.scatter([sx], [sy], s=240, marker=M["stock"], c=C["stock"],
-               linewidths=1.2, edgecolors="#ffffff", zorder=4)
+    ax.scatter([sx], [sy], s=150, c=C["stock"],
+               linewidths=1.4, edgecolors="#ffffff", zorder=4)
     # arrowhead on the last leg, so the direction of training is unambiguous
     for arm in ("memzero", "memon"):
         (x0, y0), (x1, y1) = ((pts[-2][2][arm], pts[-2][1][arm]), (pts[-1][2][arm], pts[-1][1][arm]))
@@ -111,15 +112,16 @@ fig.supylabel("identity kept   (DINO, first vs last frame)", fontsize=10.5, colo
 # README paragraph next to the figure.
 fig.suptitle("No run beats the unmodified model",
              fontsize=14, color=INK, fontweight="bold", x=0.035, ha="left", y=0.965)
-fig.legend(handles=[
-    Line2D([], [], marker=M["stock"], color="none", markerfacecolor=C["stock"],
-           markeredgecolor="#ffffff", markersize=16, label="unmodified model, this run's own baseline"),
-    Line2D([], [], marker=M["memzero"], color=C["memzero"], markerfacecolor=C["memzero"],
-           markeredgecolor="#ffffff", markersize=8, lw=1.4, label="memory zeroed"),
-    Line2D([], [], marker=M["memon"], color=C["memon"], markerfacecolor=C["memon"],
-           markeredgecolor="#ffffff", markersize=8, lw=1.4, label="memory active")],
-    loc="lower center", ncol=3, frameon=False, fontsize=9.5, labelcolor=INK2,
-    handletextpad=.5, columnspacing=2.2, bbox_to_anchor=(0.5, -0.005))
+def swatch(colour, text, line=True):
+    return Line2D([], [], marker="o", color=colour if line else "none", markerfacecolor=colour,
+                  markeredgecolor="#ffffff", markersize=9, lw=1.6, label=text)
+
+
+fig.legend(handles=[swatch(C["memon"], "memory active"),
+                    swatch(C["memzero"], "memory zeroed"),
+                    swatch(C["stock"], "unmodified model", line=False)],
+           loc="lower center", ncol=3, frameon=False, fontsize=10, labelcolor=INK2,
+           handletextpad=.6, columnspacing=2.6, bbox_to_anchor=(0.5, -0.005))
 
 fig.tight_layout(rect=[0.045, 0.075, 1, 0.925])
 fig.savefig("assets/motion_identity.png", facecolor="#ffffff", bbox_inches="tight")
