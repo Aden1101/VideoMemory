@@ -199,8 +199,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             dtype=noise.dtype,
             device=noise.device
         )
-        # fast-weight memory state, fresh per sequence (was missing, so interactive inference ran
-        # the stock model with the memory never read or written)
+        # fast-weight memory state, fresh per sequence
         self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
         self._switch_global_frame = None
         if self.use_prompt_cache:  # Junction KV cache

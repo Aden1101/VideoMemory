@@ -123,7 +123,8 @@ class SelfForcingTrainingPipeline:
             denoised_timestep_to: ending denoise timestep
         """
         assert not (disable_crossattn_cache or keep_last_write_grad), \
-            "SelfForcingTrainingPipeline does not support the E1 flags (text-dropout / cross-chunk write); use dmd_switch"
+            "this pipeline supports neither text dropout nor the cross-chunk write; " \
+            "use the streaming pipeline (distribution_loss: dmd_switch)"
         batch_size, chunk_frames, num_channels, height, width = noise.shape
 
         # fast-weight state threaded like the KV cache. Lazily allocated here,

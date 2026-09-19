@@ -21,7 +21,7 @@ import os
 class WanTextEncoder(torch.nn.Module):
     """Text encoder, with an on-disk cache and optionally lazy construction.
 
-    Two additions (2026-09-09), both inert by default on the original install:
+    Two additions, both inert by default on the original install:
 
     1. `forward` consults the embedding cache first (utils/prompt_cache). A cached prompt
        returns the tensor exactly as it was produced, same dtype, so the output is bitwise
@@ -71,14 +71,12 @@ class WanTextEncoder(torch.nn.Module):
                        map_location='cpu', weights_only=False)
         )
         
-        # The text encoder stays on CPU except on CUDA, that is the original semantics
-        # (`if torch.cuda.is_available()`), and it was right.
-        #
-        # 2026-09-09, fixing a mistake introduced earlier the same day: generalising this test to
-        # "any accelerator" puts umT5-XXL's 11 GB into the accelerator pool. On a 48 GB card that
-        # is painless; on a Mac's 17.8 GB pool it starves the generator and the VAE decode OOMs.
-        # Avoiding exactly that is what DynamicSwapInstaller is for: it streams the weights from
-        # RAM on each access, and it can do nothing if the model is already on the device.
+        # The text encoder stays on CPU unless CUDA is present. The test is deliberately
+        # `torch.cuda.is_available()` and not "any accelerator": widening it puts umT5-XXL's
+        # 11 GB into the accelerator pool, which is painless on a 48 GB card and starves the
+        # generator on a Mac's 17.8 GB pool, where the VAE decode then OOMs. Keeping it on CPU
+        # is what DynamicSwapInstaller needs: it streams the weights from RAM on each access,
+        # and can do nothing for a model already sitting on the device.
         if torch.cuda.is_available():
             self.text_encoder = self.text_encoder.cuda()
         # where the weights actually reside, so inputs can be sent there

@@ -4,10 +4,9 @@
 
 import torch
 
-# 2026-09-09: `gpu` was built by querying the CUDA driver at import time, which crashed the
-# whole inference path on a non-NVIDIA machine before the first weight was even loaded.
-# utils/device resolves the device once, without ever querying an absent driver, and delegates
-# to torch.cuda identically when CUDA is present.
+# `gpu` comes from utils/device, which resolves the device once without querying a driver that
+# may not be there, and delegates to torch.cuda identically when CUDA is present. Building it
+# from the CUDA driver at import time crashes the whole path on a non-NVIDIA machine.
 from utils.device import cpu, device as gpu, empty_cache, free_memory_gb, total_memory_gb
 
 gpu_complete_modules = []

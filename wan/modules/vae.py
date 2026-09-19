@@ -2,8 +2,8 @@
 import logging
 
 import torch
-# 2026-09-09: torch.cuda.amp is both NVIDIA-specific and deprecated upstream; we go through
-# torch.amp, whose first argument names the device.
+# torch.amp rather than torch.cuda.amp, which is NVIDIA-specific and deprecated upstream.
+# Its first argument names the device.
 import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F

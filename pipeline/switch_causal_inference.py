@@ -666,7 +666,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
         assert untouched == 0.0, "MEM_SINKPURGE touched the local window, it must not"
 
     # ---- MEM_DECODE_COMPOSITE (arms oracle1comp / memdec21c, 2026-08-02) ---------------------
-    # the problem (Aden's eye verdict on the same-scene tier). Our splice replaces a whole latent
+    # the problem (eye verdict on the same-scene tier). Our splice replaces a whole latent
     # frame, so the return re-renders the entire scene from the past: on SS2_t14 the bakery awning
     # flips blue -> pink at the return, while the frame-bank baseline brings the subject back into
     # an intact scene. The metric that saw this is the border/complement-of-crop one, not the
@@ -795,7 +795,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
             m = torch.maximum(m_a, m_b)
             print(f"[MEM_COMP_UNION] anchor centroid ({ay}, {ax}) U background centroid "
                   f"({by}, {bx}), union mask mean {float(m.mean()):.3f}", flush=True)
-            # MEM_COMP_FILL=noise (bras memdec21un, verdict oeil d'Aden 2026-08-03) : dans la part
+            # MEM_COMP_FILL=noise (arm memdec21un, eye verdict 2026-08-03): in the part
             # du masque union qui vient de l'ellipse du sujet courant et pas de celle de l'ancre,
             # le composite collait le contenu de l'ancre, c'est-a-dire du passe-bas de A a
             # l'ancienne place de B : le FANTOME FLOU vu a l'oeil, que le debruiteur ne nettoie
@@ -1393,7 +1393,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
             dtype=noise.dtype,
             device=noise.device
         )
-        # fast-weight memory state, fresh per sequence (was missing, so switch inference ran the
+        # fast-weight memory state, fresh per sequence
         # stock model with the memory never read or written)
         self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
         # MEM_WRITER (arm memdec20, memory 2.0): overlay the offline-trained write parameters on

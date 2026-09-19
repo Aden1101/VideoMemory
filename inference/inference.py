@@ -29,10 +29,9 @@ args = parser.parse_args()
 config = OmegaConf.load(args.config_path)
 
 # Initialize distributed inference
-# 2026-09-09: the distributed branch is CUDA + NCCL by construction (multi-GPU only exists
-# there). inference.sh calls torchrun even for a single process, which sets LOCAL_RANK and thus
-# led to a `torch.cuda.set_device` on a machine without NVIDIA. We now require CUDA to take that
-# branch; otherwise we take the single-device path, which is what one process means anyway.
+# The distributed branch is CUDA + NCCL by construction, and inference.sh calls torchrun even
+# for a single process, which sets LOCAL_RANK. Requiring CUDA here keeps a lone process on the
+# single-device path instead of sending it into torch.cuda.set_device.
 if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
     os.environ["NCCL_CROSS_NIC"] = "1"
     os.environ["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "INFO")
@@ -61,7 +60,6 @@ else:
         print("[inference] LOCAL_RANK is set but CUDA is absent: taking the single-device path.")
     local_rank = 0
     rank = 0
-    # 2026-09-09: was a hardcoded torch.device("cuda").
     device = af_device
     set_seed(config.seed)
     config.distributed = False  # Mark as non-distributed

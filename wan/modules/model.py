@@ -7,11 +7,10 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
 
-# 2026-09-09: these classes called flash_attention directly, bypassing the `attention`
-# dispatcher in the same module. Consequence: cross-attention required flash-attn, on any
-# machine, including an NVIDIA one where the package is not installed, it raised
-# "assert q.device.type == 'cuda'". The dispatcher picks flash when available (hence identical
-# behaviour on a README-conformant install) and PyTorch's standard attention otherwise.
+# The classes below go through the `attention` dispatcher, not flash_attention directly.
+# Calling flash_attention directly makes cross-attention require flash-attn on any machine,
+# including an NVIDIA one without the package, where it raises "assert q.device.type ==
+# 'cuda'". The dispatcher picks flash when available and PyTorch's own attention otherwise.
 from .attention import attention, flash_attention  # noqa: F401  (flash_attention stays exported)
 
 __all__ = ['WanModel']
@@ -20,7 +19,7 @@ __all__ = ['WanModel']
 def high_precision_dtype(ref):
     """Dtype for phase computations: float64 wherever it exists, float32 on Metal, which does not
     support it at all. On CUDA and CPU the returned value is float64, so the computation is the
-    original one, bit for bit. (2026-09-09)"""
+    original one, bit for bit."""
     return torch.float32 if ref.device.type == "mps" else torch.float64
 
 
@@ -52,7 +51,7 @@ def rope_freqs_to(freqs, device):
     """Move the RoPE frequency table to `device`, lowering precision only where float64 does not
     exist.
 
-    2026-09-09. `rope_params` builds the table in complex128 (phases computed in float64). Metal
+    `rope_params` builds the table in complex128 (phases computed in float64). Metal
     does not support float64 at all, so a plain .to("mps") raises TypeError. On CUDA and CPU
     nothing changes: the table stays complex128 and RoPE keeps casting x to float64, so every
     number already measured is intact bit for bit.

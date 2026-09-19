@@ -753,9 +753,9 @@ class FrameMixerBlock(nn.Module):
 
     The v1 decoder is strictly per token: each of the 30x52 queries reads the state on its own
     and the head expands it into a 2x2 latent patch, so nothing ever forces two neighbouring
-    patches to agree -> the rendered frame carries a visible 2x2 checkerboard (Aden's eye, J3).
-    This block puts back the only thing that was missing, a local spatial mixing on the token
-    grid, as a residual correction:
+    patches to agree, and the rendered frame carries a visible 2x2 checkerboard. This block
+    adds the one thing v1 lacks, a local spatial mixing on the token grid, as a residual
+    correction:
 
         x <- x + pw2(GELU(pw1(depthwise3x3(RMSNorm(x)))))
 

@@ -8,9 +8,8 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from wan.modules.video_memory import TTTBlockCache
 
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
-# 2026-09-09: the stopwatches were CUDA events and the barriers torch.cuda calls.
-# utils.device.Timer has the same interface (record / elapsed_time in ms) and delegates to
-# torch.cuda.Event when CUDA is present, profiling unchanged on an NVIDIA card.
+# Timer has the CUDA-event interface (record / elapsed_time in ms) and delegates to
+# torch.cuda.Event when CUDA is present, so profiling is unchanged on an NVIDIA card.
 from utils.device import Timer as DeviceTimer, empty_cache as device_empty_cache, \
     synchronize as device_synchronize
 from utils.debug_option import DEBUG

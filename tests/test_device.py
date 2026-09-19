@@ -38,7 +38,7 @@ print(describe())
 
 # ----------------------------- the reference: the pre-patch code -----------------------------
 def causal_rope_apply_original(x, grid_sizes, freqs, start_frame=0):
-    """Verbatim copy of the pre-2026-09-09 version (float64 hardcoded)."""
+    """Verbatim copy of the version before the device pass (float64 hardcoded)."""
     n, c = x.size(2), x.size(3) // 2
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
     output = []

@@ -426,8 +426,8 @@ class Trainer:
             weight_decay=config.weight_decay
         )
         # handles for (C) explicit mem-grad clip and (B) cosine lr schedule.
-        # mem params are FSDP-ignored, so generator.clip_grad_norm_() (an FSDP method) skips them
-        # -> they were unclipped before this. Default max_grad_norm_mem is effectively-off (1e9).
+        # mem params are FSDP-ignored, so generator.clip_grad_norm_() (an FSDP method) skips
+        # them and this is the only clip they get. Default is effectively off (1e9).
         self.mem_params = mem_params
         self.max_grad_norm_mem = float(getattr(config, "max_grad_norm_mem", 1e9))
         # per-group base lrs [LoRA, (mem)]; the cosine multiplier is applied to these each step.
@@ -1386,14 +1386,14 @@ class Trainer:
             os._exit(0)
 
     def _clip_mem_grads(self):
-        """c3 (C): explicit grad clip on the FSDP-IGNORED memory params. The generator FSDP
+        """Explicit grad clip on the FSDP-ignored memory params. The generator FSDP
         clip_grad_norm_ does NOT cover them. Called after the mem-grad hand-allreduce and before
         the optimizer step. Default max_grad_norm_mem ~1e9 => no-op (byte-identical)."""
         if getattr(self, "mem_params", None) and self.max_grad_norm_mem < 1e8:
             torch.nn.utils.clip_grad_norm_(self.mem_params, self.max_grad_norm_mem)
 
     def _lr_sched_step(self):
-        """c3 (B): cosine lr decay for both generator groups (LoRA + mem) from lr_decay_start to
+        """Cosine lr decay for both generator groups (LoRA + mem) from lr_decay_start to
         max_iters, each to its own floor fraction. lr_decay_start defaults beyond max_iters =>
         never fires => lr stays at its base value (byte-identical)."""
         s0 = self._lr_decay_start
