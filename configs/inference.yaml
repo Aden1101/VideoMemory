@@ -11,10 +11,11 @@ model_kwargs:
   timestep_shift: 5.0
   sink_size: 3
   # Declare this explicitly. The model defaults to memory_layers=(5,) with gate_init=0.1, so a
-  # config that omits the key silently runs a randomly initialised memory branch whose weights
-  # are not in the checkpoint: neither the unmodified model nor a trained memory arm, and it
-  # looks plausible enough that nothing warns you. An empty list is plain Anchor-Forcing; the
-  # memory arms carry their own value, see reference/runs/*/[cel]*.yaml.
+  # config that omits the key runs a randomly initialised memory branch whose weights are in no
+  # checkpoint: neither the unmodified model nor a trained memory arm. The only signal is one
+  # `[MAG] N memory keys kept at init` line in the log, easy to miss, and the video that comes
+  # out looks plausible. An empty list is plain Anchor-Forcing; the memory arms carry their own
+  # value, see reference/runs/*/[cel]*.yaml.
   memory_layers: []
 
 
