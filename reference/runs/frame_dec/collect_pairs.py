@@ -1,117 +1,116 @@
 #!/usr/bin/env python
-# ============================================================================================
-# frame_dec DATA COLLECTION (design v1 "frame de rappel decodee", plan_final_sink_virtuel.md):
-# collect (memory state, evicted latent frame) pairs from SELF-GENERATED single-prompt
-# rollouts of the l1@2000-EMA checkpoint, to train the offline state->frame decoder.
-#
-# Mechanism (matches the c2 eviction-feed exactly, wan/modules/causal_model.py ~L1342-1385):
-#   window_chunks = ceil(local_attn_size / F) = ceil(12/3) = 4. On the WRITE pass
-#   (ttt_update=True) of chunk c, the model pops chunk c-4 from each memory block's fifo and
-#   writes it into the fast weight (unless it is a sink chunk, popped < sink_chunks). So right
-#   AFTER the write pass of chunk c, the state has just absorbed the evicted chunk c-4, whose
-#   most recent latent frame (the one that "just left the 12-frame window") is frame
-#   3*(c-4)+2. That frame is the reconstruction target for the decoder.
-#
-# SHARD FORMAT v2 (.pt, for the decoder-training agent) -- torch.load(path) gives:
-#   {
-#     "format_version": 2,                     # v2 = v1 + per-pair "cond_emb"/"mode"/"target_frame"
-#                                              #      (+ switch bookkeeping in switch pairs);
-#                                              #      v1 shards (no cond_emb) stay trainer-readable
-#     "memory_layers": [5, 16, 27],            # block order of the "states" list
-#     "state_keys":   ["w0", "w1", "w2"],      # order inside each per-block tuple
-#     "state_shapes": {"w0": [1, 1536, 6144],  # (B*num_heads, head_dim, head_dim*4)
-#                      "w1": [1, 6144, 1536],
-#                      "w2": [1, 1536, 6144]},
-#     "target_shape": [16, 60, 104],           # one latent frame [C, H, W]
-#     "cond_dim": 4096,                        # T5 umt5-xxl channel dim of "cond_emb"
-#     "cond_key": "cond_emb",
-#     "cond_pooling": "masked mean over non-padding rows", fp16 cpu
-#     "collect_mode": "single" | "switch" | "mix",
-#     "pairs": [                               # ~200 per shard part (--shard-size)
-#       {
-#         "states": [ (w0, w1, w2), (w0, w1, w2), (w0, w1, w2) ],  # fp16 cpu, blocks 5/16/27
-#         "target": Tensor[16, 60, 104] fp16 cpu,  # single: the just-evicted latent frame;
-#                                              # switch: the LAST latent frame of A before the
-#                                              # switch (the anchor-frame candidate)
-#         "cond_emb": Tensor[4096] fp16 cpu,   # POOLED T5 embedding of the prompt whose content
-#                                              # the decoder must retrieve: the rollout prompt in
-#                                              # single mode, prompt A in switch mode (NEW in v2)
-#         "mode": "single" | "switch",         # NEW in v2
-#         "target_frame": int,                 # NEW in v2: latent index of "target" in the rollout
-#                                              # (single: == evicted_frame; switch: switch_frame-1)
-#         "prompt": str,                       # single: the rollout prompt; switch: prompt A
-#         "chunk_idx": int,                    # chunk whose WRITE pass just ran (0-based)
-#         "evicted_chunk": int,                # = chunk_idx - window_chunks (bookkeeping; in
-#         "evicted_frame": int,                #   switch mode this is a B chunk, NOT the target)
-#         "corpus_idx": int,                   # line index in the vidprom corpus file
-#         "seed": int,                         # torch/python seed of this rollout
-#         "num_frame_per_block": int,          # F = 3
-#         "window_chunks": int,                # 4
-#         "sink_chunks": int,                  # 1
-#         -- switch pairs ONLY (mode == "switch"):
-#         "prompt_b": str,                     # the interlude prompt B (another corpus line)
-#         "corpus_idx_b": int,
-#         "switch_frame": int,                 # frames >= this used prompt B (in {60, 81, 102})
-#         "switch_chunk": int,                 # = switch_frame // F; collection only at
-#                                              #   chunk_idx >= switch_chunk + min_gap_chunks (5)
-#                                              #   => A fully evicted, states are post-B-writes
-#       }, ...
-#     ],
-#     "meta": { config paths, ckpt, frames, ... }
-#   }
-#   Per-pair size ~170 MB (3 blocks x 3 fp16 state tensors of 1536x6144 = 169.9 MB + 0.2 MB
-#   target). 8 positions/video -> ~1.36 GB/video, 400 videos -> ~544 GB: OVER the 150 GB
-#   ceiling, the projection guard will abort after video 1. To fit under 150 GB use e.g.
-#   --positions 2 (400 videos ~ 136 GB) or --n 110 --positions 8 (~150 GB).
-#
-# Usage (Aden launches; one process per GPU, see run_collect.sh):
-#   python collect_pairs.py --mode corpus                      # dry-run: selection stats, no GPU
-#   python collect_pairs.py --mode run --shard 0/4 [--n 400 --positions 8]
-#   python collect_pairs.py --mode run --shard 0/4 --switch-mode   # ALL rollouts A->B (v1.1)
-#   python collect_pairs.py --mode run --shard 0/4 --mix           # ~50/50 single/switch
-#   python collect_pairs.py --mode manifest                    # merge shard manifests
-#
-# --------------------------------------------------------------------------------------------
-# SHARD FORMAT v3 "h_replay" (--v3, memory 2.0 J1/J2, reference/memory2_design.md 2.5-2.6):
-# PER-VIDEO records for the offline WRITE-REPLAY training of the writer -- states are NOT
-# stored anymore (the replay recomputes them); what is stored is the write INPUT sequence:
-#   {
-#     "format_version": 3, "kind": "h_replay", "memory_layers": [5, 16, 27],
-#     "h_dtype": "float16",            # bf16 h round-tripped through fp16 (see below)
-#     "mem_zero_all": True,            # rollouts run MEM_ZERO_ALL=1: h = DATA (independent
-#                                      # of the writer params) = the replay-exactness premise,
-#                                      # AND train == eval regime (memdec arms run memzero)
-#     "writer_ckpt": {...}, "cond_dim": 4096, "cond_pooling": <v2 masked mean>,
-#     "videos": [{
-#        "h_seq": {"5": [T(1,4680,1536) fp16, ...], "16": [...], "27": [...]},
-#                                      # h_seq[b][i] = the mem_x_write consumed by the write
-#                                      # pass of chunk write_chunks[i] (fifo peek, NOT recomputed)
-#        "write_chunks": [5, ...],     # replay order, exhaustive (ALL genuine writes)
-#        "evicted_chunks": [...],      # = write_chunks - window_chunks (bookkeeping)
-#        "latents": T(F,16,60,104) fp16,   # the WHOLE rollout: every target is available
-#        "cond_emb_a"/"cond_emb_b", prompt/prompt_b/corpus_idx*/seed/mode/switch_*,
-#        "check_states": {"5": [(chunk, (w0,w1,w2) bf16), ...], ...} | None,
-#                                      # first --check-videos videos of shard 0 only:
-#                                      # trainer-side bitwise cross-check (selftest S5)
-#        "h_stats": {...},             # fp16 round-trip + subnormal counters (selftest S4)
-#     }, ...], "meta": {...}
-#   }
-# fp16 STORAGE EXACTNESS: h lives in bf16; bf16 -> fp16 is exact in-range EXCEPT |x| < ~2^-17
-# (fp16 subnormal precision floor). To make the stored bytes authoritative ANYWAY, the fifo
-# entry is REPLACED by its fp16 round-trip BEFORE the write pass consumes it (a script-level
-# poke, zero core-code change): under MEM_ZERO_ALL=1 this provably cannot touch the latents
-# (the state feeds nothing but the zeroed injection), and it guarantees
-# in-situ state == replay(bf16(stored fp16)) BITWISE whatever the tails do. The number of
-# elements actually changed by the poke is counted in h_stats (expected ~0-100 per tensor).
-#   python collect_pairs.py --v3 --mode corpus --corpus-seed 20260727
-#   python collect_pairs.py --v3 --mode run --shard 0/4 --corpus-seed 20260727
-#   python collect_pairs.py --v3 --mode manifest
-# Defaults under --v3: n=135 (110 switch@120f + 25 single@90f), switch-frames 45,60,75,
-# out .../mem2_h_v3, max-gb 200. Founder selftest: selftest_replay.py (S1 replay-bitwise).
-# --------------------------------------------------------------------------------------------
-#
-# ADDITIVE code only: nothing outside reference/runs/frame_dec/ and the output dir is touched.
-# ============================================================================================
+"""frame_dec data collection (design v1 "frame de rappel decodee", plan_final_sink_virtuel.md):
+collect (memory state, evicted latent frame) pairs from self-generated single-prompt
+rollouts of the l1@2000-EMA checkpoint, to train the offline state->frame decoder.
+
+Mechanism (matches the c2 eviction-feed exactly, wan/modules/causal_model.py ~L1342-1385):
+  window_chunks = ceil(local_attn_size / F) = ceil(12/3) = 4. On the write pass
+  (ttt_update=True) of chunk c, the model pops chunk c-4 from each memory block's fifo and
+  writes it into the fast weight (unless it is a sink chunk, popped < sink_chunks). So right
+  after the write pass of chunk c, the state has just absorbed the evicted chunk c-4, whose
+  most recent latent frame (the one that "just left the 12-frame window") is frame
+  3*(c-4)+2. That frame is the reconstruction target for the decoder.
+
+Shard format v2 (.pt, for the decoder-training agent), torch.load(path) gives:
+  {
+    "format_version": 2,                     # v2 = v1 + per-pair "cond_emb"/"mode"/"target_frame"
+                                             #      (+ switch bookkeeping in switch pairs);
+                                             #      v1 shards (no cond_emb) stay trainer-readable
+    "memory_layers": [5, 16, 27],            # block order of the "states" list
+    "state_keys":   ["w0", "w1", "w2"],      # order inside each per-block tuple
+    "state_shapes": {"w0": [1, 1536, 6144],  # (B*num_heads, head_dim, head_dim*4)
+                     "w1": [1, 6144, 1536],
+                     "w2": [1, 1536, 6144]},
+    "target_shape": [16, 60, 104],           # one latent frame [C, H, W]
+    "cond_dim": 4096,                        # T5 umt5-xxl channel dim of "cond_emb"
+    "cond_key": "cond_emb",
+    "cond_pooling": "masked mean over non-padding rows", fp16 cpu
+    "collect_mode": "single" | "switch" | "mix",
+    "pairs": [                               # ~200 per shard part (--shard-size)
+      {
+        "states": [ (w0, w1, w2), (w0, w1, w2), (w0, w1, w2) ],  # fp16 cpu, blocks 5/16/27
+        "target": Tensor[16, 60, 104] fp16 cpu,  # single: the just-evicted latent frame;
+                                             # switch: the last latent frame of A before the
+                                             # switch (the anchor-frame candidate)
+        "cond_emb": Tensor[4096] fp16 cpu,   # pooled T5 embedding of the prompt whose content
+                                             # the decoder must retrieve: the rollout prompt in
+                                             # single mode, prompt A in switch mode (new in v2)
+        "mode": "single" | "switch",         # new in v2
+        "target_frame": int,                 # new in v2: latent index of "target" in the rollout
+                                             # (single: == evicted_frame; switch: switch_frame-1)
+        "prompt": str,                       # single: the rollout prompt; switch: prompt A
+        "chunk_idx": int,                    # chunk whose write pass just ran (0-based)
+        "evicted_chunk": int,                # = chunk_idx - window_chunks (bookkeeping; in
+        "evicted_frame": int,                #   switch mode this is a B chunk, not the target)
+        "corpus_idx": int,                   # line index in the vidprom corpus file
+        "seed": int,                         # torch/python seed of this rollout
+        "num_frame_per_block": int,          # F = 3
+        "window_chunks": int,                # 4
+        "sink_chunks": int,                  # 1
+       , switch pairs only (mode == "switch"):
+        "prompt_b": str,                     # the interlude prompt B (another corpus line)
+        "corpus_idx_b": int,
+        "switch_frame": int,                 # frames >= this used prompt B (in {60, 81, 102})
+        "switch_chunk": int,                 # = switch_frame // F; collection only at
+                                             #   chunk_idx >= switch_chunk + min_gap_chunks (5)
+                                             #   => A fully evicted, states are post-B-writes
+      }, ...
+    ],
+    "meta": { config paths, ckpt, frames, ... }
+  }
+  Per-pair size ~170 MB (3 blocks x 3 fp16 state tensors of 1536x6144 = 169.9 MB + 0.2 MB
+  target). 8 positions/video -> ~1.36 GB/video, 400 videos -> ~544 GB: over the 150 GB
+  ceiling, the projection guard will abort after video 1. To fit under 150 GB use e.g.
+  --positions 2 (400 videos ~ 136 GB) or --n 110 --positions 8 (~150 GB).
+
+Usage (Aden launches; one process per GPU, see run_collect.sh):
+  python collect_pairs.py --mode corpus                      # dry-run: selection stats, no GPU
+  python collect_pairs.py --mode run --shard 0/4 [--n 400 --positions 8]
+  python collect_pairs.py --mode run --shard 0/4 --switch-mode   # all rollouts A->B (v1.1)
+  python collect_pairs.py --mode run --shard 0/4 --mix           # ~50/50 single/switch
+  python collect_pairs.py --mode manifest                    # merge shard manifests
+
+--------------------------------------------------------------------------------------------
+shard format v3 "h_replay" (--v3, memory 2.0 J1/J2, reference/memory2_design.md 2.5-2.6):
+per-video records for the offline write-replay training of the writer, states are not
+stored anymore (the replay recomputes them); what is stored is the write input sequence:
+  {
+    "format_version": 3, "kind": "h_replay", "memory_layers": [5, 16, 27],
+    "h_dtype": "float16",            # bf16 h round-tripped through fp16 (see below)
+    "mem_zero_all": True,            # rollouts run MEM_ZERO_ALL=1: h = data (independent
+                                     # of the writer params) = the replay-exactness premise,
+                                     # and train == eval regime (memdec arms run memzero)
+    "writer_ckpt": {...}, "cond_dim": 4096, "cond_pooling": <v2 masked mean>,
+    "videos": [{
+       "h_seq": {"5": [T(1,4680,1536) fp16, ...], "16": [...], "27": [...]},
+                                     # h_seq[b][i] = the mem_x_write consumed by the write
+                                     # pass of chunk write_chunks[i] (fifo peek, not recomputed)
+       "write_chunks": [5, ...],     # replay order, exhaustive (all genuine writes)
+       "evicted_chunks": [...],      # = write_chunks - window_chunks (bookkeeping)
+       "latents": T(F,16,60,104) fp16,   # the whole rollout: every target is available
+       "cond_emb_a"/"cond_emb_b", prompt/prompt_b/corpus_idx*/seed/mode/switch_*,
+       "check_states": {"5": [(chunk, (w0,w1,w2) bf16), ...], ...} | None,
+                                     # first --check-videos videos of shard 0 only:
+                                     # trainer-side bitwise cross-check (selftest S5)
+       "h_stats": {...},             # fp16 round-trip + subnormal counters (selftest S4)
+    }, ...], "meta": {...}
+  }
+fp16 storage exactness: h lives in bf16; bf16 -> fp16 is exact in-range except |x| < ~2^-17
+(fp16 subnormal precision floor). To make the stored bytes authoritative anyway, the fifo
+entry is replaced by its fp16 round-trip before the write pass consumes it (a script-level
+poke, zero core-code change): under MEM_ZERO_ALL=1 this provably cannot touch the latents
+(the state feeds nothing but the zeroed injection), and it guarantees
+in-situ state == replay(bf16(stored fp16)) bitwise whatever the tails do. The number of
+elements actually changed by the poke is counted in h_stats (expected ~0-100 per tensor).
+  python collect_pairs.py --v3 --mode corpus --corpus-seed 20260727
+  python collect_pairs.py --v3 --mode run --shard 0/4 --corpus-seed 20260727
+  python collect_pairs.py --v3 --mode manifest
+Defaults under --v3: n=135 (110 switch@120f + 25 single@90f), switch-frames 45,60,75,
+out .../mem2_h_v3, max-gb 200. Founder selftest: selftest_replay.py (S1 replay-bitwise).
+--------------------------------------------------------------------------------------------
+
+Additive code only: nothing outside reference/runs/frame_dec/ and the output dir is touched.
+"""
 import argparse
 import gc
 import glob
@@ -132,7 +131,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 import torch
 from omegaconf import OmegaConf
 
-# THE reference loader of the l1@2000-EMA ckpt + the held-out probe pairs + the env reset
+# the reference loader of the l1@2000-EMA ckpt + the held-out probe pairs + the env reset
 from run_reid_probe import build_pipeline, PAIRS, _OFF, release_vram  # noqa: E402
 
 L1_YAML = os.path.join(REPO, "reference/runs/l1_longlive/l1_longlive.yaml")
@@ -155,7 +154,7 @@ _CLOTHES = ("jacket", "coat", "raincoat", "overcoat", "dress", "hat", "cap", "sh
             "kimono", "vest", "robe", "apron", "helmet", "boots", "gloves", "skirt", "jeans",
             "overalls", "sneakers", "bandana")
 _ATTR = "|".join(_COLORS + _MATERIALS)
-# scenery/lighting nouns right after the attribute -> NOT a re-identifiable subject
+# scenery/lighting nouns right after the attribute -> not a re-identifiable subject
 _NOUN_STOP = {"sky", "skies", "light", "lights", "glow", "sun", "sunset", "sunrise",
               "sunlight", "background", "backdrop", "air", "water", "ocean", "sea",
               "horizon", "hue", "hues", "tone", "tones", "color", "colors", "colour",
@@ -167,7 +166,7 @@ RE_NP_ATTR = re.compile(
     r"\b(?:a|an|the)\s+(?:[a-z][a-z-]*\s+){0,2}?(?:%s)\s+(?P<noun>[a-z][a-z-]{2,})" % _ATTR,
     re.IGNORECASE)
 # attributed clothing, article optional: "wearing red jackets", "in yellow raincoats",
-# "with brown leather boots" (safe without a noun stoplist: the tail REQUIRES a clothes noun)
+# "with brown leather boots" (safe without a noun stoplist: the tail requires a clothes noun)
 RE_WEAR = re.compile(
     r"\b(?:wearing|dressed in|in|with)\s+(?:[a-z][a-z-]*\s+){0,2}?(?:%s)\s+(?:[a-z][a-z-]*\s+){0,1}?(?:%s)s?\b"
     % (_ATTR, "|".join(_CLOTHES)), re.IGNORECASE)
@@ -190,14 +189,14 @@ def held_out_prompts():
 
 
 def _hits_held_out(prompt_norm: str, held) -> bool:
-    # substring match in BOTH directions (a corpus line embedding a probe prompt, or the
+    # substring match in both directions (a corpus line embedding a probe prompt, or the
     # probe prompt embedding a short corpus line, are both leaks)
     return any(h in prompt_norm or prompt_norm in h for h in held)
 
 
 def find_l1_corpus_path() -> str:
     """The vidprom prompt file the l1 training consumed: data_path / switch_prompt_path in
-    l1_longlive.yaml (they must agree -- the training used ONE file for both)."""
+    l1_longlive.yaml (they must agree, the training used one file for both)."""
     cfg = OmegaConf.load(L1_YAML)
     data_path = str(cfg.data_path)
     switch_path = str(cfg.switch_prompt_path)
@@ -210,7 +209,7 @@ def find_l1_corpus_path() -> str:
 def select_prompts(n: int, corpus_seed: int, corpus_path: str = None, verbose: bool = True):
     """Deterministic selection of n re-identifiable prompts from the l1 vidprom corpus,
     with the 16 probe prompts excluded (substring, both directions).
-    Returns a list of (corpus_idx, prompt), sorted by corpus_idx -- IDENTICAL on every
+    Returns a list of (corpus_idx, prompt), sorted by corpus_idx, identical on every
     shard/process for the same (n, corpus_seed): sharding partitions this list.
     Integrated selftest: asserts 0 held-out hits on the selected set."""
     corpus_path = corpus_path or find_l1_corpus_path()
@@ -237,7 +236,7 @@ def select_prompts(n: int, corpus_seed: int, corpus_path: str = None, verbose: b
     rng = random.Random(corpus_seed)
     selected = sorted(rng.sample(clean, n), key=lambda t: t[0])
 
-    # ---- integrated held-out selftest: 0 hit required on the SELECTED prompts ----
+    # ---- integrated held-out selftest: 0 hit required on the selected prompts ----
     hits = [(i, p) for i, p in selected if _hits_held_out(_norm_text(p), held)]
     assert not hits, f"HELD-OUT LEAK: {len(hits)} selected prompts hit the 16 probe prompts: " \
                      f"{[i for i, _ in hits][:5]}"
@@ -256,15 +255,15 @@ COND_DIM = 4096                         # umt5-xxl channel dim
 
 # ----------------------------- v3 (memory 2.0 h-replay) constants ---------------------------
 V3_SWITCH_FRAMES = (45, 60, 75)         # 120f videos: switch chunks 15 / 20 / 25 (design 2.2)
-V3_DEFAULT_OUT = "/shared/ssd_14T_project/adenelmi/mem2_h_v3"   # NEW dir, never mixed with v1
+V3_DEFAULT_OUT = "/shared/ssd_14T_project/adenelmi/mem2_h_v3"   # new dir, never mixed with v1
 V3_FRAME_SEQLEN = 1560                  # tokens per latent frame (60/2 * 104/2)
-V1_CORPUS_SEED = 1234                   # the v1 campaign seed -- v3 must use a FRESH one
+V1_CORPUS_SEED = 1234                   # the v1 campaign seed, v3 must use a fresh one
 
 
 def v3_assign_modes(corpus_indices, n_switch, mix_seed):
-    """Deterministic EXACT-count switch/single split (design: 110 switch + 25 single).
-    Rank every corpus_idx by a private hash-random keyed on (cidx, mix_seed) -- identical on
-    every shard/process and resume-safe (same guarantees as choose_mode) -- and take the
+    """Deterministic exact-count switch/single split (design: 110 switch + 25 single).
+    Rank every corpus_idx by a private hash-random keyed on (cidx, mix_seed), identical on
+    every shard/process and resume-safe (same guarantees as choose_mode), and take the
     first n_switch as switch videos. Returns the set of switch corpus_idx."""
     ranked = sorted(corpus_indices,
                     key=lambda cidx: random.Random(1000003 * cidx + mix_seed).random())
@@ -299,11 +298,11 @@ def v3_video_nbytes(rec):
 
 
 def pooled_cond_emb(cond_dict):
-    """v2 'cond_emb': MASKED-mean pooled T5 embedding of a prompt, fp16 cpu, shape (4096,).
+    """v2 'cond_emb': masked-mean pooled T5 embedding of a prompt, fp16 cpu, shape (4096,).
     WanTextEncoder zeroes the padding positions: a plain mean over all 512 rows would scale
-    with prompt LENGTH (parasitic feature flagged at v1.1 review) -- so we average over the
-    NON-ZERO rows only (sum / count of rows with nonzero norm). Any code computing cond at
-    inference time (memdec) MUST use this same pooling."""
+    with prompt length (parasitic feature flagged at v1.1 review), so we average over the
+    non-ZERO rows only (sum / count of rows with nonzero norm). Any code computing cond at
+    inference time (memdec) must use this same pooling."""
     emb = cond_dict["prompt_embeds"]
     assert emb.dim() == 3 and emb.shape[0] == 1, f"prompt_embeds shape {tuple(emb.shape)}"
     nz = emb[0].float().norm(dim=-1) > 0                      # (512,) non-padding rows
@@ -315,7 +314,7 @@ def pooled_cond_emb(cond_dict):
 
 
 # ----------------------------- custom prompt list (--prompts-file) --------------------------
-# ADDITIF (2026-08-05, materiaux v2 du sondage) : une campagne dont les prompts ne viennent PAS
+# ADDITIF (2026-08-05, materiaux v2 du sondage) : une campagne dont les prompts ne viennent pas
 # du corpus vidprom mais d'un FICHIER. Tout le reste de la machinerie v3 est reutilise tel quel
 # (meme rollout, meme capture h, meme sharding, meme manifeste, meme --twin-offset) : ce bloc ne
 # fait que remplacer `select_prompts` par une lecture de fichier, avec le MEME contrat de sortie
@@ -329,12 +328,12 @@ def load_prompts_file(path, base=PROMPTS_FILE_BASE, check_corpus=True, verbose=T
     """Lit une liste de prompts custom (une par ligne ; '#' et lignes vides ignorees) et rend
     EXACTEMENT la meme structure que select_prompts() : [(corpus_idx, prompt)] trie.
 
-    corpus_idx = base + RANG DE LA LIGNE (pas le numero de ligne du fichier) : l'ordre du
+    corpus_idx = base + rang de la ligne (pas le numero de ligne du fichier) : l'ordre du
     fichier est la cle, ajouter un commentaire ne renumerote rien.
 
     Selftest de held-out integre, DEUX references et DEUX directions :
       (a) les 16 prompts des paires de sonde (exactement le test de select_prompts) ;
-      (b) les lignes du corpus vidprom que l'entrainement l1 a consommees -- un prompt custom
+      (b) les lignes du corpus vidprom que l'entrainement l1 a consommees, un prompt custom
           qui reproduirait une ligne du corpus ne serait pas un materiau NEUF.
     """
     with open(path, "r", encoding="utf-8") as f:
@@ -375,8 +374,8 @@ def load_prompts_file(path, base=PROMPTS_FILE_BASE, check_corpus=True, verbose=T
 
 
 def choose_mode(cidx, switch_mode, mix, mix_seed):
-    """Per-video single/switch decision, keyed ONLY on corpus_idx (+ mix_seed) so it is
-    identical across shards/processes and resume-safe. --mix gives ~50/50 (NOT index parity:
+    """Per-video single/switch decision, keyed only on corpus_idx (+ mix_seed) so it is
+    identical across shards/processes and resume-safe. --mix gives ~50/50 (not index parity:
     with shard stride 4, parity would send whole shards to one mode)."""
     if switch_mode:
         return "switch"
@@ -387,7 +386,7 @@ def choose_mode(cidx, switch_mode, mix, mix_seed):
 
 def pick_switch(cidx, selected, switch_frames, switch_seed):
     """Deterministic (switch_frame, corpus_idx_b, prompt_b) for a switch rollout of prompt
-    A = selected[cidx]: switch position random among switch_frames, prompt B = ANOTHER line
+    A = selected[cidx]: switch position random among switch_frames, prompt B = another line
     of the (already filtered + held-out-clean) selected corpus list."""
     assert len(selected) >= 2, "need >= 2 selected prompts to draw a distinct prompt B"
     prng = random.Random(switch_seed * 1000003 + cidx)
@@ -404,8 +403,8 @@ def _find_causal_model(m):
     """Walk peft/wrapper layers down to the raw CausalWanModel (for _evict_dbg access)."""
     seen = 0
     while m is not None and seen < 8:
-        # type check, NOT hasattr: peft wrappers DELEGATE attribute reads (hasattr passes on the
-        # wrapper) but setattr does not -- resetting _evict_dbg on the wrapper shadows the real
+        # type check, not hasattr: peft wrappers delegate attribute reads (hasattr passes on the
+        # wrapper) but setattr does not, resetting _evict_dbg on the wrapper shadows the real
         # model's list and the post-rollout read sees an empty list (bug caught by selftest).
         if type(m).__name__ == "CausalWanModel":
             return m
@@ -425,40 +424,40 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
     v3_capture=False (default): byte-identical to the v1/v2 collector (the three v3_ kwargs
     add code only inside `if v3_capture:` branches).
 
-    v3_capture=True (memory 2.0 h-replay, design 2.6): the WHOLE rollout runs under
+    v3_capture=True (memory 2.0 h-replay, design 2.6): the whole rollout runs under
     MEM_ZERO_ALL=1 (h = data + train==eval regime); no pairs are built; instead, before the
     write pass of every chunk that genuinely writes, the fifo head (the tensor the model is
     about to pop as mem_x_write) is peeked and saved for each memory block. With
-    v3_fp16_roundtrip=True (campaign mode) the fifo entry is first REPLACED by its
-    bf16->fp16->bf16 round-trip so the in-situ write consumes EXACTLY the bytes the shard
+    v3_fp16_roundtrip=True (campaign mode) the fifo entry is first replaced by its
+    bf16->fp16->bf16 round-trip so the in-situ write consumes exactly the bytes the shard
     stores (bitwise replay guarantee even for fp16-subnormal tails; a no-op when the
     round-trip is exact, counted in h_rt_changed); False keeps h in lossless bf16 (selftest
     S1 mode). v3_state_snap_every=N>0 additionally snapshots the post-write states of every
-    N-th write (+ the last one) to cpu bf16 -- the trainer-side bitwise cross-check (S5).
+    N-th write (+ the last one) to cpu bf16, the trainer-side bitwise cross-check (S5).
 
-    switch_frame=None (default): SINGLE-PROMPT rollout, RNG/byte-identical to the v1.0
-    collector (the v2 additions -- cond_emb pooling -- consume no random numbers).
+    switch_frame=None (default): single-prompt rollout, RNG/byte-identical to the v1.0
+    collector (the v2 additions, cond_emb pooling, consume no random numbers).
 
-    switch_frame set (v1.1 recency-bias attack): ONE A->B switch at that (chunk-aligned)
+    switch_frame set (v1.1 recency-bias attack): one A->B switch at that (chunk-aligned)
     frame, exactly the single-switch branch of SwitchCausalInferencePipeline.inference
-    (_recache_after_switch + cond swap + switch_global_frame). Collection happens ONLY at
-    POST-switch chunks c >= switch_chunk + min_gap_chunks, where A is TOTALLY evicted from
+    (_recache_after_switch + cond swap + switch_global_frame). Collection happens only at
+    post-switch chunks c >= switch_chunk + min_gap_chunks, where A is totally evicted from
     the 12-frame window (window covers chunks [c-3, c], all > switch_chunk; enforced by a
-    fifo assert) and >= 2 pure-B chunks have been WRITTEN into the state. The pair target is
-    the LAST latent frame of A (switch_frame - 1, the anchor-frame candidate), the condition
+    fifo assert) and >= 2 pure-B chunks have been written into the state. The pair target is
+    the last latent frame of A (switch_frame - 1, the anchor-frame candidate), the condition
     is prompt A's pooled T5 embedding = the exact task of the revisit, data-free.
 
     Returns a dict with pairs, latents, positions, and the list of blocks whose ttt state
     was written."""
     from utils.misc import set_seed
 
-    # env hygiene: all probe knobs OFF (memory injection LIVE = the state we snapshot is the
+    # env hygiene: all probe knobs OFF (memory injection live = the state we snapshot is the
     # one the trained model actually uses)
     for k, v in _OFF.items():
         os.environ[k] = v
-    # memory 2.0 REGIME CHANGE (design 1.2, THE difference vs v1): h-replay collection runs
-    # the whole rollout under MEM_ZERO_ALL=1 -- the injection is zeroed on every pass, so
-    # (a) the h feeding the writes are pure functions of the frozen backbone = DATA,
+    # memory 2.0 regime change (design 1.2, the difference vs v1): h-replay collection runs
+    # the whole rollout under MEM_ZERO_ALL=1, the injection is zeroed on every pass, so
+    # (a) the h feeding the writes are pure functions of the frozen backbone = data,
     # independent of the writer params (the replay-exactness premise, design 1.1), and
     # (b) the latents match the harness memzero arm (train == eval alignment, selftest S2).
     if v3_capture:
@@ -484,13 +483,13 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
         assert 0 < switch_chunk < num_blocks_t, \
             f"switch_frame {switch_frame} outside the {frames}-frame rollout"
 
-    # eligible chunk positions: the popped chunk (c - wc) exists AND is past the sink, i.e.
+    # eligible chunk positions: the popped chunk (c - wc) exists and is past the sink, i.e.
     # a chunk has genuinely been evicted from the 12-frame window and written to the memory
     eligible = [c for c in range(num_blocks_t) if c - wc >= sc]
     if switch_chunk is not None:
-        # POST-switch only, A totally evicted: the window of chunk c covers chunks
+        # post-switch only, A totally evicted: the window of chunk c covers chunks
         # [c-wc+1, c]; c >= switch_chunk + min_gap_chunks (5 > wc-1 = 3) guarantees every
-        # window chunk > switch_chunk AND >= 2 pure-B chunks already written into the state
+        # window chunk > switch_chunk and >= 2 pure-B chunks already written into the state
         assert min_gap_chunks >= wc + 1, \
             (f"min_gap_chunks {min_gap_chunks} < window_chunks+1 = {wc + 1}: gap == wc barely "
              f"evicts A; the spec (chunk >= switch+5) wants >= 2 pure-B WRITES in the state")
@@ -498,8 +497,8 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
     assert eligible, (f"no eligible collection chunk: frames={frames}, "
                       f"switch_frame={switch_frame}")
     if v3_capture:
-        # v3 stores the FULL write sequence + all latents; the per-pair "positions"
-        # machinery is irrelevant (loss positions are sampled at TRAINING time, for free)
+        # v3 stores the full write sequence + all latents; the per-pair "positions"
+        # machinery is irrelevant (loss positions are sampled at training time, for free)
         positions = []
     elif forced_positions is not None:
         positions = sorted(forced_positions)
@@ -511,7 +510,7 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
         positions = sorted(prng.sample(eligible, min(n_positions, len(eligible))))
     pos_set = set(positions)
 
-    # distinct seed stream per rollout kind: a corpus_idx collected in BOTH a single and a
+    # distinct seed stream per rollout kind: a corpus_idx collected in both a single and a
     # switch campaign must not share its noise (single keeps the exact v1.0 formula)
     seed = int(config.seed) + (500000 if switch_chunk is None else 700000) + corpus_idx \
         + seed_offset
@@ -522,9 +521,9 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
     # T5 forwards consume no torch RNG -> the single-prompt stream stays v1.0-identical
     cond_b = pipeline.text_encoder(text_prompts=[prompt_b]) if switch_chunk is not None else None
     # v2 condition = the prompt whose content the decoder must retrieve: the rollout prompt
-    # in single mode, prompt A (the RETURN prompt of a revisit) in switch mode
+    # in single mode, prompt A (the return prompt of a revisit) in switch mode
     cond_emb = pooled_cond_emb(cond)
-    # v3 stores BOTH pooled conds (the trainer picks per position); no torch RNG consumed
+    # v3 stores both pooled conds (the trainer picks per position); no torch RNG consumed
     cond_emb_b = pooled_cond_emb(cond_b) if (v3_capture and cond_b is not None) else None
     # low_memory text-encoder handling, verbatim from the pipeline's low_memory branch
     from utils.memory import gpu, get_cuda_free_memory_gb, \
@@ -568,7 +567,7 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
         current_num_frames = F
 
         # v1.1 A->B switch: the single-switch branch of SwitchCausalInferencePipeline.inference
-        # (recache the window under the NEW cond, then generate with prompt B)
+        # (recache the window under the new cond, then generate with prompt B)
         if switch_chunk is not None and not switched and chunk_idx >= switch_chunk:
             assert current_start_frame == switch_frame, \
                 f"switch misaligned: chunk {chunk_idx} starts at {current_start_frame} != {switch_frame}"
@@ -607,10 +606,10 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
         output[:, current_start_frame:current_start_frame + current_num_frames] = \
             denoised_pred.to(output.device)
 
-        # ---- v3 h-capture: peek the fifo element the WRITE pass below is about to pop ----
-        # (the pop happens at model level, causal_model.py ~L1371, and the popped h IS the
-        # mem_x_write the cell writes: we save THAT tensor, nothing is recomputed). Genuine
-        # write iff the popped chunk (chunk_idx - wc) exists AND is past the sink.
+        # ---- v3 h-capture: peek the fifo element the write pass below is about to pop ----
+        # (the pop happens at model level, causal_model.py ~L1371, and the popped h is the
+        # mem_x_write the cell writes: we save that tensor, nothing is recomputed). Genuine
+        # write iff the popped chunk (chunk_idx - wc) exists and is past the sink.
         if v3_capture and chunk_idx >= wc:
             will_write = (chunk_idx - wc) >= sc
             for bi in mem_layers:
@@ -639,9 +638,9 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
                     _nd = int((_hrt != h_ev).sum().item())
                     if _nd:
                         v3_rt_changed += _nd
-                        # poke: the write consumes EXACTLY the bytes the shard stores.
+                        # poke: the write consumes exactly the bytes the shard stores.
                         # Under MEM_ZERO_ALL=1 this cannot touch the latents (the state
-                        # feeds nothing but the zeroed injection) -- asserted by the
+                        # feeds nothing but the zeroed injection), asserted by the
                         # latents-equality check in selftest_replay.py.
                         fifo[0] = (pchunk, _hrt)
                     v3_h_seq[bi].append(_h16.to("cpu"))
@@ -650,7 +649,7 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
             if will_write:
                 v3_write_chunks.append(chunk_idx)
 
-        # WRITE pass (clean context noise; eviction-feed pops chunk_idx - wc and writes it)
+        # write pass (clean context noise; eviction-feed pops chunk_idx - wc and writes it)
         context_timestep = torch.ones_like(timestep) * pipeline.args.context_noise
         pipeline.generator(
             noisy_image_or_video=denoised_pred,
@@ -676,11 +675,11 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
                     _st = pipeline.ttt_cache[bi].state
                     assert _st is not None, \
                         f"block {bi}: no ttt state after write pass of chunk {chunk_idx}"
-                    # dtype-PRESERVING snapshot (P0, 2026-08-10): the historical SwiGLU
-                    # states are bf16, so `.to("cpu", t.dtype)` is BITWISE the previous
+                    # dtype-preserving snapshot (P0, 2026-08-10): the historical SwiGLU
+                    # states are bf16, so `.to("cpu", t.dtype)` is bitwise the previous
                     # `.to("cpu", torch.bfloat16)` for them (identity change); it only
                     # matters for the fp32 linear-delta W (state_type=linear_delta), whose
-                    # equivalence selftest needs LOSSLESS per-write snapshots.
+                    # equivalence selftest needs lossless per-write snapshots.
                     v3_check[str(bi)].append(
                         (int(chunk_idx),
                          tuple(t.detach().to("cpu", t.dtype) for t in _st)))
@@ -698,17 +697,17 @@ def rollout_collect(pipeline, config, prompt, corpus_idx, frames, n_positions, d
                     (f"block {bi} fifo out of sync at chunk {chunk_idx}: {fifo_idx} "
                      f"(expected the last {wc} chunks -> popped chunk must be {evicted_chunk})")
                 if switch_chunk is not None:
-                    # A TOTALLY evicted from the window: every chunk still in the fifo is B's
+                    # A totally evicted from the window: every chunk still in the fifo is B's
                     assert min(fifo_idx) > switch_chunk, \
                         (f"block {bi}: A NOT fully evicted at chunk {chunk_idx}: window chunks "
                          f"{fifo_idx} reach into A (switch_chunk {switch_chunk})")
-            # target: single = the just-evicted frame; switch = the LAST frame of A (anchor)
+            # target: single = the just-evicted frame; switch = the last frame of A (anchor)
             target_frame = evicted_frame if switch_chunk is None else switch_frame - 1
             pair = {
                 "states": [tuple(t.detach().to("cpu", torch.float16)
                                  for t in pipeline.ttt_cache[bi].state) for bi in mem_layers],
                 "target": output[0, target_frame].detach().to("cpu", torch.float16).clone(),
-                "cond_emb": cond_emb.clone(),           # v2: pooled T5 of the RETRIEVAL prompt
+                "cond_emb": cond_emb.clone(),           # v2: pooled T5 of the retrieval prompt
                 "mode": "single" if switch_chunk is None else "switch",
                 "target_frame": int(target_frame),
                 "prompt": prompt,
@@ -818,7 +817,7 @@ def flush_part(out_dir, shard_tag, part_idx, buffer, header, key="pairs", prefix
 
 def shard_header_v3(config, config_path, mem_layers, args, switch_frames, h_dtype):
     """v3 'h_replay' shard header (design 2.5). No per-pair states anymore: the replay
-    recomputes them from h_seq; mem_zero_all MUST be asserted True by the trainer."""
+    recomputes them from h_seq; mem_zero_all must be asserted True by the trainer."""
     return {
         "format_version": 3,
         "kind": "h_replay",
@@ -895,12 +894,12 @@ def main_v3(args):
     """Memory 2.0 h-replay campaign (--v3, format v3). Reuses the v1 machinery wholesale:
     same corpus selection (held-out grep selftest inside select_prompts), same seed formulas
     (500000/700000 + corpus_idx), same pick_switch, same shard/manifest/resume pattern.
-    Differences: per-VIDEO records (h sequences + full latents), MEM_ZERO_ALL=1 rollouts
+    Differences: per-video records (h sequences + full latents), MEM_ZERO_ALL=1 rollouts
     (set inside rollout_collect(v3_capture=True)), exact-count switch/single mix, per-mode
     video lengths."""
     # v3-tuned defaults when the v1 defaults were left untouched
     if args.prompts_file:
-        # campagne a prompts CUSTOM : tout single, corpus = le fichier, repertoire dedie.
+        # campagne a prompts custom : tout single, corpus = le fichier, repertoire dedie.
         if args.out == DEFAULT_OUT:
             stem = os.path.splitext(os.path.basename(args.prompts_file))[0]
             args.out = f"/shared/ssd_14T_project/adenelmi/{stem}"
@@ -912,7 +911,7 @@ def main_v3(args):
         args.out = V3_DEFAULT_OUT
         print(f"[v3] --out -> {args.out} (v3 default, never mixed with v1 pair shards)")
     if args.twin_offset:
-        # twin campaign (red-team F1.1): SAME corpus selection + SAME single prompts, only
+        # twin campaign (red-team F1.1): same corpus selection + same single prompts, only
         # the generation seed moves -> same-prompt/different-seed hard negatives for the
         # InfoNCE bank. Twins must share the train/val side of their sibling (bank builder's
         # job, keyed on corpus_idx). Switch videos are skipped; check-states are pointless.
@@ -951,7 +950,7 @@ def main_v3(args):
     config = OmegaConf.load(args.config)
     config.distributed = False
     mem_layers = sorted(int(x) for x in config.model_kwargs.memory_layers)
-    assert mem_layers, "config has no memory_layers -- nothing to collect"
+    assert mem_layers, "config has no memory_layers, nothing to collect"
     F = int(config.num_frame_per_block)
     law = int(config.model_kwargs.local_attn_size)
     wc = max(1, math.ceil(law / F))
@@ -971,7 +970,7 @@ def main_v3(args):
         selected = select_prompts(args.n, args.corpus_seed)
         switch_set = v3_assign_modes([i for i, _ in selected], args.n_switch, args.mix_seed)
 
-    # a-priori disk projection: pure arithmetic, checked BEFORE any GPU work (guard n°1)
+    # a-priori disk projection: pure arithmetic, checked before any GPU work (guard n°1)
     gb_sw = v3_video_gb(args.frames_switch, F, wc, sc, mem_layers)
     gb_si = v3_video_gb(args.frames_single, F, wc, sc, mem_layers)
     n_sw, n_si = args.n_switch, args.n - args.n_switch
@@ -1114,8 +1113,8 @@ def main_v3(args):
             first_collected = False
 
         rec = {
-            # --no-h : les h sont CAPTURES (les asserts de parite ci-dessus ont tourne) mais
-            # PAS stockes ; rec garde tout ce que la labellisation et la re-collecte seedee
+            # --no-h : les h sont captures (les asserts de parite ci-dessus ont tourne) mais
+            # pas stockes ; rec garde tout ce que la labellisation et la re-collecte seedee
             # exigent (latents, conds, graine, write_chunks).
             "h_seq": ({} if args.no_h else {str(bi): res["h_seq"][bi] for bi in mem_layers}),
             "no_h": bool(args.no_h),
@@ -1325,7 +1324,7 @@ def main():
     config = OmegaConf.load(args.config)
     config.distributed = False
     mem_layers = sorted(int(x) for x in config.model_kwargs.memory_layers)
-    assert mem_layers, "config has no memory_layers -- nothing to collect"
+    assert mem_layers, "config has no memory_layers, nothing to collect"
 
     pipeline = build_pipeline(config, device)
     header = shard_header(config, args.config, mem_layers, args.frames, args.positions,
@@ -1405,7 +1404,7 @@ def main():
                          f"{int(args.max_gb * 1e9 / (per_pair_bytes * args.positions))} videos "
                          f"at {args.positions} pos/video).")
 
-        # flush BETWEEN videos only, so a video's pairs are atomic within one part (resume-safe)
+        # flush between videos only, so a video's pairs are atomic within one part (resume-safe)
         if len(buffer) >= args.shard_size:
             part = flush_part(args.out, shard_tag, len(parts), buffer, header)
             parts.append(part)

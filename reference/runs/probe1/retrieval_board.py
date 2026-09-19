@@ -1,31 +1,30 @@
 #!/usr/bin/env python
-# ============================================================================================
-# PHASE 1 (2026-08-10) -- "QU'EST-CE QUE LA MEMOIRE A RETENU ?" EN IMAGES, SANS GENERATION.
-#
-# Pour chaque video du corpus v2 (60 videos, 30 paires), on projette l'etat de memoire dans
-# l'espace des references DINO avec la TETE DE SONDAGE DU PLI OU LA VIDEO EST EN TEST :
-#   - les plis, les configs par pli, les graines viennent des JSON DE VERDICT SCELLES
-#     (runs/cv_{source}_subject_pool_v2.json) : AUCUNE recherche d'hyperparametres n'est
-#     relancee, AUCUN choix nouveau ; on refait exactement le geste de cv_run apres hpsearch
-#     (set_fold(ds, test, []) puis train_one(cfg, seed)), qui est deterministe ;
-#   - ZERO fuite : chaque video n'est projetee que par le modele du pli ou sa paire est en
-#     test (ni blanchiment, ni ACP, ni softmax n'ont vu sa paire) ;
-#   - CONTROLE D'IDENTITE : les marges recalculees sont confrontees aux marges stockees dans
-#     le JSON scelle (per_row), graine par graine ; l'ecart max est rapporte.
-#
-# RECUPERATION a 3 niveaux (galerie = crops-sujet DINO, 1 reference moyenne par video) :
-#   (a) 1 parmi 2  : {sa video, sa jumelle}                      -- ancre = mesure existante
-#   (b) 1 parmi 10 : + 8 distracteurs tires DETERMINISTEMENT (hash sha1, graine du split)
-#   (c) 1 parmi 60 : toute la galerie, sa propre vignette INCLUSE ("retrouve TON sujet")
-# La cible est toujours la reference de la video elle-meme ; les distracteurs excluent la
-# video et sa jumelle (la jumelle, elle, est TOUJOURS dans la galerie : c'est le piege).
-# Controle permute : 25 derangements des etats entre les 60 videos (graines 1234+k, comme
-# evaluate()).
-#
-# Sorties :
-#   runs/retrieval_gallery_v2.json         (tous les chiffres bruts)
-#   board/retrieval_board_v2.jpg           (la planche pour l'oeil d'Aden, < 1.5 MB)
-# ============================================================================================
+"""Phase 1 (2026-08-10), "QU'EST-ce QUE la MEMOIRE A RETENU ?" en images, sans generation.
+
+Pour chaque video du corpus v2 (60 videos, 30 paires), on projette l'etat de memoire dans
+l'espace des references DINO avec la tete de SONDAGE DU PLI OU la video EST en test :
+  - les plis, les configs par pli, les graines viennent des JSON de verdict SCELLES
+    (runs/cv_{source}_subject_pool_v2.json) : AUCUNE recherche d'hyperparametres n'est
+    relancee, AUCUN choix nouveau ; on refait exactement le geste de cv_run apres hpsearch
+    (set_fold(ds, test, []) puis train_one(cfg, seed)), qui est deterministe ;
+  - zero fuite : chaque video n'est projetee que par le modele du pli ou sa paire est en
+    test (ni blanchiment, ni ACP, ni softmax n'ont vu sa paire) ;
+  - CONTROLE D'IDENTITE : les marges recalculees sont confrontees aux marges stockees dans
+    le JSON scelle (per_row), graine par graine ; l'ecart max est rapporte.
+
+Recuperation a 3 niveaux (galerie = crops-sujet DINO, 1 reference moyenne par video) :
+  (a) 1 parmi 2  : {sa video, sa jumelle}                     , ancre = mesure existante
+  (b) 1 parmi 10 : + 8 distracteurs tires DETERMINISTEMENT (hash sha1, graine du split)
+  (c) 1 parmi 60 : toute la galerie, sa propre vignette incluse ("retrouve ton sujet")
+La cible est toujours la reference de la video elle-meme ; les distracteurs excluent la
+video et sa jumelle (la jumelle, elle, est TOUJOURS dans la galerie : c'est le piege).
+Controle permute : 25 derangements des etats entre les 60 videos (graines 1234+k, comme
+evaluate()).
+
+Sorties :
+  runs/retrieval_gallery_v2.json         (tous les chiffres bruts)
+  board/retrieval_board_v2.jpg           (la planche pour l'oeil d'Aden, < 1.5 MB)
+"""
 import argparse
 import hashlib
 import json
@@ -45,8 +44,8 @@ import train_probe as TP                      # noqa: E402
 SOURCES = [("state", "ecriture actuelle"),
            ("mlp_full_muon", "MLP corr. (A3)"),
            ("lin_delta_all", "delta (L4)")]
-# BRAS DE DIAGNOSTIC (demande coordinateur 10/08) : la lecture directe des activations
-# masquees, DANS SA CONFIGURATION VALIDEE (avec pre-entrainement, 15.67/19) et sans
+# bras de diagnostic (demande coordinateur 10/08) : la lecture directe des activations
+# masquees, dans sa configuration VALIDEE (avec pre-entrainement, 15.67/19) et sans
 # pre-entrainement (armes egales avec les etats, 12.00/19). Chiffres seulement, pas de
 # colonne de planche : ils departagent "goulot = memoire" vs "goulot = reference/tete".
 ARMS = [(src, src, False, lbl) for src, lbl in SOURCES] + [
@@ -63,11 +62,11 @@ OUT_BOARD = os.path.join(C.BOARD_DIR, "retrieval_board_v2.jpg")
 
 
 # ---------------------------------------------------------------------------------------------
-# 1) reconstruire les tetes de pli et projeter chaque video par SON pli de test
+# 1) reconstruire les tetes de pli et projeter chaque video par son pli de test
 # ---------------------------------------------------------------------------------------------
 def project_source(source, device, pretrain=False):
     """Rend (ds, P) avec P[(video_index, age_name, seed)] = projection L2-normalisee (768,),
-    calculee par le modele du pli ou la video est en TEST. Verifie les marges contre le JSON
+    calculee par le modele du pli ou la video est en test. Verifie les marges contre le JSON
     scelle et rend aussi le rapport de cet audit. `pretrain=True` relit le JSON `_pre` et
     pre-entraine la tete sur les 105 videos switch, EXACTEMENT comme le run scelle."""
     cvp = os.path.join(C.RUNS_DIR,
@@ -205,7 +204,7 @@ def retrieval_metrics(ds, S_by_seed, S_avg):
             perm_top1.append(float(np.mean([r == 1 for r in rkp])))
             perm_med.append(float(np.median(rkp)))
 
-        # rang de la JUMELLE dans la meme galerie (diagnostic de voisinage, 10/08) :
+        # rang de la jumelle dans la meme galerie (diagnostic de voisinage, 10/08) :
         # si le vrai sujet ET la jumelle sont tous deux tres loin, la projection ne vit
         # pas du tout dans le bon voisinage de l'espace des references.
         rk_twin = [rank_of(S_avg[vi], lv[vi][name], ds["videos"][vi]["twin_index"])
@@ -235,7 +234,7 @@ def retrieval_metrics(ds, S_by_seed, S_avg):
 # 3) la planche
 # ---------------------------------------------------------------------------------------------
 def crop_path(video_id):
-    """Le crop-sujet du milieu des frames VALIDES (meme regle de validite que les refs)."""
+    """Le crop-sujet du milieu des frames valides (meme regle de validite que les refs)."""
     d = os.path.join(C.MASK_DIR, "crops", C.seg_key(video_id, "A"))
     files = sorted(f for f in os.listdir(d) if f.endswith("_subj.jpg"))
     assert files, f"aucun crop sujet pour {video_id}"

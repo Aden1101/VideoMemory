@@ -1,19 +1,18 @@
 #!/usr/bin/env python
-# ============================================================================================
-# SCENARIO-MATRIX re-ID revisit probe (N-switch). Same machinery as
-# reference/runs/reid_probe_l1/run_reid_probe.py (imported, never modified) but driven by
-# reference/runs/reid_scen/scenarios.py: several revisit SCHEDULES, prompt TRIPLES, and the
-# re-ID scored against the segment of the subject's FIRST APPEARANCE (not the opening).
-#
-# ADDITIVE: the legacy campaign keeps running through run_reid_probe.py + pipeline.inference();
-# this driver calls the new pipeline.inference_schedule(), proven bitwise identical on the
-# legacy schedule by selftest_scenarios.py (a).
-#
-#   python run_reid_scen.py --mode selftest                       # tiny end-to-end smoke
-#   python run_reid_scen.py --mode run   --scen S2 --triples 0,1 --seeds 0 --arms memzero,framebank
-#   python run_reid_scen.py --mode score --scen S2 --triples 0,1 --seeds 0 --arms ...
-#   python run_reid_scen.py --mode summary --scen S2,S3,S4
-# ============================================================================================
+"""scenario-matrix re-ID revisit probe (N-switch). Same machinery as
+reference/runs/reid_probe_l1/run_reid_probe.py (imported, never modified) but driven by
+reference/runs/reid_scen/scenarios.py: several revisit schedules, prompt TRIPLES, and the
+re-ID scored against the segment of the subject's first appearance (not the opening).
+
+Additive: the legacy campaign keeps running through run_reid_probe.py + pipeline.inference();
+this driver calls the new pipeline.inference_schedule(), proven bitwise identical on the
+legacy schedule by selftest_scenarios.py (a).
+
+  python run_reid_scen.py --mode selftest                       # tiny end-to-end smoke
+  python run_reid_scen.py --mode run   --scen S2 --triples 0,1 --seeds 0 --arms memzero,framebank
+  python run_reid_scen.py --mode score --scen S2 --triples 0,1 --seeds 0 --arms ...
+  python run_reid_scen.py --mode summary --scen S2,S3,S4
+"""
 import argparse
 import gc
 import json
@@ -47,8 +46,8 @@ def run_arm(pipeline, config, scen, triple_idx, seed_idx, arm, device, out_mp4, 
     """One N-switch generation. Returns (latents_cpu, blocks_with_written_ttt_state)."""
     from utils.misc import set_seed
     prompts, schedule, subjects = S.schedule_for(scen, triple_idx)
-    # LEVIER 1 (legende, 2026-08-04): les scenarios S2c / SS2c font pointer le RETOUR sur
-    # l'entree 3 de la liste, dont le texte est construit ICI = prompt de A VERBATIM + le suffixe
+    # levier 1 (legende, 2026-08-04): les scenarios S2c / SS2c font pointer le retour sur
+    # l'entree 3 de la liste, dont le texte est construit ICI = prompt de A verbatim + le suffixe
     # de legende MESURE hors ligne. Suffixe vide (`caption_none`) => prompts[3] == prompts[0]
     # => rollout bit a bit identique au memzero deja sur disque (le selftest gratuit du levier).
     if arm in S.CAPTION_ARMS:
@@ -64,17 +63,17 @@ def run_arm(pipeline, config, scen, triple_idx, seed_idx, arm, device, out_mp4, 
     for k, v in S.SCEN_ARM_ENV[arm].items():
         os.environ[k] = v
     # T1 (lot offensif): trace de la masse d'attention par source, une par cellule et par bras.
-    # APRES la table des bras (qui re-met TOUTES les cles de l'union, MEM_ADD_MASS_DUMP compris).
+    # APRES la table des bras (qui re-met toutes les cles de l'union, MEM_ADD_MASS_DUMP compris).
     if arm in S.ADDPOS_ARMS:
         _md = os.path.join(getattr(config, "_res_dir", "") or RES_DIR, "add_mass",
                            f"{scen}_t{triple_idx}_s{seed_idx}_{arm}.json")
         os.makedirs(os.path.dirname(_md), exist_ok=True)
         os.environ["MEM_ADD_MASS_DUMP"] = _md
-    # PREFIX rule (2026-08-02): every memdec* variant (memdec20, memdec20s*, memdec21c*,
+    # prefix rule (2026-08-02): every memdec* variant (memdec20, memdec20s*, memdec21c*,
     # memdec21u, ...) needs the decoder, and every one of them plus memon20 needs the writer.
     # A prefix test so a new variant can never silently run without its checkpoints.
     # MEMOIRE 2.1 : les bras T0 chargent LEURS PROPRES poids (ecrivain + decodeur re-entraines
-    # sur la metrique T0). Ils ne partagent pas les ckpts A2 de memdec20 -- sans quoi les deux
+    # sur la metrique T0). Ils ne partagent pas les ckpts A2 de memdec20, sans quoi les deux
     # bras d'une meme campagne seraient le MEME modele et le contraste serait vide par
     # construction. Un ckpt T0 manquant est une ERREUR, jamais un repli silencieux sur A2.
     _is_t0 = arm in S.T0_ARMS
@@ -90,22 +89,22 @@ def run_arm(pipeline, config, scen, triple_idx, seed_idx, arm, device, out_mp4, 
         assert _wk and os.path.exists(_wk), (
             f"arm {arm} requires --mem2-{'t0-' if _is_t0 else ''}writer-ckpt (got '{_wk}')")
         os.environ["MEM_WRITER"] = _wk
-    # ---- REVIEWER CONTROLS (2026-08-03) -----------------------------------------------------
-    # noiseanchor PERSISTS the anchor it decodes (and then throws away): that dump is what the
-    # wronganchor arm of the PREVIOUS triple splices, so the two waves cost 48 rollouts and not
-    # 72. The dump is written BEFORE any content substitution (pipeline hook order), so it is the
-    # raw memdec20 anchor of this cell -- the rollout is identical to memdec20 up to the splice.
+    # ---- reviewer controls (2026-08-03) -----------------------------------------------------
+    # noiseanchor persists the anchor it decodes (and then throws away): that dump is what the
+    # wronganchor arm of the previous triple splices, so the two waves cost 48 rollouts and not
+    # 72. The dump is written before any content substitution (pipeline hook order), so it is the
+    # raw memdec20 anchor of this cell, the rollout is identical to memdec20 up to the splice.
     _dec_dir = getattr(config, "_dec_anchor_dir", "") or S.DEC_ANCHOR_DIR
     # --dump-decanchor: memdec20 persiste AUSSI l'ancre qu'il decode (effet de bord pur, aucun
-    # tirage RNG, le rollout est inchange) -- utile quand la campagne ne passe pas par
+    # tirage RNG, le rollout est inchange), utile quand la campagne ne passe pas par
     # noiseanchor et que wronganchor a quand meme besoin d'une source.
-    # LEVIER 4 : `memdec_snap` persiste TOUJOURS l'ancre qu'il decode -- c'est elle le pre-ecran
+    # levier 4 : `memdec_snap` persiste TOUJOURS l'ancre qu'il decode, c'est elle le pre-ecran
     # (metrique T0 : correlation bande-basse contre A*, B et X). Effet de bord pur, aucun RNG.
     if arm in S.SNAP_ARMS:
         os.makedirs(_dec_dir, exist_ok=True)
         os.environ["MEM_DECODE_DUMP"] = os.path.join(
             _dec_dir, f"{scen}_t{triple_idx}_s{seed_idx}_snapanchor")
-    # MEMOIRE 2.1 : `memdec_t0` persiste TOUJOURS l'ancre qu'il decode -- c'est elle le gate G2b
+    # MEMOIRE 2.1 : `memdec_t0` persiste TOUJOURS l'ancre qu'il decode, c'est elle le gate G2b
     # (metrique T0 contre A*, B, X). Nom PROPRE : ecrire dans `_decanchor` ecraserait la source
     # que lit `wronganchor`. Effet de bord pur, aucun tirage RNG, rollout inchange.
     if arm in S.T0_ARMS:
@@ -123,17 +122,17 @@ def run_arm(pipeline, config, scen, triple_idx, seed_idx, arm, device, out_mp4, 
         _src = S.wrong_anchor_src(scen, triple_idx, seed_idx, _dec_dir)
         assert os.path.exists(_src), (
             f"arm {arm} needs the DECODED anchor of triple "
-            f"{S.wrong_anchor_triple(triple_idx)} seed {seed_idx} ({_src}) -- run the "
+            f"{S.wrong_anchor_triple(triple_idx)} seed {seed_idx} ({_src}), run the "
             f"noiseanchor wave (or memdec20 --dump-decanchor) on that cell first")
         os.environ["MEM_DECODE_SRC"] = _src
         print(f"[scen][{arm}] {scen} t{triple_idx} s{seed_idx} <- decoded anchor of triple "
               f"{S.wrong_anchor_triple(triple_idx)} (same seed)", flush=True)
-    # mini-batterie training-free: graine par CELLULE du bruit SDEdit (les 6 cellules appariees ne
+    # mini-batterie training-free: graine par cellule du bruit SDEdit (les 6 cellules appariees ne
     # doivent pas partager une seule realisation), + la frame du switch (ajoutee dans le hook).
     if arm in S.SDEDIT_ARMS:
         os.environ["MEM_SDEDIT_SEED"] = str(5150241 + cell_seed(config, triple_idx, seed_idx))
     # composite arms: optional dump of {bg, anchor, composite, mask} for the eye board. Set here
-    # (not from the caller's environment) because the arm table above re-sets EVERY key.
+    # (not from the caller's environment) because the arm table above re-sets every key.
     if arm in S.COMPOSITE_BASE and getattr(config, "_comp_dump_dir", ""):
         os.makedirs(config._comp_dump_dir, exist_ok=True)
         os.environ["MEM_COMP_DUMP"] = os.path.join(
@@ -183,9 +182,9 @@ def run_arm(pipeline, config, scen, triple_idx, seed_idx, arm, device, out_mp4, 
 
 # ----------------------------- scoring ------------------------------------------------------
 def score_video_scen(path, scen, device, settle=20, resettle=12, stride=8):
-    """re-ID of every REVISIT segment against the segment of the subject's FIRST APPEARANCE.
+    """re-ID of every revisit segment against the segment of the subject's first appearance.
 
-    reid_resA_origA = mean over the revisit segments (the KEY number, same name as the legacy
+    reid_resA_origA = mean over the revisit segments (the key number, same name as the legacy
     campaign so the two are directly comparable); reid_by_revisit keeps the per-return values
     (S4 has two). Controls: the interlude that immediately precedes each revisit vs the first
     appearance (ctrl_B_origA) and the revisit vs that interlude (ctrl_resA_B)."""
@@ -237,7 +236,7 @@ def summarize(res_dir, scens, triple_ids, seed_ids, out_json=None):
             continue
         arms = [a for a in S.SCEN_ARM_ENV if any(a in c for c in cells.values())]
         revisits = S.revisit_segments(scen)
-        print(f"\n===== {scen} ({S.SCENARIOS[scen]['desc']}) -- {len(cells)} cells, "
+        print(f"\n===== {scen} ({S.SCENARIOS[scen]['desc']}), {len(cells)} cells, "
               f"arms: {','.join(arms)} =====")
         ssum = {"n_cells": len(cells), "revisit_segments": revisits, "variants": {}}
         for variant in ("full", "crop60"):

@@ -45,10 +45,10 @@ RMSNorm = getattr(nn, 'RMSNorm', CompatRMSNorm)
 class TTTBlockCache:
     """Per-block fast-weight state holder, threaded through generator calls like a KV cache.
 
-    Deliberately a plain object and NOT a dict: FSDP mixed-precision input casting and
-    activation/gradient checkpointing traverse kwargs as pytrees and REBUILD dict/list
+    Deliberately a plain object and not a dict: FSDP mixed-precision input casting and
+    activation/gradient checkpointing traverse kwargs as pytrees and rebuild dict/list
     containers (a fresh dict per forward call), silently swallowing in-place dict writes.
-    A custom object is a pytree LEAF: passed by reference, so `cache.state = new_state`
+    A custom object is a pytree leaf: passed by reference, so `cache.state = new_state`
     mutates the shared object and survives the call stack. (Scal3R threaded a tuple instead,
     which works in its single-process inference path but not under our FSDP training stack.)"""
     __slots__ = ("state", "ema", "fifo")
@@ -56,7 +56,7 @@ class TTTBlockCache:
     def __init__(self):
         self.state = None
         # e4 anti-flicker: causal temporal-EMA buffers for the injection low-pass, keyed by
-        # denoising-step (timestep value). Entries are REPLACED (never mutated in place) so a
+        # denoising-step (timestep value). Entries are replaced (never mutated in place) so a
         # shallow dict() copy suffices for the twin snapshot, exactly like the state tuples.
         self.ema = {}
         # c2 eviction-feed: FIFO of (chunk_idx, detached h) for the last window_chunks write
@@ -132,9 +132,9 @@ def zeropower_via_newtonschulz5(G, steps):
 
 
 def swiglu_apply(q, w0, w1, w2):
-    """ f_W(q) = (silu(q @ w0) * (q @ w2)) @ w1 -- Scal3R's apply formula (the `oi = ...` line of
+    """ f_W(q) = (silu(q @ w0) * (q @ w2)) @ w1, Scal3R's apply formula (the `oi = ...` line of
     fast_weight_swish_glu_weight_norm_mini_batch_apply), pulled out so the causal step() can
-    APPLY before it writes (apply-first). """
+    apply before it writes (apply-first). """
     return (F.silu(q @ w0, inplace=False) * (q @ w2)) @ w1
 
 
@@ -143,7 +143,7 @@ def swiglu_fast_weight_gradient(k, v, w0, w1, w2, lr0, lr1, lr2):
 
     Body is identical to Scal3R's fast_weight_swish_glu_weight_norm_mini_batch_gradient; the only
     change is the signature is pre-sliced to a single causal chunk, so there is no ttt_ua_order to
-    index (k, v, lr* are already the chunk's tokens). No minus sign: the fast weight ASCENDS this
+    index (k, v, lr* are already the chunk's tokens). No minus sign: the fast weight ascends this
     dot (it is the TTT objective); Muon is applied later, in weight_norm_update.
     """
     # Calculate hidden -> SiLU(W1x) ◦ (W3x)
@@ -162,15 +162,15 @@ def swiglu_fast_weight_gradient(k, v, w0, w1, w2, lr0, lr1, lr2):
     w1_grad = (hidden * lr1).transpose(-1, -2) @ v  # (B, Ch, C)
     w2_grad = (k * lr2).transpose(-1, -2) @ dhide_before_mul  # (B, C, Ch)
 
-    # NOTE: we return the raw local gradients here, not the orthogonalized ones
-    # NOTE: the muon update is applied in the update method (here: weight_norm_update)
+    # note: we return the raw local gradients here, not the orthogonalized ones
+    # note: the muon update is applied in the update method (here: weight_norm_update)
     return w0_grad, w1_grad, w2_grad
 
 
 def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps, allreduce_fn=None,
                        decay=None, init_norms=None):
     """ Muon (Newton-Schulz) + fast-weight update.
-    Default (decay=None): Scal3R renorm -- ascend the Muon'd grad, then renorm each row to its
+    Default (decay=None): Scal3R renorm, ascend the Muon'd grad, then renorm each row to its
     pre-update norm (norm conserved, no forgetting; the state only rotates in a fixed-norm shell).
     Gated-delta (decay/init_norms set): w <- decay*w + muon(grad), then cap each row to its init norm
     (shrink allowed = explicit forgetting). `allreduce_fn` = Scal3R's context-parallel allreduce (raw grads).
@@ -211,7 +211,7 @@ def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps,
 
 
 def _sinusoid_embed(vals, dim):
-    """vals: (...,) scalars -> (..., dim) parameter-free sinusoidal embedding."""
+    """Vals: (...,) scalars -> (..., dim) parameter-free sinusoidal embedding."""
     half = max(dim // 2, 1)
     freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=vals.device).float() / half)
     ang = vals.float().unsqueeze(-1) * freqs
@@ -219,17 +219,17 @@ def _sinusoid_embed(vals, dim):
 
 
 def linear_delta_chunk_update(x, W, beta):
-    """ONE linear delta-rule write on raw tokens x (T, d) fp32: W <- W + beta (v - W k) k^T,
-    SEQUENTIAL token by token in row order, k = h/||h|| (L2 per token), v = h. W (d, d) fp32
-    is updated IN PLACE and returned.
+    """One linear delta-rule write on raw tokens x (T, d) fp32: W <- W + beta (v - W k) k^T,
+    sequential token by token in row order, k = h/||h|| (L2 per token), v = h. W (d, d) fp32
+    is updated in place and returned.
 
-    P0 (plan_entrainement_video_2026-08-07, bras M2): this is the DEPLOYMENT twin of the
+    P0 (plan_entrainement_video_2026-08-07, bras M2): this is the deployment twin of the
     offline oracle `lin_chunk_update` (reference/runs/probe1/build_states.py, rule='delta',
-    arm lin_delta_all, 15.33/19). The body is arithmetic-IDENTICAL to that function's delta
-    branch -- same ops, same order, same dtypes, same kernel shapes (2-D (T, d) fp32 input) --
+    arm lin_delta_all, 15.33/19). The body is arithmetic-identical to that function's delta
+    branch, same ops, same order, same dtypes, same kernel shapes (2-D (T, d) fp32 input) --
     so the state produced in generation is bitwise the state of the offline replay
-    (asserted by reference/runs/probe1/selftest_lin_native.py). Any edit here MUST keep that
-    parity or re-run the equivalence selftest. ZERO learned parameter, training-free."""
+    (asserted by reference/runs/probe1/selftest_lin_native.py). Any edit here must keep that
+    parity or re-run the equivalence selftest. Zero learned parameter, training-free."""
     assert x.dim() == 2 and x.dtype == torch.float32, f"tokens {tuple(x.shape)} {x.dtype}"
     assert W.dim() == 2 and W.dtype == torch.float32, f"state {tuple(W.shape)} {W.dtype}"
     nrm = x.norm(dim=-1, keepdim=True)
@@ -246,7 +246,7 @@ class VideoMemoryLayer(nn.Module):
 
     Same fast-weight SwiGLU memory (qkv/lr projection, inner-loop gradient, Muon + weight-norm
     update, gated AdaLN output), wired for autoregressive video instead of bidirectional VGGT
-    patches. Use `step(x, state, do_update)` per generator call (AR/inference/rollout). Output is
+    patches. Use `step(x, state, do_update)` per generator call (ar/inference/rollout). Output is
     the gated contribution to add to the residual.
     """
     def __init__(
@@ -256,7 +256,7 @@ class VideoMemoryLayer(nn.Module):
         inter_multi: int = 4,      # k=4
         base_lr: float = 1e-2,
         muon_update_steps: int = 5,  # 0 = plain SGD on the fast weight
-        qk_norm: bool = True,      # RMSNorm on head_dim (on for AR stability; Scal3R default False)
+        qk_norm: bool = True,      # RMSNorm on head_dim (on for ar stability; Scal3R default False)
         use_modulation: bool = True,
         g_init: float = 0.0,       # 0.0 -> inert warm start (identical to baseline at step 0; Scal3R: 0.1)
         use_decay: bool = False,   # gated-delta forgetting in weight_norm_update (else renorm-to-init)
@@ -265,32 +265,32 @@ class VideoMemoryLayer(nn.Module):
         single_norm: bool = False,   # read-path hygiene: drop the redundant o_norm so proj sees the raw
                                      # read magnitude (relevance-coupled injection); keep only AdaLN a_norm
         bounded_mod: bool = False,   # tanh-bound scale/shift too, so injection amplitude is state-independent
-        rel_norm: bool = False,      # amplitude fix: replace per-token o_norm with ONE chunk-scalar RMS, so
-                                     # per-token RELATIVE read magnitude (relevance) survives to proj + carrier
+        rel_norm: bool = False,      # amplitude fix: replace per-token o_norm with one chunk-scalar RMS, so
+                                     # per-token relative read magnitude (relevance) survives to proj + carrier
                                      # while the global write-count growth cancels every chunk; also drops a_norm
         dc_remove: bool = False,     # amplitude fix: subtract the token-mean of the injection (train + inference)
                                      # so proj cannot learn the token-constant DC-bias crutch
         detach_state: Optional[bool] = None,  # None -> detach in eval, keep graph in train
         checkpoint_write: bool = False,  # gradient-checkpoint the write update
         gate_extra: Optional[Sequence[str]] = None,  # extra gate inputs (off=[]): "agreement","denoising_step","frames_since_switch"
-        state_type: str = "swiglu",   # P0/M2: "swiglu" (default, STRICTLY the historical cell)
+        state_type: str = "swiglu",   # P0/M2: "swiglu" (default, strictly the historical cell)
                                       # | "linear_delta" (matrix state W, delta rule on raw h)
         linear_beta: float = 0.5,     # beta of the delta rule (LIN_BETA of the sealed oracle)
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
-        # ---- P0 linear-delta state (plan 2026-08-07, bras M2) -- ADDITIVE ------------------
-        # state_type="linear_delta" swaps ONLY the state/read/write core of the cell:
-        #   state : ONE matrix W (head_dim x head_dim) per block, init 0, fp32 (the sealed
-        #           accumulation dtype of the offline oracle -- fp16/bf16 would change the
+        # ---- P0 linear-delta state (plan 2026-08-07, bras M2), additive ------------------
+        # state_type="linear_delta" swaps only the state/read/write core of the cell:
+        #   state : one matrix W (head_dim x head_dim) per block, init 0, fp32 (the sealed
+        #           accumulation dtype of the offline oracle, fp16/bf16 would change the
         #           rounding of the sequential rule);
-        #   write : linear_delta_chunk_update on the RAW evicted-chunk tokens (same tokens
+        #   write : linear_delta_chunk_update on the raw evicted-chunk tokens (same tokens
         #           the historical write receives, x_write of the eviction feed), k = h/||h||,
-        #           v = h -- NO qkv projection, NO learned parameter, training-free;
-        #   read  : o = W @ q for the EXISTING read-path queries q (qkv projection + q_norm),
+        #           v = h, no qkv projection, no learned parameter, training-free;
+        #   read  : o = W @ q for the existing read-path queries q (qkv projection + q_norm),
         #           plugged exactly where swiglu_apply reads today, so the whole downstream
         #           (o_norm/rel_norm, gate, modulation, injection, env probes, hooks) is
-        #           UNCHANGED.
+        #           unchanged.
         # GPU footprint (nh=1, d=1536, B=1): W fp32 = 1536*1536*4 = 9.44 MB per block
         # (28.3 MB for the 3 deployed blocks; fp16 snapshot 4.72 MB/block, ~14.2 MB/age),
         # vs the SwiGLU state (w0+w1+w2 bf16, inter_multi=4) = 56.6 MB per block (169.9 MB
@@ -298,8 +298,8 @@ class VideoMemoryLayer(nn.Module):
         # (qkv/lrs/proj/w0/w1/w2/...), so checkpoints load unchanged in both modes.
         assert state_type in ("swiglu", "linear_delta"), f"unknown state_type {state_type!r}"
         if state_type == "linear_delta":
-            # the sealed rule is defined on FULL raw tokens (d = 1536); per-head splitting of
-            # h would be a DIFFERENT rule than the validated oracle -> refuse.
+            # the sealed rule is defined on full raw tokens (d = 1536); per-head splitting of
+            # h would be a different rule than the validated oracle -> refuse.
             assert num_heads == 1, "linear_delta state requires num_heads == 1"
         self.state_type = state_type
         self.linear_beta = float(linear_beta)
@@ -343,7 +343,7 @@ class VideoMemoryLayer(nn.Module):
         do = self.head_dim
         dh = self.head_dim * inter_multi
 
-        # TTT fast weight parameters initialization -- LaCT/Scal3R: 1/sqrt(fan_in) (no sqrt(2) gain)
+        # TTT fast weight parameters initialization, LaCT/Scal3R: 1/sqrt(fan_in) (no sqrt(2) gain)
         self.w0 = nn.Parameter(torch.randn(num_heads, di, dh) / math.sqrt(di))
         self.w1 = nn.Parameter(torch.randn(num_heads, dh, do) / math.sqrt(dh))
         self.w2 = nn.Parameter(torch.randn(num_heads, di, dh) / math.sqrt(di))
@@ -405,8 +405,8 @@ class VideoMemoryLayer(nn.Module):
         return torch.cat(feats, dim=-1)
 
     def reset_parameters(self):
-        """Re-apply the memory branch's own initialization. must be called after any global
-        model init (e.g. CausalWanModel.init_weights(), which xavier-inits every nn.Linear in
+        """Re-apply the memory branch's own initialization. Must be called after any global
+        model init (e.g. causalWanModel.init_weights(), which xavier-inits every nn.Linear in
         the model)."""
         assert self.use_modulation, "reset_parameters assumes use_modulation=True (the only supported mode)"
         self._init_modulation_params(self.dim, g_init=self.g_init)
@@ -464,8 +464,8 @@ class VideoMemoryLayer(nn.Module):
         self.dbg_dc_frac = _o.mean(dim=1, keepdim=True).pow(2).mean() / _o.pow(2).mean().clamp_min(1e-12)
         _tok = _o.pow(2).mean(dim=-1).sqrt()                          # (b, l) per-token injection RMS
         self.dbg_amp_disp = _tok.std() / _tok.mean().clamp_min(1e-12) # 0 = flat = amplitude still decoupled
-        # e4: split the joint dispersion into the WANTED spatial axis (relevance coupling across
-        # sites) vs the UNWANTED temporal axis (per-site frame-to-frame std = the flicker). Needs the
+        # e4: split the joint dispersion into the wanted spatial axis (relevance coupling across
+        # sites) vs the unwanted temporal axis (per-site frame-to-frame std = the flicker). Needs the
         # frame count to reshape l=(F*S). Health target: temporal small while spatial stays > 0.
         if num_frames is not None and int(num_frames) > 0 and _tok.shape[1] % int(num_frames) == 0:
             _F = int(num_frames)
@@ -481,9 +481,9 @@ class VideoMemoryLayer(nn.Module):
 
     def init_state(self, B, device, dtype):
         if getattr(self, "state_type", "swiglu") == "linear_delta":
-            # W = 0, ONE matrix per block (nh = 1). fp32 SEALED (the oracle's accumulation
-            # dtype); the `dtype` arg (deployment bf16) is deliberately NOT applied to the
-            # state -- it still selects nothing here because the rule fixes its own dtype.
+            # W = 0, one matrix per block (nh = 1). fp32 sealed (the oracle's accumulation
+            # dtype); the `dtype` arg (deployment bf16) is deliberately not applied to the
+            # state, it still selects nothing here because the rule fixes its own dtype.
             return (torch.zeros(B * self.num_heads, self.head_dim, self.head_dim,
                                 device=device, dtype=torch.float32),)
         return (self.w0.repeat(B, 1, 1).to(device=device, dtype=dtype),
@@ -491,16 +491,16 @@ class VideoMemoryLayer(nn.Module):
                 self.w2.repeat(B, 1, 1).to(device=device, dtype=dtype))
 
     def _linear_write(self, x_write, W):
-        """Linear-delta WRITE: new W from the raw evicted-chunk tokens x_write (B, Lw, dim).
+        """Linear-delta write: new W from the raw evicted-chunk tokens x_write (B, Lw, dim).
 
         Parity contract with the offline oracle (build_states.lin_chunk_update, delta):
-          - x_write[b] is handed to linear_delta_chunk_update as the SAME 2-D (T, d) fp32
+          - x_write[b] is handed to linear_delta_chunk_update as the same 2-D (T, d) fp32
             tensor the oracle sees (bf16 -> fp32 cast is exact, like the oracle's stored
             fp16 -> fp32);
           - TF32 is forced OFF around the update (saved/restored): the offline replay runs
             under probe1 set_determinism (TF32 off), and the state must be the same function
             of the data whatever the ambient backend flags of the calling pipeline are;
-          - the state is FUNCTIONAL: W is cloned, the clone is updated in place (bit-copy +
+          - the state is functional: W is cloned, the clone is updated in place (bit-copy +
             identical in-place ops = the oracle's persistent-W trajectory), so snapshots of
             older state tuples (twin/BPTT/episodic) are never mutated;
           - no_grad: the rule is training-free by design (no learned parameter in the write;
@@ -547,11 +547,11 @@ class VideoMemoryLayer(nn.Module):
         if state is None:
             state = self.init_state(B, x.device, q.dtype)
         if getattr(self, "state_type", "swiglu") == "linear_delta":
-            # ---- P0 linear-delta core (ADDITIVE; the else-branch below is the historical
-            # path, untouched). READ, apply-first, plugged exactly where swiglu_apply reads:
+            # ---- P0 linear-delta core (additive; the else-branch below is the historical
+            # path, untouched). read, apply-first, plugged exactly where swiglu_apply reads:
             # o_i = W @ q_i for the existing read-path queries q (fp32 matmul with the fp32
-            # state, cast back to the compute dtype so ALL downstream -- gate, modulation,
-            # injection, env probes -- is unchanged). WRITE: delta rule on the RAW tokens of
+            # state, cast back to the compute dtype so all downstream, gate, modulation,
+            # injection, env probes, is unchanged). write: delta rule on the raw tokens of
             # the same chunk the historical write receives (x_write of the eviction feed,
             # else the current chunk). k/v/lr* of the qkv projection are unused by the rule.
             assert allreduce_fn is None, "linear_delta: context-parallel write not supported"
@@ -563,7 +563,7 @@ class VideoMemoryLayer(nn.Module):
                     x_write if x_write is not None else x, W),)
         else:
             w0, w1, w2 = state
-            o = swiglu_apply(q, w0, w1, w2)                       # APPLY-FIRST (state from < this chunk)
+            o = swiglu_apply(q, w0, w1, w2)                       # apply-first (state from < this chunk)
             new_state = state
             if do_update:                                          # write the (evicted, or current) chunk
                 if x_write is not None:                            # eviction-feed: write source = evicted tokens
@@ -590,47 +590,47 @@ class VideoMemoryLayer(nn.Module):
         self.dbg_out_rms = out.detach().float().pow(2).mean().sqrt()
         return out, new_state
 
-    # ---- memory 2.0 write-replay (offline writer training) -- ADDITIVE, step() untouched ----
+    # ---- memory 2.0 write-replay (offline writer training), additive, step() untouched ----
     def write_only(self, x_write, state, allreduce_fn=None, use_checkpoint=None, grad_fn=None,
                    micro_batch=None):
-        """One fast-weight WRITE: state -> new state from the evicted-chunk hidden x_write.
+        """One fast-weight write: state -> new state from the evicted-chunk hidden x_write.
 
-        EXACTLY the do_update branch of step() with x_write given, factored out so the
+        Exactly the do_update branch of step() with x_write given, factored out so the
         write-replay trainer (memory 2.0) can re-run the write chain offline on collected h
-        sequences and get BITWISE the same states as the in-situ rollout
+        sequences and get bitwise the same states as the in-situ rollout
         (selftest: reference/runs/frame_dec/selftest_replay.py). Parity contract:
-          - `_qkv_lr(x_write)` is reused AS IS: the qkv projection stays ONE fused matmul
-            (1536 -> 4608) with q computed and thrown away, exactly like step() -- re-doing
+          - `_qkv_lr(x_write)` is reused as is: the qkv projection stays one fused matmul
+            (1536 -> 4608) with q computed and thrown away, exactly like step(), re-doing
             it as separate k/v matmuls would change the rounding;
           - same `_decay_and_norms` per call, same `_write` op order, same checkpoint
             mechanism (`use_reentrant=False`), no dtype cast added anywhere;
-          - NO `_detach()` here: the caller owns the graph (replay_writes keeps it so the
+          - no `_detach()` here: the caller owns the graph (replay_writes keeps it so the
             gradient reaches qkv / k_norm / lrs / decay_logit through the whole chain);
           - caller-side requirements for bitwise parity vs inference: module and x_write in
-            the deployment dtype (bf16), NO ambient autocast, same TF32/backends settings
+            the deployment dtype (bf16), no ambient autocast, same TF32/backends settings
             and same GPU model as the in-situ rollout.
         use_checkpoint: None -> self.checkpoint_write (the config flag, same as step());
         the checkpoint branch is only taken when grads are enabled, so a no_grad replay
         follows the exact same code path as no_grad inference.
-        grad_fn (ADDITIVE, DIAGNOSTIC ONLY -- registry section "ARM MLP-CORRECTEUR", 07/08):
-        the inner-loop gradient function, with the EXACT signature of
+        grad_fn (additive, diagnostic only, registry section "arm MLP-CORRECTEUR", 07/08):
+        the inner-loop gradient function, with the exact signature of
         `swiglu_fast_weight_gradient` (k, v, w0, w1, w2, lr0, lr1, lr2) -> (g0, g1, g2).
-        None (the DEFAULT, and the only value any training/inference path ever passes) calls
-        `swiglu_fast_weight_gradient` itself, so the default write is BITWISE the historical
-        one -- calling the same function object through a local name changes nothing.
-        This exists so an offline replay can swap the WRITE OBJECTIVE (error-correcting
+        None (the default, and the only value any training/inference path ever passes) calls
+        `swiglu_fast_weight_gradient` itself, so the default write is bitwise the historical
+        one, calling the same function object through a local name changes nothing.
+        This exists so an offline replay can swap the write objective (error-correcting
         variant) without duplicating a single line of the parity contract above.
-        micro_batch (ADDITIVE, DIAGNOSTIC ONLY -- registry "PLAN FACTORIEL", 07/08): None (the
-        DEFAULT, and the only value any training/inference path ever passes) = ONE update on
-        the whole chunk, BITWISE the historical write. An int m > 0 makes the write SEQUENTIAL:
+        micro_batch (additive, diagnostic only, registry "plan FACTORIEL", 07/08): None (the
+        default, and the only value any training/inference path ever passes) = one update on
+        the whole chunk, bitwise the historical write. An int m > 0 makes the write sequential:
         the chunk's tokens are consumed in slices of m in their natural index order, each slice
         seeing the state left by the previous ones. Invariants deliberately preserved so that
-        only the update SCHEDULE changes:
-          - `_qkv_lr` still runs ONCE on the whole chunk (one fused matmul) and the slices are
-            taken on its output, so k/v/lr are token-for-token IDENTICAL to the one-step write;
-          - `_decay_and_norms` still runs ONCE per WRITE and the forget gate is applied on the
-            FIRST slice only (total = decay*w + sum of the slice updates, exactly the one-step
-            algebra); the later slices pass decay 1.0 and keep the SAME init_norms cap;
+        only the update schedule changes:
+          - `_qkv_lr` still runs once on the whole chunk (one fused matmul) and the slices are
+            taken on its output, so k/v/lr are token-for-token identical to the one-step write;
+          - `_decay_and_norms` still runs once per write and the forget gate is applied on the
+            first slice only (total = decay*w + sum of the slice updates, exactly the one-step
+            algebra); the later slices pass decay 1.0 and keep the same init_norms cap;
           - the per-row norm cap is applied at every slice: in a sequential rule each
             intermediate state is a real state (the next slice reads it), so it must be valid.
         No gradient checkpointing on this path: it is an offline no_grad diagnostic replay.
@@ -654,12 +654,12 @@ class VideoMemoryLayer(nn.Module):
             use_ckpt = self.checkpoint_write if use_checkpoint is None else bool(use_checkpoint)
             if use_ckpt and torch.is_grad_enabled():
                 # non-reentrant checkpoint: activations of the write are recomputed in backward;
-                # gradients ALSO flow to closure-captured tensors (decay <- decay_logit), which
+                # gradients also flow to closure-captured tensors (decay <- decay_logit), which
                 # use_reentrant=False supports (reentrant would silently drop them).
                 return checkpoint(_write, k, v, w0, w1, w2, lr0, lr1, lr2, use_reentrant=False)
             return _write(k, v, w0, w1, w2, lr0, lr1, lr2)
 
-        # ---- SEQUENTIAL micro-batch schedule (same two calls as `_write`, in a loop) ----
+        # ---- sequential micro-batch schedule (same two calls as `_write`, in a loop) ----
         m, L = int(micro_batch), int(k.shape[-2])
         assert m > 0, f"micro_batch must be > 0, got {micro_batch}"
         keep = (1.0, 1.0, 1.0)               # "no forgetting": the decay already fired, slice 0
@@ -677,37 +677,37 @@ class VideoMemoryLayer(nn.Module):
 def replay_writes(layer, h_seq, detach_state=False, state=None, detach_init=True,
                   n_bptt_writes=None, use_checkpoint=None, allreduce_fn=None,
                   return_all=False, grad_fn=None, micro_batch=None):
-    """Differentiable WRITE-REPLAY (memory 2.0): re-run a cell's whole write sequence on an
+    """Differentiable write-replay (memory 2.0): re-run a cell's whole write sequence on an
     ordered list of evicted-chunk hiddens, offline, keeping the graph toward the write
     parameters (qkv, k_norm, lrs, decay_logit).
 
     Premise (memory2_design.md 1.1): under MEM_ZERO_ALL=1 the h fed to the writes are pure
     functions of the frozen backbone (data, independent of the writer's parameters), so
     replaying `state <- write_theta(state, h_i)` from the init state reproduces the in-situ
-    state trajectory EXACTLY -- bitwise, not approximately (selftest_replay.py asserts it).
+    state trajectory exactly, bitwise, not approximately (selftest_replay.py asserts it).
 
     Args:
         layer: a VideoMemoryLayer (typically blocks[5/16/27].memory of the loaded pipeline),
-            in the deployment dtype (bf16). Its own detach_state flag is IRRELEVANT here:
+            in the deployment dtype (bf16). Its own detach_state flag is irrelevant here:
             this function never calls step()/_detach(); graph control is explicit below.
         h_seq: ordered list of write inputs, h_seq[i] = the mem_x_write of the i-th write
             (the fifo-popped evicted chunk, shape (B, Lw, dim)), in write_chunks order.
             Must be on layer's device and in layer's compute dtype (cast fp16-stored shards
-            back to bf16 BEFORE calling -- exact for in-range values).
-        detach_state: True cuts the graph after EVERY write (values unchanged; useful for
+            back to bf16 before calling, exact for in-range values).
+        detach_state: True cuts the graph after every write (values unchanged; useful for
             probing). False (default, the training mode) keeps the full graph.
         state: initial (w0, w1, w2); None -> layer.init_state(B, device, dtype) exactly like
             the first in-situ write pass (state is None until the first write pass, which
             initializes it from the w0/w1/w2 init parameters).
         detach_init: detach the initial state from the w0/w1/w2 init parameters (True =
             phase A/B, w-inits frozen; False = phase C, gradient flows into the inits).
-        n_bptt_writes: truncated BPTT -- only the LAST n writes build a graph, older writes
-            run under no_grad (stop-gradient at the boundary). The FORWARD is unchanged, so
+        n_bptt_writes: truncated BPTT, only the last n writes build a graph, older writes
+            run under no_grad (stop-gradient at the boundary). The forward is unchanged, so
             bitwise parity with inference is preserved (design 1.4 mitigation 3). None =
             full BPTT. 0 = pure forward.
         use_checkpoint: per-write gradient checkpointing; None -> layer.checkpoint_write.
         return_all: also return the list of per-write states (for the bitwise selftest).
-        grad_fn, micro_batch: forwarded VERBATIM to write_only; None (default) = the historical
+        grad_fn, micro_batch: forwarded verbatim to write_only; None (default) = the historical
             write objective and the historical one-step schedule, bitwise (see write_only's
             docstring). Diagnostic replays only.
 
@@ -751,15 +751,15 @@ def replay_writes(layer, h_seq, detach_state=False, state=None, detach_init=True
 class FrameMixerBlock(nn.Module):
     """v2 anti-checkerboard spatial mixer block (memory2 phase B).
 
-    The v1 decoder is STRICTLY per token: each of the 30x52 queries reads the state on its own
+    The v1 decoder is strictly per token: each of the 30x52 queries reads the state on its own
     and the head expands it into a 2x2 latent patch, so nothing ever forces two neighbouring
     patches to agree -> the rendered frame carries a visible 2x2 checkerboard (Aden's eye, J3).
-    This block puts back the only thing that was missing, a LOCAL spatial mixing on the token
+    This block puts back the only thing that was missing, a local spatial mixing on the token
     grid, as a residual correction:
 
         x <- x + pw2(GELU(pw1(depthwise3x3(RMSNorm(x)))))
 
-    with pw2 ZERO-INIT (weight AND bias) so the block is EXACTLY the identity at init: a decoder
+    With pw2 ZERO-INIT (weight and bias) so the block is exactly the identity at init: a decoder
     built with mixer=True and warm-started from a v1/A2 checkpoint computes the v1 function
     bitwise (selftest_phaseB test 1), and the extra keys are the only ones missing from the
     old state_dict."""
@@ -890,12 +890,12 @@ class AnchorFrameDecoder(nn.Module):
         self.fuse2 = nn.Linear(fuse_hidden, dim)
         self.out_norm = nn.LayerNorm(dim, eps=1e-6)
         self.head = nn.Linear(dim, z_dim * patch_h * patch_w)
-        nn.init.zeros_(self.head.weight)   # null frame at init, NEVER xavier noise
+        nn.init.zeros_(self.head.weight)   # null frame at init, never xavier noise
         nn.init.zeros_(self.head.bias)
 
-        # v1.1 optional FiLM conditioning on the read queries (cond_dim == 0 -> NO modules
-        # created: the unconditioned decoder is STRICTLY the v1.0 module, same state_dict)
-        # v2 spatial mixer (identity at init; NO module created when mixer=False -> exact v1)
+        # v1.1 optional FiLM conditioning on the read queries (cond_dim == 0 -> no modules
+        # created: the unconditioned decoder is strictly the v1.0 module, same state_dict)
+        # v2 spatial mixer (identity at init; no module created when mixer=False -> exact v1)
         self.use_mixer = bool(mixer)
         if self.use_mixer:
             assert mixer_blocks > 0, "mixer=True with mixer_blocks=0"
@@ -910,7 +910,7 @@ class AnchorFrameDecoder(nn.Module):
             self.cond_in = nn.Linear(cond_dim, cond_hidden)
             self.cond_out = nn.Linear(cond_hidden, num_blocks * 2 * dim)
             nn.init.zeros_(self.cond_out.weight)  # FiLM identity at init: scale = shift = 0
-            nn.init.zeros_(self.cond_out.bias)    # -> conditioned model == v1.0 model EXACTLY
+            nn.init.zeros_(self.cond_out.bias)    # -> conditioned model == v1.0 model exactly
 
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -926,11 +926,11 @@ class AnchorFrameDecoder(nn.Module):
         return u.unsqueeze(1)  # (B, 1, 16, 60, 104)
 
     def forward(self, states, cond=None):
-        """states: sequence of num_blocks (w0, w1, w2) tuples (memory_layers order).
-        cond: optional pooled prompt embedding, (B, cond_dim) or (cond_dim,) -- the FiLM
-        condition ("retrieve what matches THIS description"). Requires cond_dim > 0.
+        """States: sequence of num_blocks (w0, w1, w2) tuples (memory_layers order).
+        cond: optional pooled prompt embedding, (B, cond_dim) or (cond_dim,), the FiLM
+        condition ("retrieve what matches this description"). Requires cond_dim > 0.
         cond=None with cond_dim > 0 runs the unconditioned read path (no FiLM applied),
-        which at init is ALSO the exact conditioned output (zero-init FiLM).
+        which at init is also the exact conditioned output (zero-init FiLM).
         Returns the decoded latent frame (B, 1, z_dim, grid_h*patch_h, grid_w*patch_w)."""
         assert len(states) == self.num_blocks, \
             f"expected {self.num_blocks} block states, got {len(states)}"
@@ -944,7 +944,7 @@ class AnchorFrameDecoder(nn.Module):
                 cond = cond[None]
             assert cond.dim() == 2 and cond.shape[-1] == self.cond_dim, \
                 f"cond {tuple(cond.shape)} != (B, {self.cond_dim})"
-            if self.detach_states:  # cond is DATA in v1 offline training, like the states
+            if self.detach_states:  # cond is data in v1 offline training, like the states
                 cond = cond.detach()
             f = self.cond_out(F.gelu(self.cond_in(self.cond_norm(cond.to(dtype)))))
             film = f.view(f.shape[0], self.num_blocks, 2, self.dim)  # (Bc, nb, {scale,shift}, dim)
@@ -974,7 +974,7 @@ class AnchorFrameDecoder(nn.Module):
                 fb = film.expand(B, -1, -1, -1) if film.shape[0] == 1 else film
                 assert fb.shape[0] == B, \
                     f"cond batch {film.shape[0]} != state batch {B} (and not broadcastable)"
-                # FiLM AFTER the q_norm so the modulation is not renormalized away; at the
+                # FiLM after the q_norm so the modulation is not renormalized away; at the
                 # zero-init (scale = shift = 0) this is q*1 + 0 == q exactly (v1.0 identity)
                 q = q * (1.0 + fb[:, b, 0].unsqueeze(1)) + fb[:, b, 1].unsqueeze(1)
             r = swiglu_apply(q, w0, w1, w2)                         # read: (B, m, dim)

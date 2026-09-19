@@ -1,19 +1,18 @@
 #!/usr/bin/env python
-# ============================================================================================
-# DE QUOI L'ANCRE DECODEE EST-ELLE L'IMAGE ?  (0 rollout)
-#
-# Les mesures de la nuit disent que l'ancre ne porte ni l'identite de A (DINO +0.0007, p = 0.84),
-# ni sa couleur (+0.128, 13/24, p = 0.84), ni meme sa structure grossiere (+0.014, 13/24). Elle
-# n'est pourtant PAS generique : T0 montre qu'elle est copiee dans le rendu de facon SPECIFIQUE
-# (0.47-0.52 contre un plancher de 0.10). Donc elle est l'image de QUELQUE CHOSE. De quoi ?
-#
-# L'hypothese mecanique, qui vient du DECODEUR lui-meme : il a ete entraine a reconstruire la
-# frame EVINCEE de la fenetre. Au switch de RETOUR (frame 180), les frames qui viennent d'etre
-# evincees appartiennent a l'INTERLUDE B, pas a A. Un decodeur PARFAIT rendrait donc une frame
-# de B. Test : comparer l'ancre a A*, a B (l'interlude) et a X (l'ouvreur epingle dans le sink).
-#
-#   python anchor_what.py
-# ============================================================================================
+"""De QUOI L'ANCRE DECODEE EST-elle L'image ?  (0 rollout)
+
+Les mesures de la nuit disent que l'ancre ne porte ni l'identite de A (DINO +0.0007, p = 0.84),
+ni sa couleur (+0.128, 13/24, p = 0.84), ni meme sa structure grossiere (+0.014, 13/24). Elle
+n'est pourtant pas generique : T0 montre qu'elle est copiee dans le rendu de facon SPECIFIQUE
+(0.47-0.52 contre un plancher de 0.10). Donc elle est l'image de QUELQUE chose. De quoi ?
+
+L'hypothese mecanique, qui vient du DECODEUR lui-meme : il a ete entraine a reconstruire la
+frame EVINCEE de la fenetre. Au switch de retour (frame 180), les frames qui viennent d'etre
+evincees appartiennent a l'interlude B, pas a A. Un decodeur parfait rendrait donc une frame
+de B. Test : comparer l'ancre a A*, a B (l'interlude) et a X (l'ouvreur epingle dans le sink).
+
+  python anchor_what.py
+"""
 import json
 import os
 import sys

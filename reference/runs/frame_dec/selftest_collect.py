@@ -1,30 +1,29 @@
 #!/usr/bin/env python
-# ============================================================================================
-# frame_dec collection SELFTEST: one SHORT rollout (30 frames = 10 chunks) on GPU.
-#
-# Checks:
-#   0. corpus selection runs, held-out exclusion = 0 hit on the 16 probe prompts (CPU, fails
-#      fast before any GPU work), regex filter yields a sane fraction of the corpus.
-#   1. saved states are non-None on the 3 memory blocks, fp16 cpu, expected shapes, finite,
-#      and EVOLVE between chunk positions (the write is live, not a frozen snapshot).
-#   2. the target frame IS the just-evicted latent frame: bitwise equal to
-#      latents[0, evicted_frame] (fp16 cast), AND the model's own eviction-feed debug trace
-#      (MEM_EVICT_DEBUG) confirms popped == chunk_idx - window_chunks with wrote=True.
-#   3. a shard .pt written with the collected pairs (single + switch mixed) reloads
-#      bitwise-identical, format_version == 2.
-#   4. ttt state written EXACTLY on config.model_kwargs.memory_layers (no more, no less).
-#   5. v2 single-prompt pairs carry cond_emb (fp16 cpu (4096,), finite, nonzero), mode,
-#      target_frame == evicted_frame.
-#   6. SWITCH MODE (v1.1): a short A->B rollout; per pair: A totally evicted from the window
-#      (chunk bookkeeping AND the in-rollout fifo assert), target == the LAST latent frame
-#      of A (bitwise, fp16), cond_emb == pooled prompt-A embedding (same as single-mode pairs
-#      of the same prompt), switch bookkeeping coherent, states evolve post-switch.
-#   7. mode/switch pickers: --mix assignment ~50/50 and deterministic; pick_switch
-#      deterministic, switch_frame in the configured set, prompt B != prompt A.
-#
-# Run (Aden, longlive env, GPU visible):
-#   CUDA_VISIBLE_DEVICES=0 python reference/runs/frame_dec/selftest_collect.py
-# ============================================================================================
+"""frame_dec collection SELFTEST: one short rollout (30 frames = 10 chunks) on GPU.
+
+Checks:
+  0. corpus selection runs, held-out exclusion = 0 hit on the 16 probe prompts (CPU, fails
+     fast before any GPU work), regex filter yields a sane fraction of the corpus.
+  1. saved states are non-None on the 3 memory blocks, fp16 cpu, expected shapes, finite,
+     and evolve between chunk positions (the write is live, not a frozen snapshot).
+  2. The target frame is the just-evicted latent frame: bitwise equal to
+     latents[0, evicted_frame] (fp16 cast), and the model's own eviction-feed debug trace
+     (MEM_EVICT_DEBUG) confirms popped == chunk_idx - window_chunks with wrote=True.
+  3. a shard .pt written with the collected pairs (single + switch mixed) reloads
+     bitwise-identical, format_version == 2.
+  4. ttt state written exactly on config.model_kwargs.memory_layers (no more, no less).
+  5. v2 single-prompt pairs carry cond_emb (fp16 cpu (4096,), finite, nonzero), mode,
+     target_frame == evicted_frame.
+  6. SWITCH mode (v1.1): a short A->B rollout; per pair: A totally evicted from the window
+     (chunk bookkeeping and the in-rollout fifo assert), target == the last latent frame
+     of A (bitwise, fp16), cond_emb == pooled prompt-A embedding (same as single-mode pairs
+     of the same prompt), switch bookkeeping coherent, states evolve post-switch.
+  7. mode/switch pickers: --mix assignment ~50/50 and deterministic; pick_switch
+     deterministic, switch_frame in the configured set, prompt B != prompt A.
+
+Run (Aden, longlive env, GPU visible):
+  CUDA_VISIBLE_DEVICES=0 python reference/runs/frame_dec/selftest_collect.py
+"""
 import os
 import sys
 
@@ -95,9 +94,9 @@ def main():
                     f"pair {pi} block {bi}: dtype/device {t.dtype}/{t.device}"
                 assert tuple(t.shape) == es, f"pair {pi} block {bi}: shape {tuple(t.shape)} != {es}"
                 assert torch.isfinite(t).all(), f"pair {pi} block {bi}: non-finite state values"
-    # states must EVOLVE between positions (write live): compare w0 of block 5, pair0 vs pair4
+    # states must evolve between positions (write live): compare w0 of block 5, pair0 vs pair4
     d_state = (pairs[0]["states"][0][0].float() - pairs[4]["states"][0][0].float()).abs().max().item()
-    assert d_state > 0, "state identical across chunk positions -- write pass not live"
+    assert d_state > 0, "state identical across chunk positions, write pass not live"
     print(f"[selftest] states OK on blocks {mem_layers} "
           f"(max |w0(c5) - w0(c9)| = {d_state:.5f} > 0)")
 
@@ -127,7 +126,7 @@ def main():
 
     # model's own eviction trace: popped chunk == chunk_idx - wc, wrote=True past the sink
     dbg = res["evict_dbg"]
-    assert dbg, "MEM_EVICT_DEBUG trace empty -- eviction_feed not live?"
+    assert dbg, "MEM_EVICT_DEBUG trace empty, eviction_feed not live?"
     by_chunk = {}
     for e in dbg:
         by_chunk.setdefault(e["chunk"], []).append(e)
@@ -142,7 +141,7 @@ def main():
     print("[selftest] model evict-feed trace agrees: popped == chunk_idx - "
           f"{wc}, wrote=True on all collected positions")
 
-    # ---- 6. SWITCH MODE (v1.1 recency-bias attack) -------------------------------------------
+    # ---- 6. SWITCH mode (v1.1 recency-bias attack) -------------------------------------------
     frames_sw = 45                    # 15 chunks; switch at frame 15 -> switch_chunk 5
     switch_frame = 15
     cidx_b, prompt_b = selected[1]
@@ -156,7 +155,7 @@ def main():
     assert res_sw["mode"] == "switch" and res_sw["switch_chunk"] == 5
     assert res_sw["written"] == mem_layers
     assert len(sw_pairs) == 3, f"expected 3 switch pairs, got {len(sw_pairs)}"
-    ref_A = sw_lat[0, switch_frame - 1].to(torch.float16)   # the LAST latent frame of A
+    ref_A = sw_lat[0, switch_frame - 1].to(torch.float16)   # the last latent frame of A
     assert ref_A.abs().max().item() > 0, "last-A reference frame is all-zeros"
     for pair in sw_pairs:
         assert pair["mode"] == "switch"
@@ -165,21 +164,21 @@ def main():
         assert pair["corpus_idx_b"] == cidx_b
         assert pair["target_frame"] == switch_frame - 1
         # A totally evicted: the window of chunk c covers chunks [c-wc+1, c], all past A
-        # (the collector ALSO asserted this on the model's real fifo during the rollout)
+        # (the collector also asserted this on the model's real fifo during the rollout)
         w_lo = pair["chunk_idx"] - pair["window_chunks"] + 1
         assert w_lo > pair["switch_chunk"], \
             f"chunk {pair['chunk_idx']}: window low chunk {w_lo} <= switch_chunk 5"
         assert torch.equal(pair["target"], ref_A), \
             f"chunk {pair['chunk_idx']}: target != last A frame {switch_frame - 1} (bitwise)"
         check_cond_emb(pair, f"switch chunk {pair['chunk_idx']}")
-        # cond is PROMPT A's pooled embedding: same prompt + same encoder as the single
+        # cond is prompt A's pooled embedding: same prompt + same encoder as the single
         # rollout above -> must match its cond_emb (fp16 tolerance for device nondeterminism)
         assert torch.allclose(pair["cond_emb"].float(), pairs[0]["cond_emb"].float(),
                               rtol=0.0, atol=1e-2), \
             "switch cond_emb != pooled prompt-A embedding of the single rollout"
     d_sw = (sw_pairs[0]["states"][0][0].float()
             - sw_pairs[-1]["states"][0][0].float()).abs().max().item()
-    assert d_sw > 0, "switch states identical across positions -- B writes not live"
+    assert d_sw > 0, "switch states identical across positions, B writes not live"
     print(f"[selftest] SWITCH OK: A evicted (window > chunk 5) on chunks "
           f"{[p['chunk_idx'] for p in sw_pairs]}, target == last-A frame {switch_frame - 1} "
           f"(bitwise), cond_emb == pooled A, states evolve (max d = {d_sw:.5f})")
@@ -199,7 +198,7 @@ def main():
     print(f"[selftest] pickers OK: mix split {100 * frac:.1f}% switch (deterministic), "
           f"pick_switch({test_cidx}) = frame {pk1[0]}, B corpus_idx {pk1[1]}")
 
-    # ---- 3. shard save / reload roundtrip (MIXED single + switch, format v2) -----------------
+    # ---- 3. shard save / reload roundtrip (mixed single + switch, format v2) -----------------
     header = shard_header(config, DEFAULT_CONFIG, mem_layers, frames, 5, collect_mode="mix")
     out_dir = os.path.join(HERE, "selftest_out")
     os.makedirs(out_dir, exist_ok=True)

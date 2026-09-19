@@ -1,14 +1,13 @@
 #!/usr/bin/env python
-# ============================================================================================
-# The prompt-embedding cache, verified -- CPU, no real encoder (11.4 GB), ~1 s.
-#
-# THE test is P3: a prompt read back from the cache must return the tensor BIT FOR BIT. This
-# project compares effects the size of its own chain noise (+/-2 pairs out of 19, measured
-# 07/08); a rounding error introduced by the cache would be invisible and would falsify
-# everything. No quantization is permitted here, not even a "harmless" one.
-#
-#   python tests/test_prompt_cache.py
-# ============================================================================================
+"""The prompt-embedding cache, verified on CPU, with no real encoder, in about a second.
+
+P3 is the test that matters: a prompt read back from the cache must return the tensor bit for
+bit. This project compares effects the size of its own chain noise (plus or minus 2 pairs out
+of 19, measured 07/08), so a rounding error introduced by the cache would be invisible and
+would falsify everything. No quantization is permitted here, not even a harmless-looking one.
+
+    python tests/test_prompt_cache.py
+"""
 import os
 import shutil
 import sys
@@ -35,7 +34,7 @@ try:
 
     # --- P1: the key is stable and distinguishes what it must ---------------------------------
     check("P1 stable key", pc.key_of(A) == pc.key_of(A))
-    # THE trap the key has to cover: pass 1 and pass 2 must work in the same precision, because
+    # The trap the key has to cover: pass 1 and pass 2 must work in the same precision, because
     # inference.py casts the whole pipeline to bfloat16. A float32 cache served to a bfloat16
     # model gives a wrong conditioning, with no error raised.
     check("P1d dtype is part of the key",
@@ -51,9 +50,9 @@ try:
     pc.put(A, emb, TMP)
     check("P2b present after write", pc.has(A, TMP, torch.float32))
 
-    # --- P3: THE test -- bitwise read-back -----------------------------------------------------
+    # --- P3: the one that matters, bitwise read-back --------------------------------------------
     back = pc.get(A, TMP, torch.float32)
-    check("P3 read-back BITWISE identical", torch.equal(back, emb),
+    check("P3 read-back bitwise identical", torch.equal(back, emb),
           f"max|diff| = {float((back-emb).abs().max())}")
     check("P3b dtype preserved", back.dtype == emb.dtype)
     check("P3c shape preserved", back.shape == emb.shape)
@@ -66,7 +65,7 @@ try:
     # --- P4: get_many preserves input order and reports the misses -----------------------------
     # Catches the error that would raise no exception: pairing a prompt with another one's
     # conditioning because the rows got shuffled.
-    # a bf16 embedding must NOT answer a float32 request
+    # a bf16 embedding must not answer a float32 request
     pc.put(A, emb.to(torch.bfloat16), TMP)
     check("P1e bf16 and f32 coexist without being confused",
           pc.get(A, TMP, torch.float32).dtype is torch.float32

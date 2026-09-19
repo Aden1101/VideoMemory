@@ -90,28 +90,28 @@ class StreamingTrainingModel:
         self.tv_loss_weight = getattr(config, "tv_loss_weight", 0.0)
         self.tv_motion_floor = getattr(config, "tv_motion_floor", 0.0)   # latent-diff floor; 0 => inactive
         # e3 counterfactual-advantage objective (all defaults 0/off => byte-identical baseline).
-        # Rewards the memory ONLY for beating its own motion-valid mem-OFF twin on identity:
+        # Rewards the memory only for beating its own motion-valid mem-OFF twin on identity:
         #   L = -w_adv * g * clamp(cos_ON - cos_CF, -neg, +pos) + w_rel*(log m_ON - log m_CF)^2
         #       + w_ext * relu(log(frac*m_stock) - log m_ON)^2
-        self.adv_loss_weight = getattr(config, "adv_loss_weight", 0.0)   # BONUS mode only (default OFF)
+        self.adv_loss_weight = getattr(config, "adv_loss_weight", 0.0)   # bonus mode only (default OFF)
         self.adv_clamp_pos = getattr(config, "adv_clamp_pos", 0.05)      # reward saturates here (cos units)
         self.adv_clamp_neg = getattr(config, "adv_clamp_neg", 0.20)      # do-no-harm side stays linear 4x deeper
         self.adv_gate_sigma = getattr(config, "adv_gate_sigma", 0.405)   # ln(1.5): log-motion validity band
         self.adv_floor_frac = getattr(config, "adv_floor_frac", 0.5)     # ext floor fires below frac*stock motion
         self.mm_rel_weight = getattr(config, "mm_rel_weight", 0.0)       # two-sided log-motion match to the twin
         self.mm_ext_weight = getattr(config, "mm_ext_weight", 0.0)       # one-sided log floor vs stock-AF curve
-        # do-no-harm hinge (identity may not be WORSE than the twin; nothing pays for beating it):
+        # do-no-harm hinge (identity may not be worse than the twin; nothing pays for beating it):
         self.dnh_weight = getattr(config, "dnh_weight", 0.0)
         self.dnh_deadband = getattr(config, "dnh_deadband", 0.01)        # cos units of tolerated noise
         # activity floor: the injection's causal AC-dose (real-vs-twin latent difference, global
         # per-channel mean removed so a DC/style bias cannot satisfy it) must stay >= act_floor.
         # relu => zero gradient once satisfied: a floor, never a maximizer.
         self.act_weight = getattr(config, "act_weight", 0.0)
-        self.act_floor = getattr(config, "act_floor", 0.05)              # relative AC-dose target (CALIBRATE)
+        self.act_floor = getattr(config, "act_floor", 0.05)              # relative AC-dose target (calibrate)
         # e4 anti-flicker (all defaults reproduce e3 exactly):
-        #  - motion_lag2: use the flicker-BLIND lag-2 motion statistic in mm_rel/mm_ext + the dose,
+        #  - motion_lag2: use the flicker-blind lag-2 motion statistic in mm_rel/mm_ext + the dose,
         #    so frame-rate shimmer no longer counterfeits motion credit (removes the flicker payer).
-        #  - dose_tmean_remove: also subtract the per-site TEMPORAL mean in the AC-dose, so a static
+        #  - dose_tmean_remove: also subtract the per-site temporal mean in the AC-dose, so a static
         #    overlay (wallpaper) earns zero dose (escalation named in the docstring).
         #  - flick_weight/flick_deadband: latent second-temporal-difference hinge vs the twin (tripwire).
         self.motion_lag2 = bool(getattr(config, "motion_lag2", False))
@@ -558,7 +558,7 @@ class StreamingTrainingModel:
     # ---- counterfactual-twin machinery (e3): snapshot/restore everything one chunk mutates ----
     def _twin_snapshot(self):
         """Clone every piece of state a chunk generation mutates (KV / cross-attn / flow / prompt
-        caches, fast-weight state, RNG streams, switch flag) so a mem-OFF twin of the SAME chunk can
+        caches, fast-weight state, RNG streams, switch flag) so a mem-OFF twin of the same chunk can
         be generated and then fully undone. Tensor clones go to CPU to spare VRAM. Completeness is
         validated empirically by E3_TWIN_SELFTEST=1 (twin with memory ON must equal the real chunk
         bitwise)."""
@@ -584,11 +584,11 @@ class StreamingTrainingModel:
         ttt_ema = None
         ttt_fifo = None
         if getattr(p, "ttt_cache", None):
-            # state tuples are REPLACED per write (never mutated in place) -> keeping refs suffices
+            # state tuples are replaced per write (never mutated in place) -> keeping refs suffices
             ttt = [None if getattr(c, "state", None) is None else tuple(c.state) for c in p.ttt_cache]
             # e4: the EMA buffers are new mutable state a chunk mutates -> snapshot them too, else the
             # mem-OFF twin's buffer writes leak into the real rollout (breaks the counterfactual). Dict
-            # entries are REPLACED per update (never mutated in place), so a shallow dict() copy suffices.
+            # entries are replaced per update (never mutated in place), so a shallow dict() copy suffices.
             ttt_ema = [dict(getattr(c, "ema", {}) or {}) for c in p.ttt_cache]
             # c2 eviction-feed: the fifo is appended/popped per write chunk ((idx, tensor) tuples,
             # tensors never mutated in place) -> a shallow list() copy suffices, like the EMA dicts.
@@ -704,8 +704,8 @@ class StreamingTrainingModel:
         )
 
         # ---- counterfactual mem-OFF twin (e3 advantage objective) ----
-        # Same pre-chunk state, same noise, same RNG stream, injection zeroed -> the ONLY difference
-        # vs the real chunk is the memory's injection during THIS chunk. Generated FIRST, then every
+        # Same pre-chunk state, same noise, same RNG stream, injection zeroed -> the only difference
+        # vs the real chunk is the memory's injection during this chunk. Generated first, then every
         # mutated state is restored, so the real rollout below is bit-identical to a no-twin run.
         # Selftest (mandatory before launch): E3_TWIN_SELFTEST=1 keeps the memory ON in the twin and
         # the code below asserts twin == real, which validates snapshot completeness + RNG pairing.
@@ -826,7 +826,7 @@ class StreamingTrainingModel:
             "current_length": self.state["current_length"],
             "gradient_mask": gradient_mask,  # Mask frames that do not require gradients for loss computation
             "overlap_frames_used": overlap_frames_to_use,
-            "twin_new_frames": twin_new_frames,  # mem-OFF counterfactual of the NEW frames (e3), or None
+            "twin_new_frames": twin_new_frames,  # mem-OFF counterfactual of the new frames (e3), or None
         }
         if (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] current_training_chunk: ({self.state['current_length'] - new_frames_to_generate} -> {self.state['current_length']})/{self.state['temp_max_length']}")
@@ -852,7 +852,7 @@ class StreamingTrainingModel:
         return self._dino
 
     def _dino_embed_pixels(self, pixels):
-        """pixels [B,T,C,H,W] in [-1,1] -> L2-normalized DINO CLS embeddings [B*T, D] (fp32)."""
+        """Pixels [B,T,C,H,W] in [-1,1] -> L2-normalized DINO CLS embeddings [B*T, D] (fp32)."""
         dino = self._get_dino()
         b, t, c, h, w = pixels.shape
         x = pixels.reshape(b * t, c, h, w).float()
@@ -866,7 +866,7 @@ class StreamingTrainingModel:
 
     def _set_id_anchor(self, chunk):
         """Cache the chunk-0 subject identity anchor (no grad), called from the rollout on the first
-        chunk. Uses the HEAD frames (highest prompt fidelity, last to degrade under collapse) so the
+        chunk. Uses the head frames (highest prompt fidelity, last to degrade under collapse) so the
         anchor is a real subject; supervised chunks compare their tail frames, so id_cos=1.0 becomes a
         genuine static-video alarm instead of a vacuous garbage-vs-garbage fixed point."""
         if self.id_loss_weight <= 0.0 and not self._e3_anchor_on:
@@ -879,7 +879,7 @@ class StreamingTrainingModel:
 
     def _compute_identity_tv_loss(self, chunk, chunk_start_frame, gradient_mask):
         """Frame-level identity anchor loss + temporal-variance floor. Returns (id_loss, tv_loss, log).
-        All log values are 0-dim tensors present on EVERY chunk (chunk-0 defaults) so merge_dict_list
+        All log values are 0-dim tensors present on every chunk (chunk-0 defaults) so merge_dict_list
         (which keys off the first chunk's dict) keeps them and stacks them across chunks."""
         device = chunk.device
         id_loss = torch.zeros((), device=device)
@@ -937,27 +937,27 @@ class StreamingTrainingModel:
         return torch.tensor(float(curve[i]), device=self.device)
 
     def _compute_advantage_loss(self, chunk, chunk_info):
-        """e3 objective: clean + ACTIVE + do-no-harm + dynamic, via the mem-OFF counterfactual twin.
+        """e3 objective: clean + active + do-no-harm + dynamic, via the mem-OFF counterfactual twin.
             L = w_dnh * relu(cos_CF - cos_ON - deadband)            (do-no-harm identity hinge)
               + w_act * relu(act_floor - D_ac)                      (activity floor: not inert)
               + w_rel * (log m_ON - log m_CF)^2                     (motion two-sided vs twin)
               + w_ext * relu(log(frac * m_stock) - log m_ON)^2      (anti-co-freeze vs stock curve)
-              [ - w_adv * g * clamp(cos_ON - cos_CF, -neg, +pos)    BONUS mode only, default OFF ]
+              [ - w_adv * g * clamp(cos_ON - cos_CF, -neg, +pos)    bonus mode only, default OFF ]
         with D_ac = RMS((c_ON - c_CF) - per-channel-mean) / RMS_ac(c_CF): the injection's causal
         dose, DC/global-style component removed.
         Anti-degeneracy structure (each blocked in-construction, not by tuning):
-        - The twin is no-grad and shares history + KV + noise: the ONLY differential lever is the
+        - The twin is no-grad and shares history + KV + noise: the only differential lever is the
           memory injection during this chunk; nothing can be earned by degrading the baseline, and
           the paired design cancels prompt/noise variance.
-        - NOTHING pays for identity self-similarity anymore (id_loss removed, reward off): freeze has
+        - nothing pays for identity self-similarity anymore (id_loss removed, reward off): freeze has
           no payer, and mm_rel/mm_ext punish it; a frozen chunk also zeroes the dnh hinge trivially,
           so freeze buys nothing that neutrality does not already buy, at strictly higher mm cost.
         - The activity floor is a RELU: zero gradient once D_ac >= act_floor -> a floor, never a
-          maximizer -> no runaway (contrast: e2_amp's rel_norm pinned a FIXED dose at every chunk;
+          maximizer -> no runaway (contrast: e2_amp's rel_norm pinned a fixed dose at every chunk;
           here the floor only forbids ~zero dose, the envelope bounds it above, and D_ac's mean
           removal forbids satisfying it with the resurrected DC bias).
         - Under the box {identity not-worse, motion matched, DMD on-manifold, dose >= floor}, the
-          cheapest admissible behavior is an active-but-neutral content/detail difference: ACTIVE by
+          cheapest admissible behavior is an active-but-neutral content/detail difference: active by
           construction, harmless by constraint. Wallpaper (static texture watermark) is the residual
           gaming channel -> judged at eval (visual + dcfrac), escalation = temporal-mean removal in D_ac.
         - Decoded frames are position-randomized in the tail so the read cannot position-lock.
@@ -980,9 +980,9 @@ class StreamingTrainingModel:
         ov = int(chunk_info.get("overlap_frames_used", 0))
         new_real = chunk[:, ov:]                        # newly generated frames only (grad); twin spans
         # the same global frames and is decode-comparable (no first-frame re-encode contamination)
-        # e4: lag-2 (frame-rate-blind) motion statistic -- frame-rate alternation contributes ~0 to a
+        # e4: lag-2 (frame-rate-blind) motion statistic, frame-rate alternation contributes ~0 to a
         # lag-2 delta while smooth motion contributes fully, so the memory can no longer counterfeit
-        # motion credit with shimmer. Falls back to the e3 first-difference when the flag is off OR the
+        # motion credit with shimmer. Falls back to the e3 first-difference when the flag is off or the
         # chunk is too short for a lag-2 window. (motion_targets.json must be regenerated to match.)
         if getattr(self, "motion_lag2", False) and new_real.shape[1] >= 3:
             m_on = (new_real[:, 2:] - new_real[:, :-2]).abs().mean() * 0.5
@@ -1008,14 +1008,14 @@ class StreamingTrainingModel:
             if getattr(self, "dose_tmean_remove", False):
                 cf_ac = cf_ac - cf_ac.mean(dim=1, keepdim=True)         # match the per-site temporal removal
             cf_rms = cf_ac.float().pow(2).mean().sqrt().clamp_min(eps)
-        # e4: also remove the per-site TEMPORAL mean so a static overlay (wallpaper) earns ZERO dose;
+        # e4: also remove the per-site temporal mean so a static overlay (wallpaper) earns zero dose;
         # only a slow, state-evolving, spatially-structured change can satisfy the floor.
         if getattr(self, "dose_tmean_remove", False):
             d_ac = d_ac - d_ac.mean(dim=1, keepdim=True)                # per (B,C,H,W) site temporal mean
         dose = d_ac.float().pow(2).mean().sqrt() / cf_rms
         act = F.relu(self.act_floor - dose)
-        # (3b) e4 anti-flicker tripwire: penalize the per-site SECOND-temporal-difference roughness the
-        # injection adds BEYOND the mem-OFF twin. One-sided hinge, paired (real acceleration in the twin
+        # (3b) e4 anti-flicker tripwire: penalize the per-site second-temporal-difference roughness the
+        # injection adds beyond the mem-OFF twin. One-sided hinge, paired (real acceleration in the twin
         # is priced in), relative to the twin's own roughness. D2 (not D1) maximizes on frame-rate
         # alternation while smooth constant-velocity motion contributes ~0. Latent-space (covers all new
         # frames, free); the EMA low-pass should make this structurally ~0 -> a rise flags conversion of
@@ -1041,10 +1041,10 @@ class StreamingTrainingModel:
             px_cf = self.base_model.vae.decode_to_pixel(twin[:, s0:s1], use_cache=False)
             cos_cf = (self._dino_embed_pixels(px_cf) * self._id_anchor).sum(-1).mean()
         A = cos_on - cos_cf
-        # do-no-harm hinge: fires only when the injection makes identity WORSE than mem-OFF (beyond
-        # the noise deadband); no gate needed -- under freeze it is zero, and the mm terms own freeze.
+        # do-no-harm hinge: fires only when the injection makes identity worse than mem-OFF (beyond
+        # the noise deadband); no gate needed, under freeze it is zero, and the mm terms own freeze.
         dnh = F.relu(-A - self.dnh_deadband)
-        # BONUS-mode clamped reward (default OFF): motion-validity gate DETACHED (never a lever)
+        # bonus-mode clamped reward (default OFF): motion-validity gate detached (never a lever)
         with torch.no_grad():
             ref = m_tgt if m_tgt is not None else m_cf
             gate = torch.exp(-((torch.log(m_on.detach() + eps) - torch.log(ref + eps)) ** 2)

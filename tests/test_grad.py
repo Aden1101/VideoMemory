@@ -38,7 +38,7 @@ def test_closed_form_gradient_matches_autograd():
     # closed-form raw gradient of dot = <fW(k), v>
     g0, g1, g2 = swiglu_fast_weight_gradient(k, v, w0, w1, w2, ones, ones, ones)
 
-    # autograd gradient of the SAME dot
+    # autograd gradient of the same dot
     w0a = w0.clone().requires_grad_(True)
     w1a = w1.clone().requires_grad_(True)
     w2a = w2.clone().requires_grad_(True)
@@ -79,7 +79,7 @@ def test_apply_first_inter_chunk_causality():
 
     o_ref = _run_chunks(q, k, v, state, chunks, clean)
 
-    # perturb ONLY the 3rd (future) chunk, tokens 6:9
+    # perturb only the 3rd (future) chunk, tokens 6:9
     qp, kp, vp = q.clone(), k.clone(), v.clone()
     p = torch.Generator().manual_seed(2)
     qp[:, 6:9] += torch.randn(B, 3, di, generator=p, dtype=torch.float64)

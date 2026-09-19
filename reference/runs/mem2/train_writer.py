@@ -1,83 +1,82 @@
 #!/usr/bin/env python
-# ============================================================================================
-# MEMORY 2.0 -- OFFLINE WRITER TRAINER by WRITE-REPLAY (J3 deliverable D).
-#
-# Premise (memory2_design.md 1.1, selftest_replay.py S1 green, selftest_s1b.py F5.2 green):
-# under MEM_ZERO_ALL=1 the eviction-feed hidden states h are DATA (independent of the writer
-# parameters), so the whole write chain can be re-run OFFLINE, differentiably, from collected
-# h sequences -- no video model in the loop. This trainer does exactly that:
-#
-#   state_0 = cell.init_state  ->  for i in writes:  state = write_theta(state, h_i)
-#   at sampled positions:      frame_hat = AnchorFrameDecoder(states, cond)
-#   loss = subject-weighted norm_mse(frame_hat, target)  +  lambda * InfoNCE(frame_hat, target)
-#
-# The DIE-ON patches of reference/memory2_redteam.md are implemented here, each tagged:
-#   F2.3  warm-start from l1@2000-EMA + assert writer/delta_l1 == 0 at step 0 (vs the ckpt).
-#   F3.3  AnchorFrameDecoder(detach_states=False) + assert qkv.weight.grad != 0 after step 1.
-#   F2.1  phase A unfreezes the decoder's ADDRESSING only (queries / pos_row / pos_col /
-#         q_norms); content (fuse/out_norm/head/read_norms) and the cond FiLM stay frozen, so
-#         a rotation of the key space cannot masquerade as "the state has nothing new".
-#   F1.6  targets are AGED: age sampled in {1,2,5,10,20} writes, metrics split by age AND by
-#         mode (single/switch/anchor); single videos are down-weighted (--single_w).
-#   F1.1  InfoNCE negatives = the whole split-side bank (which CONTAINS the same-prompt twin
-#         and the k=8 cond-nearest videos, both also logged separately) + cond-dropout 0.5;
-#         causal margin acc(true state) - acc(shuffled state) logged FROM STEP 0.
-#   F1.3  same-video negatives are masked ONLY within +-mask_chunks of the target (the other
-#         segment's frames stay in the softmax: the anti-contamination pressure).
-#   F3.2  mem/influence_decay@k (replay with h_{T-k} neutralized) + loss_by_age.
-#   F4.1  per-VIDEO split (>= 20 val videos, twins on their sibling's side) + proximal
-#         ||theta_w - theta_l1||^2 (--prox) + train/val gap logged.
-#   F5.4  peak VRAM of the FULL backward measured and logged before anything is scaled up
-#         (--vram_probe sweeps K / n_bptt and prints the table).
-#   F3.1  --toy = the redefined gate: >= 8 videos, targets >= 10 writes old, PASS only if the
-#         loss collapses AND n_bptt_writes=1 does clearly worse AND h-shuffle degrades.
-# NO VAE IN THE LOSS (J3 mandate): the phase-A instance term lives in latent crop60 space
-# (mem2_data.latent_embed); the VAE is only used for the viz grid, exactly like train_decoder.py.
-#
-# ---------------------------------- PHASE B (2026-07-28) -------------------------------------
-# J3 left two defects to convert (memory2_j3_report VERDICTS + Aden's eye):
-#   (a) RENDERING: the per-token decoder emits a low-pass frame with a visible 2x2 checkerboard
-#       -- nothing in v1 ever mixes neighbouring patches.  Fix = AnchorFrameDecoder(mixer=True)
-#       (2 residual depthwise-3x3 + pointwise blocks on the 30x52 grid, zero-init => identity at
-#       init => a v1.2/A2 checkpoint warm-starts bitwise, the ONLY missing keys are `mixer.*`).
-#   (b) INSTANCE: with no instance pressure the stored content is the right one ~1 time in 2.
-#       Fix = --lam_dino: differentiable VAE decode of ONE frame -> crop60 -> DINOv2 ViT-B/14
-#       (THE harness re-ID model, imported from run_reid_probe.get_dino) -> InfoNCE against the
-#       PRECOMPUTED bank of true-anchor DINO embeddings (build_bank_dino.py), same-prompt twin
-#       and cond-kNN forced in the softmax.  The J3 latent InfoNCE started 100% on the wrong
-#       side (pos_gap -0.11..-0.36); --dino_probe measures the SAME quantity in DINO space and
-#       is a hard GATE: no B2 run if pos_gap <= 0 at step 0.
-#   The phase-B writer is FROZEN at A2 (--writer_ckpt ... --freeze_writer): only the decoder
-#   moves, so `writer/delta_ref` must stay EXACTLY 0.0 from step 0 to the final checkpoint
-#   (asserted at every val and at the end of the run).
-#
-# ------------------------- PHASE T0 / MEMOIRE 2.1 (2026-08-04) --------------------------------
-# La nuit du 04/08 a ferme le CANAL (T0 : le splice est LU, exces apparie +0.83, x20 la
-# prediction), l'INSTANT (levier 4 : 0/2) et l'ADDITIF (levier 3 : 2/4). Ce qui reste debout est
-# l'ECRITURE : l'ancre decodee est une image de l'ambiance du rollout (vs A* +0.042, vs B +0.298,
-# vs X +0.344 ; B > A sur 21/24, p = 3e-4), pas du sujet -- parce que le DECODEUR a ete entraine
-# a reconstruire la frame EVINCEE, et qu'au retour ce qui vient d'etre evince est l'INTERLUDE.
-# 2.1 change l'OBJECTIF, pas le mecanisme : --lam_t0 ajoute un terme contrastif dans la SEULE
-# metrique du dossier qui (a) voit ce defaut et (b) tolere le flou du rendu (la reco reste, avec
-# --rec_w reduit, comme regulariseur) :
-#     ancre decodee a la position de RETOUR simulee (etat de FIN de sequence + positions
-#     post-switch echantillonnees)  --T0-->  HAUTE correlation bande-basse avec le segment A,
-#     BASSE avec l'interlude B, les autres videos et le JUMEAU (meme prompt, autre graine).
-# Metrique/perte : t0_metric.py (import unique, identique bitwise a prescreen_offensif.lowband).
-# References : build_bank_t0.py (pre-calculees hors ligne dans les deux espaces -- le cote
-# reference n'a jamais besoin de gradient, seule l'ancre paie un decode VAE si --t0_space pixel).
-# Gates scelles AVANT tout run dans memory2_probes_registry.md (sections D0 / G1 / G2a / G2b / G3).
-# `--lam_t0 0` est BYTE-SAFE : le terme n'est meme pas construit (selftest_t0 test 9).
-#
-# Usage (GPU pre-check in the SAME command, house rule):
-#   CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
-#   CUDA_VISIBLE_DEVICES=1 python reference/runs/mem2/train_writer.py --toy       # gate F3.1
-#   ... --smoke                       # 5 steps, batch 1: shapes/asserts/VRAM
-#   ... --vram_probe                  # F5.4 sweep, no training
-#   ... --phase A --steps 2500        # the real phase A
-#   ... --phase B --writer_ckpt A2 --freeze_writer --mixer --dino_probe   # phase-B gate
-# wandb is MANDATORY (house rule): never WANDB_MODE=disabled.
-# ============================================================================================
+"""Memory 2.0, OFFLINE WRITER trainer by WRITE-replay (J3 deliverable D).
+
+Premise (memory2_design.md 1.1, selftest_replay.py S1 green, selftest_s1b.py F5.2 green):
+under MEM_ZERO_ALL=1 the eviction-feed hidden states h are data (independent of the writer
+parameters), so the whole write chain can be re-run OFFLINE, differentiably, from collected
+h sequences, no video model in the loop. This trainer does exactly that:
+
+  state_0 = cell.init_state  ->  for i in writes:  state = write_theta(state, h_i)
+  at sampled positions:      frame_hat = AnchorFrameDecoder(states, cond)
+  loss = subject-weighted norm_mse(frame_hat, target)  +  lambda * InfoNCE(frame_hat, target)
+
+The die-ON patches of reference/memory2_redteam.md are implemented here, each tagged:
+  F2.3  warm-start from l1@2000-EMA + assert writer/delta_l1 == 0 at step 0 (vs the ckpt).
+  F3.3  AnchorFrameDecoder(detach_states=False) + assert qkv.weight.grad != 0 after step 1.
+  F2.1  phase A unfreezes the decoder's addressing only (queries / pos_row / pos_col /
+        q_norms); content (fuse/out_norm/head/read_norms) and the cond FiLM stay frozen, so
+        a rotation of the key space cannot masquerade as "the state has nothing new".
+  F1.6  targets are aged: age sampled in {1,2,5,10,20} writes, metrics split by age and by
+        mode (single/switch/anchor); single videos are down-weighted (--single_w).
+  F1.1  InfoNCE negatives = the whole split-side bank (which contains the same-prompt twin
+        and the k=8 cond-nearest videos, both also logged separately) + cond-dropout 0.5;
+        causal margin acc(true state) - acc(shuffled state) logged from step 0.
+  F1.3  same-video negatives are masked only within +-mask_chunks of the target (the other
+        segment's frames stay in the softmax: the anti-contamination pressure).
+  F3.2  mem/influence_decay@k (replay with h_{T-k} neutralized) + loss_by_age.
+  F4.1  per-video split (>= 20 val videos, twins on their sibling's side) + proximal
+        ||theta_w - theta_l1||^2 (--prox) + train/val gap logged.
+  F5.4  peak VRAM of the full backward measured and logged before anything is scaled up
+        (--vram_probe sweeps K / n_bptt and prints the table).
+  F3.1  --toy = the redefined gate: >= 8 videos, targets >= 10 writes old, pass only if the
+        loss collapses and n_bptt_writes=1 does clearly worse and h-shuffle degrades.
+no VAE in the loss (J3 mandate): the phase-A instance term lives in latent crop60 space
+(mem2_data.latent_embed); the VAE is only used for the viz grid, exactly like train_decoder.py.
+
+---------------------------------- phase B (2026-07-28) -------------------------------------
+J3 left two defects to convert (memory2_j3_report verdicts + Aden's eye):
+  (a) rendering: the per-token decoder emits a low-pass frame with a visible 2x2 checkerboard
+     , nothing in v1 ever mixes neighbouring patches.  Fix = AnchorFrameDecoder(mixer=True)
+      (2 residual depthwise-3x3 + pointwise blocks on the 30x52 grid, zero-init => identity at
+      init => a v1.2/A2 checkpoint warm-starts bitwise, the only missing keys are `mixer.*`).
+  (b) instance: with no instance pressure the stored content is the right one ~1 time in 2.
+      Fix = --lam_dino: differentiable VAE decode of one frame -> crop60 -> DINOv2 ViT-B/14
+      (the harness re-ID model, imported from run_reid_probe.get_dino) -> InfoNCE against the
+      PRECOMPUTED bank of true-anchor DINO embeddings (build_bank_dino.py), same-prompt twin
+      and cond-kNN forced in the softmax.  The J3 latent InfoNCE started 100% on the wrong
+      side (pos_gap -0.11..-0.36); --dino_probe measures the same quantity in DINO space and
+      is a hard gate: no B2 run if pos_gap <= 0 at step 0.
+  The phase-B writer is frozen at A2 (--writer_ckpt ... --freeze_writer): only the decoder
+  moves, so `writer/delta_ref` must stay exactly 0.0 from step 0 to the final checkpoint
+  (asserted at every val and at the end of the run).
+
+------------------------- phase T0 / MEMOIRE 2.1 (2026-08-04) --------------------------------
+La nuit du 04/08 a ferme le canal (T0 : le splice est lu, exces apparie +0.83, x20 la
+prediction), l'instant (levier 4 : 0/2) et l'ADDITIF (levier 3 : 2/4). Ce qui reste debout est
+l'ECRITURE : l'ancre decodee est une image de l'ambiance du rollout (vs A* +0.042, vs B +0.298,
+vs X +0.344 ; B > A sur 21/24, p = 3e-4), pas du sujet, parce que le DECODEUR a ete entraine
+a reconstruire la frame EVINCEE, et qu'au retour ce qui vient d'etre evince est l'interlude.
+2.1 change l'OBJECTIF, pas le mecanisme : --lam_t0 ajoute un terme contrastif dans la SEULE
+metrique du dossier qui (a) voit ce defaut et (b) tolere le flou du rendu (la reco reste, avec
+--rec_w reduit, comme regulariseur) :
+    ancre decodee a la position de retour simulee (etat de fin de sequence + positions
+    post-switch echantillonnees)  --T0-->  HAUTE correlation bande-basse avec le segment A,
+    BASSE avec l'interlude B, les autres videos et le JUMEAU (meme prompt, autre graine).
+Metrique/perte : t0_metric.py (import unique, identique bitwise a prescreen_offensif.lowband).
+References : build_bank_t0.py (pre-calculees hors ligne dans les deux espaces, le cote
+reference n'a jamais besoin de gradient, seule l'ancre paie un decode VAE si --t0_space pixel).
+Gates scelles AVANT tout run dans memory2_probes_registry.md (sections D0 / G1 / G2a / G2b / G3).
+`--lam_t0 0` est BYTE-safe : le terme n'est meme pas construit (selftest_t0 test 9).
+
+Usage (GPU pre-check in the same command, house rule):
+  CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
+  CUDA_VISIBLE_DEVICES=1 python reference/runs/mem2/train_writer.py --toy       # gate F3.1
+  ... --smoke                       # 5 steps, batch 1: shapes/asserts/VRAM
+  ... --vram_probe                  # F5.4 sweep, no training
+  ... --phase A --steps 2500        # the real phase A
+  ... --phase B --writer_ckpt A2 --freeze_writer --mixer --dino_probe   # phase-B gate
+wandb is mandatory (house rule): never WANDB_MODE=disabled.
+"""
 import argparse
 import copy
 import json
@@ -115,11 +114,11 @@ DEC_V12 = os.path.join(FRAME_DEC, "frame_dec_v12/ckpt/dec_step4000.pt")
 OUT_ROOT = os.path.join(D.RUNS_DIR, "writer")
 WRITER_A2 = os.path.join(OUT_ROOT, "mem2_writer_A2_final.pt")
 
-# theta_w (design 3.2): every parameter the WRITE path consumes. w0/w1/w2 (the state prior)
+# theta_w (design 3.2): every parameter the WRITE path consumes. W0/w1/w2 (the state prior)
 # stay frozen in phase A/B; the read path (q_norm/proj/o_norm) is out of scope (injection dead).
 WRITE_PARAMS = ("qkv.weight", "qkv.bias", "lrs.weight", "lrs.bias",
                 "k_norm.weight", "decay_logit")
-# F2.1: the decoder's ADDRESSING (what it asks the state), never its CONTENT or its FiLM.
+# F2.1: the decoder's addressing (what it asks the state), never its content or its FiLM.
 ADDRESS_PREFIXES = ("queries", "pos_row", "pos_col", "q_norms.")
 
 
@@ -131,9 +130,9 @@ def _clean_ema_key(name):
 
 
 def ref_theta_l1(config, blocks, device, dtype=torch.bfloat16):
-    """theta_l1 read STRAIGHT FROM THE CHECKPOINT (F2.3): the EMA shadow when use_ema is on
+    """theta_l1 read straight from the CHECKPOINT (F2.3): the EMA shadow when use_ema is on
     (that is what the harness deploys and what the v3 collection ran), else generator_memory.
-    Returned in the deployment dtype -- the exact bytes the cells must hold at step 0."""
+    Returned in the deployment dtype, the exact bytes the cells must hold at step 0."""
     ck = torch.load(config.lora_ckpt, map_location="cpu", weights_only=False, mmap=True)
     use_ema = bool(getattr(config, "use_ema", False))
     src = "generator_ema" if use_ema else "generator_memory"
@@ -145,7 +144,7 @@ def ref_theta_l1(config, blocks, device, dtype=torch.bfloat16):
         got = {}
         for name in WRITE_PARAMS:
             k = pfx + name
-            assert k in sd, f"{src} has no {k} -- wrong ckpt layout?"
+            assert k in sd, f"{src} has no {k}, wrong ckpt layout?"
             got[name] = sd[k].detach().to(device=device, dtype=dtype).clone()
         ref[bi] = got
     del ck, sd
@@ -156,7 +155,7 @@ def build_cells(config, device, mode="pipeline"):
     """The l1@2000-EMA memory cells, in the deployment dtype (bf16) on `device`.
     mode='pipeline' = the canonical harness path (run_reid_probe.build_pipeline: base -> LoRA ->
     generator_memory -> EMA overlay -> .to(bf16)), then the cells are deep-copied out and the
-    1.3B generator + T5 are released. mode='direct' rebuilds the cell from the config kwargs and
+    1.3B generator + T5 are released. Mode='direct' rebuilds the cell from the config kwargs and
     loads the same EMA tensors (cheap, used by the CPU selftests); both are asserted identical
     to theta_l1 at step 0, so 'direct' can never silently diverge."""
     blocks = sorted(int(x) for x in config.model_kwargs.memory_layers)
@@ -216,7 +215,7 @@ def get_write_params(cell):
 
 # ----------------------------- losses -----------------------------------------------------------
 def norm_mse_per(pred, target, subject_weight=1.0, eps=1e-8):
-    """Per-SAMPLE norm_mse (train_decoder.norm_mse without the final .mean()), so the loss can be
+    """Per-sample norm_mse (train_decoder.norm_mse without the final .mean()), so the loss can be
     split by age / mode. Asserted equal to norm_mse(...).mean() by selftest_trainer S-E1."""
     pf, tf = pred.float(), target.float()
     if subject_weight != 1.0:
@@ -236,7 +235,7 @@ def norm_mse_per(pred, target, subject_weight=1.0, eps=1e-8):
 
 def infonce(z, pos, neg, tau, neg_mask=None):
     """z (K,D) anchors (decoded frames), pos (K,D) their true targets, neg (M,D) the bank.
-    neg_mask (K,M) True = MASKED OUT (same video, within +-mask_chunks of the target: F1.3).
+    neg_mask (K,M) True = masked OUT (same video, within +-mask_chunks of the target: F1.3).
     Returns (loss, top1 accuracy)."""
     l_pos = (z * pos).sum(-1, keepdim=True) / tau                  # (K,1)
     l_neg = (z @ neg.t()) / tau                                    # (K,M)
@@ -278,9 +277,9 @@ class Bank:
               f"dim {self.dim}, {self.emb_all.numel() * 4 / 1e6:.0f} MB on {device}", flush=True)
 
     def negatives(self, side, meta, target_chunks, n_neg=0, mask_chunks=2, rng=None):
-        """(neg_emb (M,D), mask (K,M), diag index sets). Full split-side bank by default -- it
-        CONTAINS the same-prompt twin and the cond-kNN videos (both reported separately). With
-        n_neg > 0 a random subset is drawn and twin + kNN entries are FORCE-added (mandate)."""
+        """(neg_emb (M,D), mask (K,M), diag index sets). Full split-side bank by default, it
+        contains the same-prompt twin and the cond-kNN videos (both reported separately). With
+        n_neg > 0 a random subset is drawn and twin + kNN entries are force-added (mandate)."""
         pool = self.sides[side]
         if n_neg and n_neg < pool.numel():
             sel = pool[torch.randperm(pool.numel(), device=pool.device)[:n_neg]]
@@ -298,7 +297,7 @@ class Bank:
         same = (self.e_video[pool] == vid_i)
         tc = torch.tensor(target_chunks, device=self.device).view(-1, 1)
         near = (self.e_chunk[pool].view(1, -1) - tc).abs() <= mask_chunks
-        mask = same.view(1, -1) & near                      # F1.3: same video AND near = masked
+        mask = same.view(1, -1) & near                      # F1.3: same video and near = masked
         return neg, mask, pool
 
     def entries_of_video(self, video_i):
@@ -335,7 +334,7 @@ class WriterTrainer:
         self.cells, self.blocks, self.vae = build_cells(self.config, self.device, args.load)
         self.ref, ref_src = ref_theta_l1(self.config, self.blocks, self.device)
 
-        # ---- F2.3: warm start IS l1@2000-EMA, bit for bit -----------------------------------
+        # ---- F2.3: warm start is l1@2000-EMA, bit for bit -----------------------------------
         d0 = delta_l1(self.cells, self.ref)
         print(f"[writer] warm start from {ref_src} of {self.config.lora_ckpt}: "
               f"writer/delta_l1 = {d0:.3e}", flush=True)
@@ -343,7 +342,7 @@ class WriterTrainer:
                            f"The step-0 baseline would not be the v1.2 regime.")
 
         # trainable write params (bf16 leaves) + fp32 masters (design 3.5: master fp32, forward
-        # in the deployment dtype -> the trained function IS the deployed function)
+        # in the deployment dtype -> the trained function is the deployed function)
         self.wparams, self.masters = {}, {}
         for bi, cell in self.cells.items():
             for p in cell.parameters():
@@ -357,9 +356,9 @@ class WriterTrainer:
         print(f"[writer] theta_w: {len(self.wparams)} tensors, {n_w / 1e6:.2f}M params "
               f"over blocks {self.blocks}", flush=True)
 
-        # ---- PHASE B: load a TRAINED writer (A2) and freeze it -------------------------------
+        # ---- phase B: load a trained writer (A2) and freeze it -------------------------------
         # theta_ref (the tripwire reference) becomes whatever the run starts from: l1 in phase A,
-        # A2 in phase B. `writer/delta_ref` must stay EXACTLY 0.0 for the whole frozen run.
+        # A2 in phase B. `writer/delta_ref` must stay exactly 0.0 for the whole frozen run.
         self.ref_start = {bi: {k: v.clone() for k, v in g.items()} for bi, g in self.ref.items()}
         self.writer_src = f"{ref_src}@{os.path.basename(str(self.config.lora_ckpt))}"
         if args.writer_ckpt:
@@ -393,7 +392,7 @@ class WriterTrainer:
             print(f"[writer] theta_w FROZEN (phase-B contract): delta_ref = {d_ref:.3e}, "
                   f"prox disabled, n_bptt -> 0 (the FULL chain is still replayed, only the "
                   f"graph is cut: replay_writes' forward is unchanged, so the states are "
-                  f"bitwise those of a full-BPTT replay -- selftest_phaseB test 5)", flush=True)
+                  f"bitwise those of a full-BPTT replay, selftest_phaseB test 5)", flush=True)
             args.prox = 0.0
             args.n_bptt = 0
 
@@ -409,7 +408,7 @@ class WriterTrainer:
             sd = ck["decoder"] if isinstance(ck, dict) and "decoder" in ck else ck
             missing, unexpected = self.decoder.load_state_dict(sd, strict=False)
             assert not unexpected, f"decoder warm-start unexpected keys: {list(unexpected)[:4]}"
-            # strict=False is tolerated for the v2 MIXER KEYS ONLY (they init to the identity):
+            # strict=False is tolerated for the v2 mixer keys only (they init to the identity):
             # any other missing key would mean a silently re-initialized decoder.
             bad = [k for k in missing if not k.startswith("mixer.")]
             assert not bad, f"decoder warm-start missing NON-mixer keys: {bad[:4]}"
@@ -431,7 +430,7 @@ class WriterTrainer:
               f"{' + MIXER' if args.mixer else ''})", flush=True)
 
         groups = [{"params": dec_train, "lr": args.lr_d, "weight_decay": args.wd_d}]
-        if not self.freeze_writer:      # a frozen writer is not even IN the optimizer state
+        if not self.freeze_writer:      # a frozen writer is not even in the optimizer state
             groups.insert(0, {"params": list(self.masters.values()), "lr": args.lr_w,
                               "weight_decay": 0.0})
         self.opt = torch.optim.AdamW(groups, betas=(0.9, 0.95))
@@ -449,14 +448,14 @@ class WriterTrainer:
         self.hcache = {}                     # video_id -> {block: [cpu fp16 h]} (toy/smoke)
         self.bank = Bank(args.bank, self.device)
 
-        # ---- PHASE B: the DINO instance space (bank precomputed by build_bank_dino.py) ------
+        # ---- phase B: the DINO instance space (bank precomputed by build_bank_dino.py) ------
         self.dino_emb, self.dino_key2row, self.dino = None, {}, None
         self.last_dino_gap = None            # gate: lambda_dino is 0 while pos_gap <= 0
         if args.lam_dino > 0 or args.dino_probe or args.dino_log:
             db = torch.load(args.dino_bank, map_location="cpu", weights_only=False)
             assert db["emb"].shape[0] == len(self.bank.entries), \
                 (f"{args.dino_bank}: {db['emb'].shape[0]} rows vs {len(self.bank.entries)} bank "
-                 f"entries -- rebuild build_bank_dino.py against THIS bank")
+                 f"entries, rebuild build_bank_dino.py against THIS bank")
             self.dino_emb = db["emb"].to(device=self.device, dtype=torch.float32)
             for r, e in enumerate(self.bank.entries):
                 self.dino_key2row[(e["video_id"], int(e["frame"]))] = r
@@ -464,14 +463,14 @@ class WriterTrainer:
                 from train_decoder import build_vae
                 self.vae = build_vae(self.device)
             from run_reid_probe import get_dino
-            self.dino = get_dino(self.device)          # THE harness model, frozen, fp32
+            self.dino = get_dino(self.device)          # the harness model, frozen, fp32
             print(f"[writer] DINO bank: {tuple(self.dino_emb.shape)} "
                   f"({db['meta']['model']}, crop {db['meta']['crop_frac']}), "
                   f"{len(self.dino_key2row)} (video, frame) keys", flush=True)
 
         # ---- MEMOIRE 2.1: the T0 low-band contrastive term ---------------------------------
         # `--lam_t0 0` and no `--t0_log` => the bank is not even loaded and the term is never
-        # built: the run is BYTE-IDENTICAL to the phase-A/A2 recipe (selftest_t0 test 9).
+        # built: the run is BYTE-identical to the phase-A/A2 recipe (selftest_t0 test 9).
         self.t0bank = None
         if args.lam_t0 > 0 or args.t0_log or args.t0_probe:
             self.t0bank = T0Bank(args.t0_bank, self.device, space=args.t0_space,
@@ -491,7 +490,7 @@ class WriterTrainer:
 
     # ---------- h loading -------------------------------------------------------------------
     def get_h(self, meta, upto):
-        """h_seq[block][0..upto] on the GPU in the DEPLOYMENT dtype (bf16). --cache_videos N
+        """h_seq[block][0..upto] on the GPU in the deployment dtype (bf16). --cache_videos N
         keeps the first N videos' full fp16 h in CPU RAM (1.5 GB/video): the toy/smoke runs
         then never touch the shards again."""
         vid = meta["video_id"]
@@ -537,9 +536,9 @@ class WriterTrainer:
     # ---------- DINO instance space (phase B) ---------------------------------------------------
     def dino_z(self, lat):
         """Decoded latent frames (n, 1, 16, 60, 104) -> L2-normalized DINOv2 ViT-B/14 CLS
-        (n, 768), DIFFERENTIABLE end to end: frozen VAE (bf16) -> [0,1] -> centre crop60 ->
+        (n, 768), differentiable end to end: frozen VAE (bf16) -> [0,1] -> centre crop60 ->
         bilinear 224 -> ImageNet norm -> frozen DINO. Exactly build_bank_dino's pipeline (same
-        two functions), so the anchor and the precomputed bank live in the SAME space."""
+        two functions), so the anchor and the precomputed bank live in the same space."""
         assert self.dino is not None, "dino_z called without a DINO bank (--lam_dino/--dino_log)"
         px = latent_to_pixels(self.vae, lat.to(torch.bfloat16),
                               use_checkpoint=bool(self.args.dino_vae_ckpt))
@@ -547,9 +546,9 @@ class WriterTrainer:
         return Fn.normalize(self.dino(x), dim=-1)
 
     def dino_positions(self, meta, positions, k=None):
-        """The (index-in-positions) subset the DINO term supervises: positions whose TARGET is a
-        bank entry (so its DINO embedding is precomputed), ANCHORS FIRST (the revisit task), at
-        most k of them -- one VAE backward per position is the expensive part of a phase-B step."""
+        """The (index-in-positions) subset the DINO term supervises: positions whose target is a
+        bank entry (so its DINO embedding is precomputed), anchors first (the revisit task), at
+        most k of them, one VAE backward per position is the expensive part of a phase-B step."""
         vid = meta["video_id"]
         cand = [t for t, p in enumerate(positions)
                 if (vid, int(p["frame"])) in self.dino_key2row]
@@ -557,7 +556,7 @@ class WriterTrainer:
         return cand[:(self.args.dino_k if k is None else k)]
 
     def dino_term(self, meta, positions, pred, side, pool=None, mask=None, k=None):
-        """InfoNCE in DINO space: anchor = the DECODED frame, positive = the precomputed
+        """InfoNCE in DINO space: anchor = the decoded frame, positive = the precomputed
         embedding of its true target, negatives = the same split-side bank rows the latent term
         uses (twin + cond-kNN included / forced, F1.3 mask applied). Returns (loss, logs)."""
         if self.dino_emb is None:
@@ -590,11 +589,11 @@ class WriterTrainer:
 
     # ---------- T0 term (memoire 2.1) -----------------------------------------------------------
     def t0_term(self, meta, positions, pred, side, grad=True):
-        """Terme contrastif T0 sur l'ancre decodee a la position de RETOUR simulee.
+        """Terme contrastif T0 sur l'ancre decodee a la position de retour simulee.
 
-        SUPPORT : les positions de kind 'anchor' -- et elles seules. Ce sont, par construction de
-        `mem2_data.sample_positions`, exactement les etats POST-SWITCH avec cond = A : la
-        situation du revisit. `--t0_end_pos` force la premiere d'entre elles a l'etat de FIN de
+        Support : les positions de kind 'anchor', et elles seules. Ce sont, par construction de
+        `mem2_data.sample_positions`, exactement les etats post-switch avec cond = A : la
+        situation du revisit. `--t0_end_pos` force la premiere d'entre elles a l'etat de fin de
         sequence (la position de retour la plus profonde disponible dans le corpus).
         POSITIFS = segment A de CETTE video ; NEGATIFS = son interlude B + toutes les autres
         videos du bon cote du split (jumeau inclus, loggue a part).
@@ -620,8 +619,8 @@ class WriterTrainer:
                 logs["t0_corr_twin"] = float(T0M.corr_set(z.detach(), E_tw).mean())
             # tripwire anti-Goodhart (G1) : une ancre qui s'aplatit a une correlation mal
             # definie et peut faire monter la marge sans rien apprendre.
-            # AUDIT 2026-08-04 : mesure dans l'ESPACE DE LA METRIQUE (contraste de la bande
-            # basse decodee), pas sur le latent -- un latent bruite decode parfois plat.
+            # audit 2026-08-04 : mesure dans l'ESPACE de la METRIQUE (contraste de la bande
+            # basse decodee), pas sur le latent, un latent bruite decode parfois plat.
             logs["t0_anchor_std"] = float(band.detach().mean())
             logs["t0_anchor_std_lat"] = T0M.anchor_spatial_std(x.detach())
             logs["t0_k"] = float(len(sel))
@@ -643,19 +642,19 @@ class WriterTrainer:
         if lam > 0:
             loss = loss + lam * li * w
         logs.update({"inst": float(li), "acc": float(acc), "n_neg": int(neg.shape[0])})
-        # phase-B instance term (DINO). lam_d == 0 with --dino_log still MEASURES it (that is
+        # phase-B instance term (DINO). lam_d == 0 with --dino_log still measures it (that is
         # the gate quantity) without ever letting it move a weight.
         if self.dino_emb is not None and (lam_d > 0 or a.dino_log):
             if lam_d > 0:
                 dl, dlogs = self.dino_term(meta, positions, pred, side, pool=pool, mask=mask)
                 if dl is not None:
                     loss = loss + lam_d * dl * w
-            else:                      # pure MEASUREMENT (--dino_log): never build a VAE graph
+            else:                      # pure measurement (--dino_log): never build a VAE graph
                 with torch.no_grad():
                     _, dlogs = self.dino_term(meta, positions, pred.detach(), side,
                                               pool=pool, mask=mask)
             logs.update(dlogs)
-        # memoire 2.1: the T0 low-band term. lam_t0 == 0 with --t0_log still MEASURES the gate
+        # memoire 2.1: the T0 low-band term. Lam_t0 == 0 with --t0_log still measures the gate
         # quantity (the sealed margin) without ever letting it move a weight.
         if self.t0bank is not None and (lam_t0 > 0 or a.t0_log):
             if lam_t0 > 0:
@@ -679,8 +678,8 @@ class WriterTrainer:
     # ---------- T0 per-video evaluation (the sealed gate quantity: G1 / G2a) --------------------
     @torch.no_grad()
     def t0_eval(self, videos, side, k=None, tag=""):
-        """Marge T0 VIDEO PAR VIDEO (les gates comptent des videos, pas seulement une moyenne).
-        Renvoie (resume, lignes). Etats rejoues (n_bptt=0, bitwise le replay complet -- selftest
+        """Marge T0 video par video (les gates comptent des videos, pas seulement une moyenne).
+        Renvoie (resume, lignes). Etats rejoues (n_bptt=0, bitwise le replay complet, selftest
         phase B test 5), cond FORCEE (comme au deploiement : au revisit le prompt A est donne)."""
         assert self.t0bank is not None, "t0_eval sans banque T0 (--t0_bank/--lam_t0/--t0_log)"
         self.sync_masters_to_cells()
@@ -718,7 +717,7 @@ class WriterTrainer:
     # ---------- causal margin (F1.1.4) ---------------------------------------------------------
     @torch.no_grad()
     def causal_margin(self, meta, positions, target, acc_true, side):
-        """acc(true state) - acc(state of ANOTHER video, same cond): if ~0 the phase is inert
+        """acc(true state) - acc(state of another video, same cond): if ~0 the phase is inert
         whatever the absolute accuracy. Uses the previous step's states (always available,
         works at batch size 1)."""
         if self.prev_states is None:
@@ -743,7 +742,7 @@ class WriterTrainer:
     @torch.no_grad()
     def influence_probe(self, meta, ks=(1, 2, 5, 10, 20)):
         """Replay the chain, then replay it again with h_{T-k} replaced by its per-token mean
-        (an 'uninformative write' of the same magnitude) and report how much the FINAL state and
+        (an 'uninformative write' of the same magnitude) and report how much the final state and
         the decoded loss move. A 'cheat-short' writer (F3.2) collapses to ~0 past k=2."""
         positions = D.sample_positions(meta, random.Random(0), k=1, anchor_frac=1.0,
                                        min_age_writes=1)
@@ -816,7 +815,7 @@ class WriterTrainer:
         return gn ** 0.5
 
     def prox_loss(self):
-        """||theta_w - theta_l1||^2 on the fp32 masters -- F4.1(ii) makes it obligatory in
+        """||theta_w - theta_l1||^2 on the fp32 masters, F4.1(ii) makes it obligatory in
         phase A (n_eff ~ 135 videos vs 21M writer params)."""
         if self.args.prox <= 0:
             return None
@@ -828,8 +827,8 @@ class WriterTrainer:
     # ---------- the loop -----------------------------------------------------------------------
     def positions_for(self, meta, k=None, min_age=None, anchor_frac=None, rng=None):
         if self.args.fixed_positions and k is None and anchor_frac is None:
-            # toy/overfit mode: ONE fixed (state, target) set per video (drawn once, seeded),
-            # instead of a fresh draw every step -- an overfit gate must see the same points.
+            # toy/overfit mode: one fixed (state, target) set per video (drawn once, seeded),
+            # instead of a fresh draw every step, an overfit gate must see the same points.
             key = meta["video_id"]
             if key not in self._fixed_pos:
                 self._fixed_pos[key] = self.positions_for(
@@ -846,9 +845,9 @@ class WriterTrainer:
         return self._force_end_pos(meta, pos)
 
     def _force_end_pos(self, meta, pos):
-        """Delegue a t0_bank.force_end_pos (module SANS CUDA, donc selftestable sur
+        """Delegue a t0_bank.force_end_pos (module sans CUDA, donc selftestable sur
         CPU : `import wan` initialise un contexte CUDA des l'import).
-        AUDIT 2026-08-04 : conditionne AUSSI a la presence du terme T0. Sans cela le defaut
+        audit 2026-08-04 : conditionne AUSSI a la presence du terme T0. Sans cela le defaut
         `--t0_end_pos 1` modifiait le tirage de positions meme a `--lam_t0 0`, ce qui CASSAIT
         la byte-safety promise (le run n'etait plus la recette A2)."""
         enabled = bool(self.args.t0_end_pos) and self.t0bank is not None
@@ -866,11 +865,11 @@ class WriterTrainer:
             positions = self.positions_for(meta)
             h_over = None
             if a.h_shuffle:
-                # toy control (c): the h SEQUENCE comes from ANOTHER video, re-drawn at EVERY
+                # toy control (c): the h sequence comes from another video, re-drawn at every
                 # step (a fixed pairing would just be memorized by the decoder). The state can
                 # then carry nothing about the target -> the loss must stall.
                 i_max = max(p["i"] for p in positions)
-                # the pool is the RUN's video pool (self.shuffle_pool), NOT the current batch:
+                # the pool is the run's video pool (self.shuffle_pool), not the current batch:
                 # at bs=1 a batch has no other video and the control would silently no-op
                 # (caught at J3: the hshuffle curve came out bit-identical to main).
                 pool = self.shuffle_pool or videos
@@ -905,8 +904,8 @@ class WriterTrainer:
             last_states = ([tuple(t.detach() for t in b) for b in dec_states], len(positions))
             del pred, target, dec_states, loss
         self.prev_states = last_states
-        # ORDER MATTERS: the replay grads live on the bf16 cell params -> copy them onto the
-        # fp32 masters FIRST, then let the proximal term ACCUMULATE on top (backward() adds).
+        # ORDER matters: the replay grads live on the bf16 cell params -> copy them onto the
+        # fp32 masters first, then let the proximal term accumulate on top (backward() adds).
         wgn = 0.0
         if not self.freeze_writer:
             wgn = self.gather_grads()
@@ -954,7 +953,7 @@ class WriterTrainer:
             positions = self.positions_for(meta)
             pred, target, dec_states, _ = self.forward_video(meta, positions, n_bptt=0,
                                                              force_cond=True)
-            per = norm_mse_per(pred, target)     # val loss UNWEIGHTED + cond ALWAYS on, so it
+            per = norm_mse_per(pred, target)     # val loss unweighted + cond always on, so it
             # is comparable with the v1.x decoder vals (0.867 v1.1 / 0.812 v1.2)
             tot += per.tolist()
             for p, v in zip(positions, per.tolist()):
@@ -966,18 +965,18 @@ class WriterTrainer:
                                                n_neg=a.n_neg, mask_chunks=a.mask_chunks)
             _, acc = infonce(z, pe, neg, a.tau, mask)
             accs.append(float(acc))
-            # HEALTH of the instance term (measured at J3: it starts NEGATIVE -- a decoded
+            # health of the instance term (measured at J3: it starts negative, a decoded
             # anchor is closer to some other video's frame than to its own target, at every
             # pooling factor, centered or not). Ramp lambda_inst only once this turns positive.
             gaps.append(float(((z * pe).sum(-1)
                                - (z @ neg.t()).masked_fill(mask, -2.0).max(dim=1).values).mean()))
-            # phase B: the SAME quantities in DINO space (the gate + the reported val sim)
+            # phase B: the same quantities in DINO space (the gate + the reported val sim)
             if self.dino_emb is not None:
                 _, dl = self.dino_term(meta, positions, pred, "val", pool=None, mask=None,
                                        k=self.args.dino_k_val)
                 for k, v in dl.items():
                     dino_agg.setdefault(k, []).append(v)
-            # MEMOIRE 2.1 : LA quantite des gates, mesuree sur des videos HELD-OUT (G2a), video
+            # MEMOIRE 2.1 : la quantite des gates, mesuree sur des videos HELD-OUT (G2a), video
             # par video (le gate est un compte de videos, pas seulement une moyenne).
             if self.t0bank is not None and self.t0bank.has(meta):
                 _, tl = self.t0_term(meta, positions, pred, "val", grad=False)
@@ -1001,7 +1000,7 @@ class WriterTrainer:
             out["val/t0_n_videos"] = float(len(t0_pos))
         if "val/dino_gap" in out:
             self.last_dino_gap = out["val/dino_gap"]     # drives the lambda_dino gate
-        if self.freeze_writer:                            # phase-B contract, checked at EVERY val
+        if self.freeze_writer:                            # phase-B contract, checked at every val
             d = delta_l1(self.cells, self.ref_start)
             out["writer/delta_ref"] = d
             assert d == 0.0, f"PHASE-B VIOLATION: the frozen writer moved (delta_ref={d:.3e})"
@@ -1035,10 +1034,10 @@ class WriterTrainer:
 # ----------------------------- retrieval-space probe ----------------------------------------------
 @torch.no_grad()
 def acc_probe(tr, n_videos=10, pools=(2, 4, 8, 16)):
-    """How retrievable is a v1.2-decoded anchor in LATENT crop space, per pooling factor?
+    """How retrievable is a v1.2-decoded anchor in latent crop space, per pooling factor?
     The smoke showed inst/acc = 0 against the full 3.4k bank at pool=2: a decoded frame is
     low-pass by nature, so a fine-grained latent cosine can be dominated by the sharpness gap
-    rather than by identity. This measures the effect BEFORE the long run picks a default
+    rather than by identity. This measures the effect before the long run picks a default
     (and reports cos(pred, its own target) vs the best competing bank entry)."""
     print("\n[writer][acc_probe] retrieval of the DECODED anchor in latent crop space", flush=True)
     from build_bank import BANK_LAT
@@ -1055,7 +1054,7 @@ def acc_probe(tr, n_videos=10, pools=(2, 4, 8, 16)):
         tgts.append(target.float())
     for pool in pools:
         for center in (False, True):
-            # centering = subtract the bank MEAN embedding before the cosine. A decoded frame
+            # centering = subtract the bank mean embedding before the cosine. A decoded frame
             # is low-pass by construction, so the raw latent cosine is dominated by the common
             # "smooth frame" direction shared by every entry; removing it is the standard fix
             # (and it is free: the bank never moves).
@@ -1082,17 +1081,17 @@ def acc_probe(tr, n_videos=10, pools=(2, 4, 8, 16)):
     return out
 
 
-# ----------------------------- DINO retrieval probe (PHASE-B GATE) --------------------------------
+# ----------------------------- DINO retrieval probe (phase-B gate) --------------------------------
 @torch.no_grad()
 def dino_probe(tr, n_videos=10, k=2):
-    """THE phase-B gate. Same question as J3's --acc_probe, but in the space the verdict is
-    measured in: decode val ANCHORS from replayed states with the current writer+decoder,
+    """The phase-B gate. Same question as J3's --acc_probe, but in the space the verdict is
+    measured in: decode val anchors from replayed states with the current writer+decoder,
     embed with the harness DINOv2 ViT-B/14 through the VAE, and retrieve against the val side
     of the precomputed DINO bank.
 
-    In LATENT space J3 measured top-1 = 0.000 and pos_gap = -0.11..-0.36 at every pooling: the
+    In latent space J3 measured top-1 = 0.000 and pos_gap = -0.11..-0.36 at every pooling: the
     instance term would have pushed on the low-pass artefact, not on identity. If pos_gap is
-    NEGATIVE here too, --lam_dino must NOT be ramped (B2 would train on a wrong-signed signal)."""
+    negative here too, --lam_dino must not be ramped (B2 would train on a wrong-signed signal)."""
     print("\n[writer][dino_probe] retrieval of the DECODED anchor in DINO ViT-B/14 space",
           flush=True)
     assert tr.dino_emb is not None, "dino_probe needs --dino_bank (build_bank_dino.py)"
@@ -1112,7 +1111,7 @@ def dino_probe(tr, n_videos=10, k=2):
         per_video.append((meta["video_id"], meta["mode"], dl["dino_gap"], dl["dino_cos_pos"],
                           dl["dino_cos_best_neg"], dl["dino_acc"]))
         del pred
-    assert accs, "dino_probe: no val position had a bank entry -- bank/split mismatch"
+    assert accs, "dino_probe: no val position had a bank entry, bank/split mismatch"
     out = {"dino_probe/top1": sum(accs) / len(accs),
            "dino_probe/pos_gap": sum(gaps) / len(gaps),
            "dino_probe/cos_pos": sum(cps) / len(cps),
@@ -1127,18 +1126,18 @@ def dino_probe(tr, n_videos=10, k=2):
           f"{out['dino_probe/cos_best_neg']:.3f} | POS_GAP "
           f"{out['dino_probe/pos_gap']:+.4f}", flush=True)
     print(f"[writer][dino_probe] GATE: pos_gap > 0 ? "
-          f"{'PASS -- lambda_dino may be ramped' if out['dino_probe/pos_gap'] > 0 else 'FAIL -- do NOT ramp lambda_dino'}",
+          f"{'PASS, lambda_dino may be ramped' if out['dino_probe/pos_gap'] > 0 else 'FAIL, do NOT ramp lambda_dino'}",
           flush=True)
     return out
 
 
-# ----------------------------- T0 probe (MEMOIRE 2.1 -- gate G2a) ----------------------------------
+# ----------------------------- T0 probe (MEMOIRE 2.1, gate G2a) ----------------------------------
 @torch.no_grad()
 def t0_probe(tr, n_videos=26, k=2):
-    """GATE G2a (registre) : la marge T0 de l'ancre decodee, sur les videos VAL held-out.
-    RULE SCELLEE : marge moyenne >= +0.05 ET >= 60 % des videos val a marge > 0.
+    """Gate G2a (registre) : la marge T0 de l'ancre decodee, sur les videos val held-out.
+    rule SCELLEE : marge moyenne >= +0.05 ET >= 60 % des videos val a marge > 0.
     Reference publiee de depart (24 cellules S2, 16.1 quater) : corr vs A* +0.042, vs B +0.298,
-    soit une marge de -0.256 -- c'est ce chiffre que 2.1 doit retourner."""
+    soit une marge de -0.256, c'est ce chiffre que 2.1 doit retourner."""
     print("\n[writer][t0_probe] marge bande-basse de l'ancre decodee, videos VAL held-out",
           flush=True)
     summ, rows = tr.t0_eval(tr.val_vids[:n_videos], "val", k=k)
@@ -1157,7 +1156,7 @@ def t0_probe(tr, n_videos=26, k=2):
             f"({100 * summ['frac_pos']:.0f} %)", flush=True)
     print(f"[writer][t0_probe] GATE G2a (marge >= {tr.args.t0_gate_margin:+.2f} ET "
           f">= {100 * tr.args.t0_gate_frac:.0f} % de videos positives) : "
-          f"{'PASS' if ok else 'FAIL -- STOP avant tout rollout'}", flush=True)
+          f"{'PASS' if ok else 'FAIL, STOP avant tout rollout'}", flush=True)
     out = {f"t0_probe/{k_}": v for k_, v in summ.items()}
     out["t0_probe/gate"] = float(ok)
     return out, rows, ok
@@ -1201,7 +1200,7 @@ def vram_probe(tr, lam_d=0.0):
 # ----------------------------- toy gate (F3.1) -----------------------------------------------------
 def load_toy_results(name="toy_result.json"):
     """Previous variants' summaries (so one variant can be re-run without redoing the others).
-    MEMOIRE 2.1 : les toys T0 ecrivent dans `toy_t0_result.json` -- une reprise partielle doit
+    MEMOIRE 2.1 : les toys T0 ecrivent dans `toy_t0_result.json`, une reprise partielle doit
     relire LE MEME fichier, sinon le controle h-shuffle de G1 serait declare manquant."""
     p = os.path.join(OUT_ROOT, name)
     if not os.path.exists(p):
@@ -1212,8 +1211,8 @@ def load_toy_results(name="toy_result.json"):
 
 
 def run_toy(args, wandb):
-    """The REDEFINED toy gate: >= 8 videos, targets >= 10 writes old.
-    PASS iff (a) the loss collapses, (b) n_bptt_writes=1 does clearly worse, (c) h-shuffle
+    """The redefined toy gate: >= 8 videos, targets >= 10 writes old.
+    pass iff (a) the loss collapses, (b) n_bptt_writes=1 does clearly worse, (c) h-shuffle
     degrades. Anything else = the gradient does not carry long-range write information."""
     results = {}
     want = [v.strip() for v in args.toy_variants.split(",") if v.strip()]
@@ -1230,7 +1229,7 @@ def run_toy(args, wandb):
         sw = [v for v in tr.train_vids if v["mode"] == "switch"][:a.toy_videos]
         assert len(sw) >= 8, f"toy needs >= 8 switch videos, got {len(sw)}"
         tr.shuffle_pool = sw                       # the h-shuffle control draws from the toy pool
-        # MEMOIRE 2.1 / GATE G1 : la marge T0 AVANT tout pas (le point de depart publie est
+        # MEMOIRE 2.1 / gate G1 : la marge T0 AVANT tout pas (le point de depart publie est
         # -0.256 sur les 24 cellules S2 ; on le re-mesure ici, sur le corpus, avant de bouger).
         t0_before = None
         if tr.t0bank is not None:
@@ -1275,13 +1274,13 @@ def run_toy(args, wandb):
                   f"du depart)", flush=True)
         tr.step = a.toy_steps
         tr.save(os.path.join(OUT_ROOT, f"toy_{variant}.pt"))   # kept: the eye-check needs the
-        # post-toy writer + decoder to decode an anchor from a TRAINED state
+        # post-toy writer + decoder to decode an anchor from a trained state
         print(f"[toy:{variant}] first {results[variant]['first']:.4f} -> "
               f"last {results[variant]['last']:.4f}", flush=True)
         del tr
         torch.cuda.empty_cache()
 
-    # ---- GATE G1 (MEMOIRE 2.1, registre) : la marge T0 devient-elle franchement positive ? ----
+    # ---- gate G1 (MEMOIRE 2.1, registre) : la marge T0 devient-elle franchement positive ? ----
     g1 = None
     if args.lam_t0 > 0 and "t0_after" in results.get("main", {}):
         mt = results["main"]
@@ -1290,11 +1289,11 @@ def run_toy(args, wandb):
         g1_count = aft["n_pos"] >= args.t0_g1_min_pos
         g1_corr_a = aft["corr_a"] >= args.t0_g1_corr_a
         # controle scelle 1 : h-shuffle (la sequence h d'une AUTRE video) doit rester <= 0,
-        # sinon la marge vient du decodeur/cond seul et G1 est VOID.
+        # sinon la marge vient du decodeur/cond seul et G1 est void.
         sh = results.get("hshuffle", {}).get("t0_after")
         g1_shuffle = (sh is not None) and (sh["margin"] <= 0.0)
         # controle scelle 2 (anti-Goodhart) : l'ancre ne doit pas s'aplatir (>= 25 % de l'ecart
-        # -type spatial du depart), sinon la correlation est mal definie et G1 est VOID.
+        # -type spatial du depart), sinon la correlation est mal definie et G1 est void.
         std_ratio = aft["anchor_std"] / max(bef["anchor_std"], 1e-9)
         g1_std = std_ratio >= args.t0_g1_std_ratio
         g1 = bool(g1_margin and g1_count and g1_corr_a and g1_shuffle and g1_std)
@@ -1314,7 +1313,7 @@ def run_toy(args, wandb):
         print(f"[toy] (5) CONTROLE anti-Goodhart : std spatiale >= "
               f"{100 * args.t0_g1_std_ratio:.0f} % du depart : {100 * std_ratio:.0f} % : "
               f"{'PASS' if g1_std else 'FAIL -> G1 VOID'}")
-        print(f"[toy] VERDICT G1 : {'PASS -- on paie l entrainement complet' if g1 else 'FAIL'}")
+        print(f"[toy] VERDICT G1 : {'PASS, on paie l entrainement complet' if g1 else 'FAIL'}")
         print("[toy] ======================================================\n", flush=True)
         wandb.log({"G1/margin": aft["margin"], "G1/margin_before": bef["margin"],
                    "G1/corr_a": aft["corr_a"], "G1/corr_b": aft["corr_b"],
@@ -1323,7 +1322,7 @@ def run_toy(args, wandb):
                    "G1/hshuffle_margin": (sh["margin"] if sh else float("nan"))}, step=30001)
 
     if not all(k in results for k in ("main", "bptt1", "hshuffle")):
-        print("[toy] F3.1 non evaluable (variantes manquantes) -- seul G1 est rapporte",
+        print("[toy] F3.1 non evaluable (variantes manquantes), seul G1 est rapporte",
               flush=True)
         with open(os.path.join(OUT_ROOT, _res_name), "w") as f:
             json.dump({k: {kk: vv for kk, vv in v.items() if kk != "hist"}
@@ -1355,7 +1354,7 @@ def run_toy(args, wandb):
                    for k, v in results.items()}
                   | {"verdict": verdict, "a": a_ok, "b": b_ok, "c": c_ok, "G1": g1}, f, indent=2)
     # MEMOIRE 2.1 : quand le terme T0 est actif, LE gate est G1 (F3.1 reste rapporte comme
-    # diagnostic de chaine, il a deja ete tranche au J3 : a PASS, b +8.9 %, c PASS).
+    # diagnostic de chaine, il a deja ete tranche au J3 : a pass, b +8.9 %, c pass).
     return bool(g1) if args.lam_t0 > 0 else verdict
 
 
@@ -1407,7 +1406,7 @@ def parse_args(argv=None):
     ap.add_argument("--t0_space", choices=["latent", "pixel"], default="pixel",
                     help="espace du terme T0. DEFAUT = pixel : la regle D0 a REJETE le latent "
                          "(D0.a, CPU : Spearman 0.51/0.45 < 0.70 et plus-proche-voisin 21/18 % "
-                         "< 50 % -- le latent poole ne reproduit PAS la geometrie bande-basse "
+                         "< 50 %, le latent poole ne reproduit PAS la geometrie bande-basse "
                          "pixel sur des ancres decodees). Ne repasser a 'latent' qu'en notant "
                          "la derogation au registre.")
     ap.add_argument("--t0_lat_mode", choices=["chan", "gray"], default="chan")
@@ -1430,7 +1429,7 @@ def parse_args(argv=None):
                     help="mesure la marge T0 sur les videos val puis sort (gate G2a)")
     ap.add_argument("--t0_probe_videos", type=int, default=26)
     # seuils des gates SCELLES au registre (memory2_probes_registry.md, G1 / G2a). Ils sont des
-    # flags pour etre lisibles dans wandb.config, PAS pour etre bouges : tout changement doit
+    # flags pour etre lisibles dans wandb.config, pas pour etre bouges : tout changement doit
     # etre note au registre avec sa date et sa raison.
     ap.add_argument("--t0_g1_margin", type=float, default=0.10)
     ap.add_argument("--t0_g1_min_pos", type=float, default=6.0)
@@ -1503,7 +1502,7 @@ def parse_args(argv=None):
 def main():
     args = parse_args()
     assert os.environ.get("WANDB_MODE", "") != "disabled", \
-        "house rule: WANDB_MODE=disabled is forbidden -- every run logs live to wandb"
+        "house rule: WANDB_MODE=disabled is forbidden, every run logs live to wandb"
     os.makedirs(OUT_ROOT, exist_ok=True)
     import wandb
     run_name = args.run_name + ("_toy" if args.toy else ("_smoke" if args.smoke else ""))
@@ -1512,7 +1511,7 @@ def main():
     if args.toy:
         args.ages = [args.toy_min_age, 20]
         args.min_age = args.toy_min_age
-        args.cond_dropout = 1.0        # the state is the ONLY route to the target in the toy
+        args.cond_dropout = 1.0        # the state is the only route to the target in the toy
         args.cache_videos = max(args.cache_videos, args.toy_videos)
         args.steps = args.toy_steps
         if args.toy_anchor_frac >= 0:
@@ -1546,7 +1545,7 @@ def main():
         wandb.log({f"vram/K{K}_bptt{nb}": pk for K, nb, pk, _, _ in rows}, step=0)
     if args.acc_probe or args.vram_probe or args.dino_probe:
         wandb.finish()
-        if args.dino_probe:      # exit code IS the gate verdict
+        if args.dino_probe:      # exit code is the gate verdict
             sys.exit(0 if res["dino_probe/pos_gap"] > 0 else 2)
         return
 
@@ -1567,7 +1566,7 @@ def main():
         batch = [tr.train_vids[(s * args.bs + i) % len(tr.train_vids)] for i in range(args.bs)]
         logs = tr.train_step(batch, lam, lam_d=lam_d, lam_t0=lam_t0)
         logs.update(tr.writer_diag())
-        if s == 0:                       # F3.3: the loss MUST reach the writer
+        if s == 0:                       # F3.3: the loss must reach the writer
             if tr.freeze_writer:
                 print(f"[writer][F3.3] SKIPPED: the writer is FROZEN this run "
                       f"(delta_ref {logs['writer/delta_ref']:.3e}, only the decoder learns)",
@@ -1577,7 +1576,7 @@ def main():
                 assert g is not None and torch.isfinite(g).all() and float(g.abs().sum()) > 0, \
                     "F3.3 VIOLATION: qkv.weight got NO gradient after the first backward"
                 print(f"[writer][F3.3] qkv.weight grad |sum| = {float(g.abs().sum()):.3e} "
-                      f"(non-zero, finite) -- the loss reaches the writer", flush=True)
+                      f"(non-zero, finite), the loss reaches the writer", flush=True)
             dg = [p for n_, p in tr.decoder.named_parameters() if n_.startswith("mixer.")
                   and p.grad is not None and float(p.grad.abs().sum()) > 0]
             if args.mixer:
@@ -1588,7 +1587,7 @@ def main():
                   f"(K={args.K}, bs={args.bs}, n_bptt={args.n_bptt}, "
                   f"lam_dino={args.lam_dino}, lam_t0={args.lam_t0})", flush=True)
             if tr.t0bank is not None:
-                # MEMOIRE 2.1 : LA quantite des gates, sur les videos VAL, AVANT tout pas utile
+                # MEMOIRE 2.1 : la quantite des gates, sur les videos val, AVANT tout pas utile
                 # (reference publiee, 24 cellules S2 : A +0.042 / B +0.298 => marge -0.256).
                 b0, _ = tr.t0_eval(tr.val_vids[:args.t0_probe_videos], "val", k=args.t0_k,
                                    tag="")
@@ -1618,7 +1617,7 @@ def main():
                   flush=True)
         if (s + 1) % args.ckpt_every == 0:
             tr.save(os.path.join(OUT_ROOT, f"{args.run_name}_step{s + 1}.pt"))
-    if tr.freeze_writer:                 # phase-B contract, END of run
+    if tr.freeze_writer:                 # phase-B contract, end of run
         d = delta_l1(tr.cells, tr.ref_start)
         print(f"[writer] PHASE-B FREEZE CHECK at step {steps}: writer/delta_ref = {d:.3e}",
               flush=True)

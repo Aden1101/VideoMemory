@@ -1,18 +1,17 @@
 #!/usr/bin/env python
-# ============================================================================================
-# The 2026-09-09 "device-agnostic" pass, verified.
-#
-# THE PROMISE TO KEEP, and the only one that matters: on CUDA (and on CPU) the code must behave
-# EXACTLY as before. This project has already lost campaigns to comparisons where one arm was
-# not what it was believed to be, and the 07/08 device control measured that merely changing
-# machine shifts the result by two pairs out of nineteen. A portability patch that moved any
-# value on the original hardware would be worse than no patch.
-#
-# D3 is therefore the central test: it reimplements the PRE-patch RoPE and demands BITWISE
-# equality with the current version on a device that supports float64.
-#
-#   python tests/test_device.py
-# ============================================================================================
+"""The device-agnostic pass, verified.
+
+The promise to keep, and the only one that matters: on CUDA and on CPU the code must behave
+exactly as before. This project has already lost campaigns to comparisons where one arm was
+not what it was believed to be, and the 07/08 device control measured that merely changing
+machine shifts the result by two pairs out of nineteen. A portability patch that moved any
+value on the original hardware would be worse than no patch.
+
+D3 is therefore the central test: it reimplements the pre-patch RoPE and demands bitwise
+equality with the current version on a device that supports float64.
+
+    python tests/test_device.py
+"""
 import os
 import sys
 
@@ -37,7 +36,7 @@ def check(name, cond, detail=""):
 print(describe())
 
 
-# ----------------------------- the reference: the PRE-patch code -----------------------------
+# ----------------------------- the reference: the pre-patch code -----------------------------
 def causal_rope_apply_original(x, grid_sizes, freqs, start_frame=0):
     """Verbatim copy of the pre-2026-09-09 version (float64 hardcoded)."""
     n, c = x.size(2), x.size(3) // 2
@@ -82,10 +81,10 @@ check("D2e rope_phase_dtype follows the table",
       rope_phase_dtype(freqs_cpu) is torch.float64
       and rope_phase_dtype(freqs_cpu.to(torch.complex64)) is torch.float32)
 
-# --- D3: BITWISE equality with the pre-patch code, on a float64 device ------------------------
+# --- D3: bitwise equality with the pre-patch code, on a float64 device -----------------------
 ref = causal_rope_apply_original(x_cpu, grid, freqs_cpu, start_frame=2)
 new = causal_rope_apply(x_cpu, grid, freqs_cpu, start_frame=2)
-check("D3 RoPE BITWISE identical to the original code (CPU)", torch.equal(ref, new),
+check("D3 RoPE bitwise identical to the original code (CPU)", torch.equal(ref, new),
       f"max|diff| = {float((ref - new).abs().max())}")
 ref0 = causal_rope_apply_original(x_cpu, grid, freqs_cpu)
 check("D3b same without a frame offset", torch.equal(ref0, causal_rope_apply(x_cpu, grid, freqs_cpu)))
@@ -98,13 +97,13 @@ if device.type == "mps":
     err = float((got - ref).abs().max())
     check("D4b RoPE executes on Metal", got.shape == ref.shape)
     # Tolerance: this is a float32-vs-float64 gap on a unit-norm rotation, so of the order of
-    # float32 epsilon relative to the amplitude of x -- not a difference of method.
+    # float32 epsilon relative to the amplitude of x, not a difference of method.
     check("D4c gap consistent with plain precision loss", err < 1e-4, f"max|diff| = {err:.2e}")
     check("D4d norm is preserved (it is a rotation)",
           abs(float(got.norm()) - float(ref.norm())) < 1e-3)
     check("D4e float64 refused on Metal, as expected", not supports_float64(device))
 else:
-    print("  --  D4 skipped (no Metal device here)")
+    print("  ..  D4 skipped (no Metal device here)")
 
 # --- D5: the stopwatch returns milliseconds whichever path it takes ---------------------------
 a, b = Timer(), Timer()

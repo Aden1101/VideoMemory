@@ -1,30 +1,29 @@
 #!/usr/bin/env python
-# ============================================================================================
-# MEMORY 2.0 (write-replay) -- shared DATA layer for J2/J3.
-# Reads the v3 "h_replay" shards written by reference/runs/frame_dec/collect_pairs.py --v3
-# (format documented in that file's header + memory2_design.md 2.5) and gives the bank
-# builder / h-oracle probe / writer trainer ONE definition of:
-#   - the video INDEX (metadata only, no big tensor materialized)          -> build_index()
-#   - the per-VIDEO train/val SPLIT (red-team F4.1: >= 20 val VIDEOS)      -> assign_split()
-#   - the twin pairing (same prompt, seed + 100000: red-team F1.1b)        -> twin_of()
-#   - target frames, their AGE in writes, and the cond that goes with them -> targets_for()
-#   - the latent crop60 embedding used by the (VAE-free) InfoNCE           -> latent_embed()
-#
-# ADDITIVE: nothing outside reference/runs/mem2/ is imported-and-modified; collect_pairs.py is
-# imported READ-ONLY (corpus/held-out helpers) so the held-out grep selftest uses the very same
-# code that filtered the corpus.
-#
-# SHARD ACCESS: torch.load(..., mmap=True) -- the 11-14 GB parts are memory-mapped, so reading
-# one video's h (1.5 GB) never materializes its 5-8 neighbours. Index building touches metadata
-# only and takes ~1 s for the whole 191 GB campaign.
-#
-# AGE CONVENTION (used everywhere, including wandb bucket names):
-#   write index i = position in write_chunks (0-based). After write i the state has just
-#   absorbed evicted chunk write_chunks[i] - window_chunks, whose LAST latent frame is
-#   frame_of_write(i). A target of AGE a decoded from the state at index i is the frame
-#   evicted at write index j = i - (a - 1):  age 1 = "your latest write" (the trivial recency
-#   target the red-team F1.6 warns about), age 20 = 20 writes ago.
-# ============================================================================================
+"""Memory 2.0 (write-replay), shared data layer for J2/J3.
+Reads the v3 "h_replay" shards written by reference/runs/frame_dec/collect_pairs.py --v3
+(format documented in that file's header + memory2_design.md 2.5) and gives the bank
+builder / h-oracle probe / writer trainer one definition of:
+  - the video INDEX (metadata only, no big tensor materialized)          -> build_index()
+  - the per-video train/val split (red-team F4.1: >= 20 val videos)      -> assign_split()
+  - the twin pairing (same prompt, seed + 100000: red-team F1.1b)        -> twin_of()
+  - target frames, their AGE in writes, and the cond that goes with them -> targets_for()
+  - the latent crop60 embedding used by the (VAE-free) InfoNCE           -> latent_embed()
+
+Additive: nothing outside reference/runs/mem2/ is imported-and-modified; collect_pairs.py is
+imported read-only (corpus/held-out helpers) so the held-out grep selftest uses the very same
+code that filtered the corpus.
+
+Shard access: torch.load(..., mmap=True), the 11-14 GB parts are memory-mapped, so reading
+one video's h (1.5 GB) never materializes its 5-8 neighbours. Index building touches metadata
+only and takes ~1 s for the whole 191 GB campaign.
+
+AGE convention (used everywhere, including wandb bucket names):
+  write index i = position in write_chunks (0-based). After write i the state has just
+  absorbed evicted chunk write_chunks[i] - window_chunks, whose last latent frame is
+  frame_of_write(i). A target of AGE a decoded from the state at index i is the frame
+  evicted at write index j = i - (a - 1):  age 1 = "your latest write" (the trivial recency
+  target the red-team F1.6 warns about), age 20 = 20 writes ago.
+"""
 import glob
 import hashlib
 import json
@@ -65,7 +64,7 @@ def load_part(path, mmap=True):
     assert isinstance(obj, dict) and obj.get("format_version") == 3 \
         and obj.get("kind") == "h_replay", f"{path}: not a v3 h_replay shard"
     assert obj.get("mem_zero_all") is True, \
-        (f"{path}: mem_zero_all is {obj.get('mem_zero_all')!r} -- the write-replay premise "
+        (f"{path}: mem_zero_all is {obj.get('mem_zero_all')!r}, the write-replay premise "
          f"(h = data, independent of theta_w) only holds for MEM_ZERO_ALL=1 rollouts")
     return obj
 
@@ -133,9 +132,9 @@ def load_index(path=INDEX_JSON, dirs=(V3_DIR, TWIN_DIR), rebuild=False, verbose=
 
 # ----------------------------- held-out selftest (F. brief: grep the manifests) --------------
 def held_out_hits(vids):
-    """Re-verify (grep) that no selected prompt hits one of the 16 probe prompts, in BOTH
-    directions -- the collector asserted it at selection time, this re-checks the shards that
-    actually landed on disk (prompt AND prompt_b of every video)."""
+    """Re-verify (grep) that no selected prompt hits one of the 16 probe prompts, in both
+    directions, the collector asserted it at selection time, this re-checks the shards that
+    actually landed on disk (prompt and prompt_b of every video)."""
     from collect_pairs import held_out_prompts, _hits_held_out, _norm_text
     held = held_out_prompts()
     hits = []
@@ -147,13 +146,13 @@ def held_out_hits(vids):
     return hits, len(held)
 
 
-# ----------------------------- split (F4.1: per VIDEO, >= 20 val videos) ---------------------
+# ----------------------------- split (F4.1: per video, >= 20 val videos) ---------------------
 def _hash01(s):
     return int(hashlib.sha1(s.encode()).hexdigest()[:12], 16) / float(1 << 48)
 
 
 def assign_split(vids, n_val_switch=18, n_val_single=4, salt="mem2-v1"):
-    """Deterministic per-VIDEO split. Rules:
+    """Deterministic per-video split. Rules:
       - stratified by mode so val contains both populations (>= 20 videos total);
       - a TWIN always lands on the side of its sibling (key = corpus_idx), red-team F1.1b:
         a twin in val while its sibling trains would leak the exact scene.
@@ -189,14 +188,14 @@ def twin_of(video_id, tidx, vids_by_id):
 
 # ----------------------------- targets / ages -------------------------------------------------
 def frame_of_write(meta, i):
-    """Latent frame index of the target evicted by write i (its chunk's LAST frame)."""
+    """Latent frame index of the target evicted by write i (its chunk's last frame)."""
     wc, F = meta["window_chunks"], meta["num_frame_per_block"]
     c = meta["write_chunks"][i]
     return (c - wc) * F + (F - 1)
 
 
 def anchor_write_index(meta):
-    """Write index j whose evicted frame IS the anchor (last frame of A, switch_frame - 1).
+    """Write index j whose evicted frame is the anchor (last frame of A, switch_frame - 1).
     None for single videos."""
     if meta["switch_chunk"] is None:
         return None
@@ -206,7 +205,7 @@ def anchor_write_index(meta):
 
 
 def anchor_eligible_states(meta):
-    """State (write) indices where the anchor target is the REVISIT task: A fully evicted from
+    """State (write) indices where the anchor target is the revisit task: A fully evicted from
     the KV window and >= 2 pure-B chunks written (the collector's min_gap rule)."""
     if meta["switch_chunk"] is None:
         return []
@@ -225,9 +224,9 @@ def sample_positions(meta, rng, k=3, ages=(1, 2, 5, 10, 20), anchor_frac=0.5,
     """K supervised positions for one video, as dicts:
         {'i': state index, 'j': target write index, 'age': i-j+1, 'frame': latent frame,
          'cond': 'a'|'b', 'kind': 'anchor'|'recency'}
-    'anchor' positions (switch videos only) are the REVISIT task: target = last frame of A,
+    'anchor' positions (switch videos only) are the revisit task: target = last frame of A,
     state = post-switch, cond = A. 'recency' positions implement red-team F1.6 (aged targets
-    sampled in {1,2,5,10,20} writes, NEVER only age 1)."""
+    sampled in {1,2,5,10,20} writes, never only age 1)."""
     n = len(meta["write_chunks"])
     out = []
     aj = anchor_write_index(meta)
@@ -294,7 +293,7 @@ def get_record(meta, cache):
 
 
 def load_h(meta, cache, blocks, upto=None, device=None, dtype=torch.bfloat16):
-    """h_seq[block][0..upto] -> list per block. Stored fp16 -> cast to the DEPLOYMENT dtype
+    """h_seq[block][0..upto] -> list per block. Stored fp16 -> cast to the deployment dtype
     (bf16) exactly like selftest_replay's test 4 (round-trip exact for in-range values)."""
     rec = get_record(meta, cache)
     out = {}
@@ -326,7 +325,7 @@ def load_conds(meta, cache):
 # ----------------------------- latent embedding (VAE-free InfoNCE space) ----------------------
 def latent_embed(x, frac=0.6, pool=2, eps=1e-6):
     """(B, 16, 60, 104) or (B, 1, 16, 60, 104) latent frames -> L2-normalized crop60 embedding.
-    The mandate keeps the VAE OUT of the loss (viz only), so the instance term lives in LATENT
+    The mandate keeps the VAE out of the loss (viz only), so the instance term lives in latent
     space: centre crop60 (the region re-ID scores), 2x2 average pool (kills the pixel-adversarial
     high-frequency directions of red-team F1.5), per-sample RMS normalization then L2 norm ->
     plain cosine similarity. Differentiable (the anchor side carries the gradient)."""

@@ -76,7 +76,7 @@ class StreamingTrainingPipeline:
                         m.detach_state = False
             print("[train_write] ENABLED")
 
-        # c2 cache-dropout co-training: with prob cache_dropout_prob, a WHOLE rollout runs
+        # c2 cache-dropout co-training: with prob cache_dropout_prob, a whole rollout runs
         # with a starved runtime sink (cache_dropout_sink frames, default 0) and the memory
         # ON, so the memory is the only carrier of the early-video anchor. 0.0 = off
         # (default, byte-identical: the sink attribute is never touched).
@@ -85,7 +85,7 @@ class StreamingTrainingPipeline:
         self._cache_dropout_active = False
         # c3: linear anneal of the dropout prob from cache_dropout_prob (start) to
         # cache_dropout_prob_end over cache_dropout_anneal_steps. When end is None or the anneal
-        # window is <= 0, the prob is CONSTANT at the start value = byte-identical to c2.
+        # window is <= 0, the prob is constant at the start value = byte-identical to c2.
         _cd_end = kwargs.get("cache_dropout_prob_end", None)
         self.cache_dropout_prob_end = (float(_cd_end) if _cd_end is not None
                                        else self.cache_dropout_prob)
@@ -124,7 +124,7 @@ class StreamingTrainingPipeline:
 
     def _maybe_cache_dropout(self):
         """c2: roll the per-rollout cache-dropout coin (rank-synced) and set the runtime sink.
-        The override stays in place for the whole rollout (all chunks AND their backwards:
+        The override stays in place for the whole rollout (all chunks and their backwards:
         gradient-checkpoint recompute must see the same sink the forward saw); the next
         rollout re-decides, restoring the full sink on a no-drop draw."""
         if self.cache_dropout_prob <= 0.0:

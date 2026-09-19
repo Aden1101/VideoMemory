@@ -1,33 +1,32 @@
 #!/usr/bin/env python
-# ============================================================================================
-# TACHE n 1 -- LES MASQUES DU SUJET (plan_memoire_2026-08-04, correctif d'auto-audit n 2).
-#
-# "Les MASQUES DU SUJET n'existent pas encore : segmentation guidee par le nom du sujet du
-#  prompt (GroundingDINO+SAM) sur les images propres du corpus, une fois, avec planche de
-#  validation a l'oeil AVANT tout."
-#
-# Ce que fait ce script, une fois, pour les 165 videos du corpus (2 segments-sujet pour les
-# switch, 1 pour les single) :
-#   1. echantillonne ~10 frames LATENTES du segment (probe1_common.sample_segment_frames) ;
-#   2. les VAE-decode en pixels propres (chemin identique a build_bank.dino_audit_embed :
-#      une frame latente decodee SEULE = une frame pixel) ;
-#   3. detecte le sujet par un detecteur OUVERT-VOCABULAIRE guide par le texte (OWL-ViT
-#      large-patch14 -- l'equivalent HF leger de GroundingDINO ; `transformers` est fige a
-#      4.33.2 dans cet env et n'a pas GroundingDino, on ne met PAS a jour une dependance du
-#      trainer pour une tache annexe). Les requetes viennent du nom du sujet extrait du
-#      prompt ; le detecteur ARBITRE entre elles (score median sur les frames) ;
-#   4. segmente au SAM (facebook/sam-vit-huge) avec la boite comme invite ;
-#   5. ecrit masque + crop-sujet + crop-fond (le COMPLEMENT) + l'embedding DINO des deux ;
-#   6. rend une PLANCHE de validation a l'oeil (grille image | masque), JPEG < 0.5 MB.
-#
-# Les modeles sont telecharges sur le DISQUE PROJET (HF_HOME = probe1/hf) : le home est plein.
-#
-# Usage (pre-check GPU DANS la commande, regle de la maison ; jamais l'index 6) :
-#   CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
-#   CUDA_VISIBLE_DEVICES=7 python reference/runs/probe1/build_masks.py --all
-#   ... --limit 4            # fumee
-#   ... --board_only         # re-rend seulement la planche depuis ce qui est sur disque
-# ============================================================================================
+"""Tache n 1, les masques DU SUJET (plan_memoire_2026-08-04, correctif d'auto-audit n 2).
+
+"Les masques DU SUJET n'existent pas encore : segmentation guidee par le nom du sujet du
+ prompt (GroundingDINO+SAM) sur les images propres du corpus, une fois, avec planche de
+ validation a l'oeil AVANT tout."
+
+Ce que fait ce script, une fois, pour les 165 videos du corpus (2 segments-sujet pour les
+switch, 1 pour les single) :
+  1. echantillonne ~10 frames latentes du segment (probe1_common.sample_segment_frames) ;
+  2. les VAE-decode en pixels propres (chemin identique a build_bank.dino_audit_embed :
+     une frame latente decodee SEULE = une frame pixel) ;
+  3. detecte le sujet par un detecteur OUVERT-VOCABULAIRE guide par le texte (OWL-ViT
+     large-patch14, l'equivalent HF leger de GroundingDINO ; `transformers` est fige a
+     4.33.2 dans cet env et n'a pas GroundingDino, on ne met pas a jour une dependance du
+     trainer pour une tache annexe). Les requetes viennent du nom du sujet extrait du
+     prompt ; le detecteur ARBITRE entre elles (score median sur les frames) ;
+  4. segmente au SAM (facebook/sam-vit-huge) avec la boite comme invite ;
+  5. ecrit masque + crop-sujet + crop-fond (le complement) + l'embedding DINO des deux ;
+  6. rend une PLANCHE de validation a l'oeil (grille image | masque), JPEG < 0.5 MB.
+
+Les modeles sont telecharges sur le DISQUE PROJET (HF_HOME = probe1/hf) : le home est plein.
+
+Usage (pre-check GPU dans la commande, regle de la maison ; jamais l'index 6) :
+  CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
+  CUDA_VISIBLE_DEVICES=7 python reference/runs/probe1/build_masks.py --all
+  ... --limit 4            # fumee
+  ... --board_only         # re-rend seulement la planche depuis ce qui est sur disque
+"""
 import argparse
 import os
 import sys
@@ -108,7 +107,7 @@ def detect(owl_p, owl_m, pils, queries, device, batch=4):
 def pick_query(scores, queries):
     """Le detecteur arbitre : on part du candidat le plus prioritaire (celui que l'extraction
     du prompt a classe premier) et un candidat plus tardif ne le remplace que s'il le bat de
-    SWITCH_MARGIN en score MEDIAN sur les frames du segment. La mediane (et non la moyenne)
+    SWITCH_MARGIN en score median sur les frames du segment. La mediane (et non la moyenne)
     evite qu'une seule frame chanceuse decide."""
     med = np.median(scores, axis=0)
     best = 0
@@ -157,9 +156,9 @@ def box_of_mask(mask, pad=CROP_PAD):
 def make_crops(frame01, mask):
     """frame01 (3, H, W) dans [0,1], mask (H, W) bool ->
        (crop-sujet (3, h, w), crop-fond (3, H, W)).
-    Le crop-SUJET est la boite serree du masque avec l'exterieur du masque MIS A ZERO (c'est le
-    sujet, pas sa vignette de contexte). Le crop-FOND est le COMPLEMENT : l'image entiere avec
-    le sujet mis a zero -- exactement l'esprit du `zero_center` de score_comp.py, mais avec le
+    Le crop-SUJET est la boite serree du masque avec l'exterieur du masque mis A zero (c'est le
+    sujet, pas sa vignette de contexte). Le crop-fond est le complement : l'image entiere avec
+    le sujet mis a zero, exactement l'esprit du `zero_center` de score_comp.py, mais avec le
     vrai masque au lieu du carre central."""
     m = torch.from_numpy(mask)[None].float()
     subj_full = frame01 * m
@@ -186,7 +185,7 @@ def save_jpeg(t01, path, quality=88, max_w=320):
 def process_segment(meta, seg, latents, models, device, args, force_qi=None):
     owl_p, owl_m, sam_p, sam_m, vae = models
     key = C.seg_key(meta["video_id"], seg["name"])
-    # corpus a sujets NON HUMAINS (v4) : on coupe le repli "a person" a la source, sinon
+    # corpus a sujets non HUMAINS (v4) : on coupe le repli "a person" a la source, sinon
     # `pick_query` peut le preferer et poser le masque sur un figurant du decor.
     sp = C.subject_phrase(seg["prompt"],
                           person_fallback=getattr(args, "corpus", "v1")
@@ -204,7 +203,7 @@ def process_segment(meta, seg, latents, models, device, args, force_qi=None):
     H, W = masks.shape[-2:]
     area = masks.reshape(len(idx), -1).mean(axis=1)
     # IoU(masque, boite) > 0 est la condition du contrat de selftest : le masque doit
-    # RECOUPER la detection qui l'a produit (un masque vide, ou parti ailleurs, est invalide).
+    # recouper la detection qui l'a produit (un masque vide, ou parti ailleurs, est invalide).
     iou_box = np.zeros(len(idx), dtype=np.float32)
     for t in range(len(idx)):
         x0, y0, x1, y1 = boxes[t, qi]
@@ -273,7 +272,7 @@ def unpack_masks(rec):
 def cell_measures(rec, masks):
     """Les MESURES AUTOMATIQUES ecrites dans la cellule (materiau v4) : ce que la machine sait
     dire du masque, pour qu'Aden n'ait a juger que ce que lui seul peut juger (l'identite).
-      aire  = fraction de l'image sous le masque, mediane sur les frames VALIDES ;
+      aire  = fraction de l'image sous le masque, mediane sur les frames valides ;
       conf  = score de detection median (confiance du detecteur ouvert-vocabulaire) ;
       stab  = STABILITE DU SUIVI = IoU moyenne entre masques de frames consecutives : 1.0 =
               le masque designe la meme chose d'un bout a l'autre, ~0 = il saute d'un objet
@@ -346,7 +345,7 @@ def build_board(keys, out_path, cols=3, thumb_w=208, quality=78, max_bytes=500_0
     for i, (k, q, s, fl, orig, mid, m, mes) in enumerate(cells):
         r, c = divmod(i, cols)
         x, y = c * cw, r * ch
-        # colonne 1 : image sans le sujet (= le crop-FOND) ; colonne 2 : sujet surligne ;
+        # colonne 1 : image sans le sujet (= le crop-fond) ; colonne 2 : sujet surligne ;
         # colonne 3 : le masque binaire
         for j, im in enumerate((orig, mid, m)):
             board.paste(im.resize((tw, th), Image.BILINEAR), (x + j * tw, y + lab))
@@ -374,7 +373,7 @@ def build_board(keys, out_path, cols=3, thumb_w=208, quality=78, max_bytes=500_0
 
 
 def board_keys(vids, pairs, n=24):
-    """~24 segments VARIES : d'abord les segments SIGNALES (c'est eux qu'il faut voir), puis un
+    """~24 segments varies : d'abord les segments signales (c'est eux qu'il faut voir), puis un
     balayage des tetes de sujet distinctes, en privilegiant les videos des paires (celles dont
     depend le sondage). Deterministe."""
     pair_ids = {p["main"] for p in pairs} | {p["twin"] for p in pairs}
@@ -410,16 +409,16 @@ def board_keys(vids, pairs, n=24):
 
 
 def fix_pairs(pairs, models, device, args, corpus="v1"):
-    """LE CORRECTIF DE COHERENCE DES JUMEAUX.
+    """LE CORRECTIF de coherence des JUMEAUX.
 
     Une paire, c'est DEUX rollouts du MEME prompt : la liste de requetes candidates y est donc
-    identique par construction. Mais le detecteur les arbitre VIDEO PAR VIDEO, et il lui arrive
+    identique par construction. Mais le detecteur les arbitre video par video, et il lui arrive
     de trancher differemment des deux cotes (mesure : `main:204394` -> "medium-sized brown dog",
     `twin:204394` -> "small bird" ; `main:142397` -> "vase", `twin:142397` -> "small table").
-    Le sondeur comparerait alors "un chien contre un oiseau" au lieu de "CE chien contre CET
+    Le sondeur comparerait alors "un chien contre un oiseau" au lieu de "ce chien contre CET
     AUTRE chien" : la tache changerait de nature sur ces paires.
 
-    Correctif : la requete est choisie UNE FOIS PAR PAIRE, sur les scores medians des DEUX
+    Correctif : la requete est choisie UNE fois par PAIRE, sur les scores medians des DEUX
     videos (moyenne des deux medianes, meme regle de marge de priorite), puis les segments qui
     n'avaient pas ce choix sont RECALCULES avec la requete imposee. Aucun autre changement."""
     import mem2_data as D
@@ -470,7 +469,7 @@ def fix_pairs(pairs, models, device, args, corpus="v1"):
 
 def pair_board_keys(pairs, numbered=False):
     """Une cellule pour CHACUNE des 60 videos de paire (30 paires cote a cote) : c'est ce
-    corpus-la, et lui seul, dont depend le sondage -- l'oeil doit le voir en entier.
+    corpus-la, et lui seul, dont depend le sondage, l'oeil doit le voir en entier.
     `numbered` : ordre de la planche NUMEROTEE = celui de C.board_numbers (identifiant de la
     video principale, lexicographique), le seul auquel les listes d'oeil scellees renvoient.
     Rend (cles, {cle: numero de paire})."""
@@ -488,7 +487,7 @@ def pair_board_keys(pairs, numbered=False):
 
 def boards_to_make(vids, pairs, args):
     """(cles, chemin, numeros) des planches a rendre : la planche VARIEE des ~24 segments du
-    corpus, la planche des 30 PAIRES, et la planche NUMEROTEE (l'objet du verdict d'oeil)."""
+    corpus, la planche des 30 paires, et la planche NUMEROTEE (l'objet du verdict d'oeil)."""
     suf = "" if args.corpus == "v1" else f"_{args.corpus}"
     # les planches du corpus v1 ne doivent JAMAIS etre ecrasees par celles du v2 (l'oeil d'Aden
     # a rendu son verdict sur les v1) : le suffixe porte sur les trois.
@@ -498,7 +497,7 @@ def boards_to_make(vids, pairs, args):
     yield keys, os.path.join(C.BOARD_DIR, f"masks_board_pairs{suf}.jpg"), None, {}
     keys, nums = pair_board_keys(pairs, numbered=True)
     yield (keys, os.path.join(C.BOARD_DIR, f"masks_board_pairs_numerote{suf}.jpg"), nums, {})
-    # PLANCHE DE LABELLISATION (materiau v4) : UNE LIGNE PAR PAIRE (cols=2 : la principale et
+    # PLANCHE de LABELLISATION (materiau v4) : UNE ligne par PAIRE (cols=2 : la principale et
     # sa jumelle cote a cote, jamais coupees par un saut de ligne) + les MESURES AUTOMATIQUES
     # ecrites dans chaque cellule. C'est celle que l'oeil d'Aden annote.
     yield (keys, os.path.join(C.BOARD_DIR, f"labels_board{suf}.jpg"), nums,
@@ -585,7 +584,7 @@ def main():
             print(f"[masks] {n + 1}/{len(sel)} videos, {done} segments, {len(flagged)} signales, "
                   f"{el / 60:.1f} min ({el / max(1, n + 1):.1f} s/video)", flush=True)
 
-    # un fichier PAR CORPUS : la campagne v2 ecrasait silencieusement le resume de la v1
+    # un fichier par corpus : la campagne v2 ecrasait silencieusement le resume de la v1
     # (audit 2 du 05/08 ; artefact de documentation, aucun effet sur le protocole).
     C.save_json({"corpus": args.corpus, "n_videos": len(sel), "n_segments_done": done,
                  "flagged": flagged},

@@ -1,40 +1,39 @@
 #!/usr/bin/env python
-# ============================================================================================
-# SELFTEST S1 -- REPLAY-BITWISE (memory 2.0, J1). THE founding gate of the write-replay plan
-# (reference/memory2_design.md 3.7 S1: "ECHEC = stop chantier").
-#
-# Claim under test (design 1.1): under MEM_ZERO_ALL=1 the eviction-feed h are DATA (pure
-# functions of the frozen backbone), so replaying the write chain offline with
-# video_memory.replay_writes() from the init state reproduces the in-situ fast-weight states
-# EXACTLY -- bitwise, not approximately.
-#
-# What it runs (one GPU, a few minutes, l1@2000-EMA via probe_l1.yaml):
-#   rollout : one short single-prompt rollout (default 45 frames = 15 chunks, MEM_ZERO_ALL=1)
-#             through collect_pairs.rollout_collect(v3_capture=True): h kept bf16 in RAM
-#             (lossless), post-write states snapshotted after EVERY write (3 blocks).
-#   test 1  : replay_writes (no grad) == in-situ states at EVERY write, torch.equal on
-#             w0/w1/w2, blocks 5/16/27. The core S1 assert.
-#   test 2  : replay WITH grad (checkpoint_write path, l1 has ckpt_write=true) -> final state
-#             STILL bitwise-equal (checkpoint forward parity) AND a dummy loss on the final
-#             state backprops NON-ZERO grads to qkv/{weight,bias}, lrs/{weight,bias},
-#             k_norm.weight, decay_logit; q_norm.weight gets NO grad (negative control: q is
-#             computed and discarded by the write path). Also re-runs the forward with
-#             use_checkpoint=False -> same bits (checkpoint vs direct parity).
-#   test 3  : truncated BPTT (n_bptt_writes=3): final state bitwise-identical (the forward
-#             is unchanged, only the graph is cut) + grads still non-zero + grads DIFFER
-#             from the full-BPTT grads (proof the truncation actually cut the graph).
-#   test 4  : (unless --skip-roundtrip) the CAMPAIGN storage path: second identical rollout
-#             with the fp16 round-trip poke (v3_fp16_roundtrip=True), replay from the stored
-#             fp16 h cast back to bf16 == the poked in-situ states, bitwise; and the two
-#             rollouts' LATENTS are byte-identical (the poke provably touches nothing
-#             observable under MEM_ZERO_ALL=1). Reports the S4 counters (rt_changed,
-#             subnormals, absmax).
-#
-# Usage (Aden launches; needs a visible GPU -- `import wan` touches CUDA):
-#   cd reference/runs/frame_dec && python selftest_replay.py            # full run
-#   python selftest_replay.py --frames 30 --skip-roundtrip              # quicker smoke
-# Exit code 0 = ALL GREEN; 1 = at least one check failed (chantier gate closed).
-# ============================================================================================
+"""SELFTEST S1, replay-bitwise (memory 2.0, J1). The founding gate of the write-replay plan
+(reference/memory2_design.md 3.7 S1: "ECHEC = stop chantier").
+
+Claim under test (design 1.1): under MEM_ZERO_ALL=1 the eviction-feed h are data (pure
+functions of the frozen backbone), so replaying the write chain offline with
+video_memory.replay_writes() from the init state reproduces the in-situ fast-weight states
+exactly, bitwise, not approximately.
+
+What it runs (one GPU, a few minutes, l1@2000-EMA via probe_l1.yaml):
+  rollout : one short single-prompt rollout (default 45 frames = 15 chunks, MEM_ZERO_ALL=1)
+            through collect_pairs.rollout_collect(v3_capture=True): h kept bf16 in RAM
+            (lossless), post-write states snapshotted after every write (3 blocks).
+  test 1  : replay_writes (no grad) == in-situ states at every write, torch.equal on
+            w0/w1/w2, blocks 5/16/27. The core S1 assert.
+  test 2  : replay with grad (checkpoint_write path, l1 has ckpt_write=true) -> final state
+            still bitwise-equal (checkpoint forward parity) and a dummy loss on the final
+            state backprops non-ZERO grads to qkv/{weight,bias}, lrs/{weight,bias},
+            k_norm.weight, decay_logit; q_norm.weight gets no grad (negative control: q is
+            computed and discarded by the write path). Also re-runs the forward with
+            use_checkpoint=False -> same bits (checkpoint vs direct parity).
+  test 3  : truncated BPTT (n_bptt_writes=3): final state bitwise-identical (the forward
+            is unchanged, only the graph is cut) + grads still non-zero + grads differ
+            from the full-BPTT grads (proof the truncation actually cut the graph).
+  test 4  : (unless --skip-roundtrip) the campaign storage path: second identical rollout
+            with the fp16 round-trip poke (v3_fp16_roundtrip=True), replay from the stored
+            fp16 h cast back to bf16 == the poked in-situ states, bitwise; and the two
+            rollouts' latents are byte-identical (the poke provably touches nothing
+            observable under MEM_ZERO_ALL=1). Reports the S4 counters (rt_changed,
+            subnormals, absmax).
+
+Usage (Aden launches; needs a visible GPU, `import wan` touches CUDA):
+  cd reference/runs/frame_dec && python selftest_replay.py            # full run
+  python selftest_replay.py --frames 30 --skip-roundtrip              # quicker smoke
+Exit code 0 = ALL green; 1 = at least one check failed (chantier gate closed).
+"""
 import argparse
 import os
 import sys
@@ -53,7 +52,7 @@ from collect_pairs import rollout_collect, _find_causal_model, DEFAULT_CONFIG  #
 from run_reid_probe import build_pipeline  # noqa: E402
 from wan.modules.video_memory import replay_writes  # noqa: E402
 
-# any re-identifiable-style prompt works: the selftest checks BITWISE mechanics, not quality.
+# any re-identifiable-style prompt works: the selftest checks bitwise mechanics, not quality.
 # (Not one of the 16 held-out probe prompts, so no leak whatever this file is reused for.)
 PROMPT = "a brown bear with one white ear fishing in a shallow mountain river"
 
@@ -62,7 +61,7 @@ _FAILS = []
 
 def check(name, ok, detail=""):
     tag = "PASS" if ok else "FAIL"
-    print(f"[selftest][{tag}] {name}" + (f" -- {detail}" if detail else ""), flush=True)
+    print(f"[selftest][{tag}] {name}" + (f": {detail}" if detail else ""), flush=True)
     if not ok:
         _FAILS.append(name)
     return ok
@@ -106,7 +105,7 @@ def main():
                     help="skip test 4 (second rollout with the fp16 storage poke)")
     args = ap.parse_args()
 
-    # bitwise-parity preconditions: the in-situ rollout and the replay must see the SAME
+    # bitwise-parity preconditions: the in-situ rollout and the replay must see the same
     # backend numerics. Inference processes never touch these (only trainer/distillation.py
     # sets TF32, and it is not imported here); assert so a future import cannot silently
     # change the fp32 lrs matmul.
@@ -131,7 +130,7 @@ def main():
         assert layer.qkv.weight.dtype == torch.bfloat16, \
             f"block {bi} memory not in bf16 (deployment dtype)"
 
-    # ---- rollout 1: MEM_ZERO_ALL=1, h kept LOSSLESS bf16, state snapshot at EVERY write ----
+    # ---- rollout 1: MEM_ZERO_ALL=1, h kept lossless bf16, state snapshot at every write ----
     print(f"[selftest] rollout 1/{1 if args.skip_roundtrip else 2}: {args.frames} frames, "
           f"h bf16 in RAM, snap every write", flush=True)
     res = rollout_collect(pipeline, config, PROMPT, 0, args.frames, 0, device,
@@ -149,7 +148,7 @@ def main():
               f"{len(res['h_seq'][bi])} h, {len(res['check_states'][str(bi)])} snaps, "
               f"{n_writes} writes")
 
-    # ================= test 1: S1 REPLAY-BITWISE (no grad), every write, 3 blocks ==========
+    # ================= test 1: S1 replay-bitwise (no grad), every write, 3 blocks ==========
     for bi in mem_layers:
         layer = layers[bi]
         h_dev = [h.to(device) for h in res["h_seq"][bi]]          # cpu bf16 -> cuda, bitwise
@@ -179,7 +178,7 @@ def main():
         for p in wp.values():
             p.requires_grad_(True)
             p.grad = None
-        # negative control: q_norm participates ONLY in the (discarded) read query
+        # negative control: q_norm participates only in the (discarded) read query
         if hasattr(layer.q_norm, "weight") and layer.q_norm.weight is not None:
             layer.q_norm.weight.requires_grad_(True)
             layer.q_norm.weight.grad = None
@@ -270,9 +269,9 @@ def main():
             check(f"test4 replay-from-fp16-storage bitwise block {bi}", ok,
                   "" if ok else f"FIRST divergence at write {first_bad}, max|d|={max_d:.3e}")
 
-    print("\n[selftest] " + ("ALL GREEN -- the write-replay gate S1 is OPEN"
+    print("\n[selftest] " + ("ALL GREEN, the write-replay gate S1 is OPEN"
                              if not _FAILS else
-                             f"{len(_FAILS)} FAILURE(S): {_FAILS} -- STOP CHANTIER (design "
+                             f"{len(_FAILS)} FAILURE(S): {_FAILS}, STOP CHANTIER (design "
                              f"3.7 S1), debug before anything else"), flush=True)
     sys.exit(0 if not _FAILS else 1)
 

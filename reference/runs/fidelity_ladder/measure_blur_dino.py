@@ -1,18 +1,17 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ECHELLE DE FLOU FINE -- similarite DINO entre l'image INSEREE et l'image nette d'origine.
-#
-# Pour chaque scenario du paquet (08, 09, 10) et chaque sigma de l'echelle {0, 1, 2, 3, 4,
-# 6, 24} : l'image inseree est reconstruite par les operations EXACTES du hook _blur_latent
-# (decode -> flou sigma -> encode), puis re-decodee ; on mesure
-#   dino_cos  : cos(DINO(image inseree re-decodee), DINO(image nette d'origine))
-#   psnr_px   : PSNR pixel de la meme paire
-# sigma=0 (barreau `oracle`) insere la VRAIE frame latente sans aller-retour VAE ->
-# dino_cos = 1.0 par construction ; la ligne `rt0` (aller-retour VAE sans flou) est ajoutee
-# a titre informatif (= ce que rendrait un decodeur parfait qui repasse par le VAE).
-# Sortie : refs/blur_fine_dino.json + table imprimee -> conversion du verdict de l'oeil en
-# specification chiffree ("un decodeur doit atteindre au moins X de similarite DINO").
-# ============================================================================================
+"""ECHELLE de FLOU fine, similarite DINO entre l'image INSEREE et l'image nette d'origine.
+
+Pour chaque scenario du paquet (08, 09, 10) et chaque sigma de l'echelle {0, 1, 2, 3, 4,
+6, 24} : l'image inseree est reconstruite par les operations exactes du hook _blur_latent
+(decode -> flou sigma -> encode), puis re-decodee ; on mesure
+  dino_cos  : cos(DINO(image inseree re-decodee), DINO(image nette d'origine))
+  psnr_px   : PSNR pixel de la meme paire
+sigma=0 (barreau `oracle`) insere la VRAIE frame latente sans aller-retour VAE ->
+dino_cos = 1.0 par construction ; la ligne `rt0` (aller-retour VAE sans flou) est ajoutee
+a titre informatif (= ce que rendrait un decodeur parfait qui repasse par le VAE).
+Sortie : refs/blur_fine_dino.json + table imprimee -> conversion du verdict de l'oeil en
+specification chiffree ("un decodeur doit atteindre au moins X de similarite DINO").
+"""
 import json
 import math
 import os

@@ -488,9 +488,9 @@ class SelfForcingTrainingPipeline:
                 print(f"rank {dist.get_rank()}, current_start_frame: {current_start_frame}, current_num_frames: {current_num_frames}, current_timestep: {current_timestep}")
                 print(f"rank {dist.get_rank()}, rerun_for_cache")
             with torch.no_grad():
-                # Step 3.3 clean-context rerun = the ONLY place the fast weights move.
-                # NOTE: kept under no_grad on purpose for this phase -> the memory state is
-                # threaded/updated (like inference) but the write-path (k,v,lrs) receives NO
+                # Step 3.3 clean-context rerun = the only place the fast weights move.
+                # note: kept under no_grad on purpose for this phase -> the memory state is
+                # threaded/updated (like inference) but the write-path (k,v,lrs) receives no
                 # meta-gradient. Lift this no_grad later to train the write-path through BPTT.
                 self.generator(
                     noisy_image_or_video=denoised_pred,
@@ -500,7 +500,7 @@ class SelfForcingTrainingPipeline:
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                     ttt_cache=self.ttt_cache,
-                    ttt_update=True,  # WRITE the clean chunk into memory (mirrors the clean KV-cache write)
+                    ttt_update=True,  # write the clean chunk into memory (mirrors the clean KV-cache write)
                 )
 
             # Step 3.4: update the start and end frame indices

@@ -1,20 +1,19 @@
 #!/usr/bin/env python
-# ============================================================================================
-# SMOKE TEST OF THE INFERENCE PATH, on the local device, with no weights and no data.
-#
-# A REAL miniature CausalWanModel (random weights, real head geometry 12 x 128 because the
-# pipeline's KV cache requires it), rolled out in STREAMING mode over three chunks. No image is
-# judged: we check that the chain executes and that the cache advances -- RoPE, attention,
-# rolling KV cache, sink, TTT memory cell.
-#
-# This test exists because the 2026-09-09 device-agnostic pass hit four successive walls that no
-# import test would have caught: float64 in RoPE, float64 in the timestep embedding, five
-# attention calls bypassing the dispatcher, and video writing. Each only shows up at run time,
-# one step further than the last.
-#
-#   python tests/test_inference_smoke.py            # detected device
-#   AF_DEVICE=cpu python tests/test_inference_smoke.py
-# ============================================================================================
+"""Smoke test of the inference path, on the local device, with no weights and no data.
+
+A real miniature CausalWanModel (random weights, real head geometry 12 x 128 because the
+pipeline's KV cache requires it), rolled out in streaming mode over three chunks. No image is
+judged: this checks that the chain executes and that the cache advances, through RoPE,
+attention, the rolling KV cache, the sink and the TTT memory cell.
+
+The test exists because the device-agnostic pass hit four successive walls that no import
+test would have caught: float64 in RoPE, float64 in the timestep embedding, five attention
+calls bypassing the dispatcher, and video writing. Each only shows up at run time, one step
+further than the last.
+
+    python tests/test_inference_smoke.py            # detected device
+    AF_DEVICE=cpu python tests/test_inference_smoke.py
+"""
 import os
 import sys
 import time
@@ -61,13 +60,13 @@ def main():
            "is_init": False} for _ in range(LAYERS)]
 
     # The output head is zero-init (causal_model.py:1780, the "never noise into the cache"
-    # rule), so a fresh model returns EXACTLY zero. We perturb it, otherwise S4 and S5 would be
-    # testing 0 == 0 and would never again catch a regression of the path.
+    # rule), so a fresh model returns exactly zero. It is perturbed here, otherwise S4 and S5
+    # would be comparing 0 with 0 and would never catch a regression of the path.
     with torch.no_grad():
         m.head.head.weight.normal_(0, 0.02)
 
     ctx = [torch.randn(16, 64, device=device, dtype=DT)]
-    t = torch.ones(1, F, device=device, dtype=DT) * 1000.0     # one timestep PER frame
+    t = torch.ones(1, F, device=device, dtype=DT) * 1000.0     # one timestep per frame
     ends, outs = [], []
 
     with torch.no_grad():

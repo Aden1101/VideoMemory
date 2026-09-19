@@ -1,20 +1,19 @@
 #!/usr/bin/env python
-# ============================================================================================
-# BLIND JUDGING BOARDS -- scorer. Takes the code returned by the judge + the sealed key, and
-# produces the table. No torch, no GPU, no media: it only reads text.
-#
-#   python score_boards.py --key key_duel2.json --code "duel2~1~gdg...~a1b2c3"
-#   python score_boards.py --key key_pair2.json --code_file answers.txt
-#
-# WHAT IT REFUSES TO DO, and why (every guard comes from a real mistake in this project)
-#  - It NEVER dilutes "cannot tell" into chance: it counts them separately and computes the
-#    score over decided cells only, printing both counts. 60% over 10 decided cells out of 30 is
-#    not the same result as 60% over 30.
-#  - It never reports a p-value without the count and the interval: the registry's 10-seed annex
-#    showed that a single point always presents as more solid than it is.
-#  - It checks the checksum: a code pasted from the wrong board is a loud error, not a plausible
-#    score.
-# ============================================================================================
+"""Blind judging boards, scorer. Takes the code returned by the judge + the sealed key, and
+produces the table. No torch, no GPU, no media: it only reads text.
+
+  python score_boards.py --key key_duel2.json --code "duel2~1~gdg...~a1b2c3"
+  python score_boards.py --key key_pair2.json --code_file answers.txt
+
+What it refuses to do, and why (every guard comes from a real mistake in this project)
+ - It never dilutes "cannot tell" into chance: it counts them separately and computes the
+   score over decided cells only, printing both counts. 60% over 10 decided cells out of 30 is
+   not the same result as 60% over 30.
+ - It never reports a p-value without the count and the interval: the registry's 10-seed annex
+   showed that a single point always presents as more solid than it is.
+ - It checks the checksum: a code pasted from the wrong board is a loud error, not a plausible
+   score.
+"""
 import argparse
 import json
 import math
@@ -42,7 +41,7 @@ def binom_p_two_sided(k, n, p0=0.5):
 
 def wilson(k, n, z=1.96):
     """95% Wilson interval: honest at small n, unlike the normal interval which runs outside
-    [0,1] as soon as the rate approaches the edges -- and our n is always small."""
+    [0,1] as soon as the rate approaches the edges, and our n is always small."""
     if n == 0:
         return (0.0, 1.0)
     p = k / n
@@ -79,8 +78,8 @@ def parse_code(code, key):
 # ----------------------------- les trois lectures ----------------------------------------------
 def score_pair2(ans, key):
     """An answer key exists: the true subject is on a known side. We report the hit rate over
-    DECIDED cells, plus a breakdown by source (decoder, light blur, strong blur...) when the meta
-    carries it -- that breakdown is what places the decoder output on the blur ladder, which is
+    decided cells, plus a breakdown by source (decoder, light blur, strong blur...) when the meta
+    carries it, that breakdown is what places the decoder output on the blur ladder, which is
     the very question of the 22/08 board."""
     per_src, rows = {}, []
     hit = seen = unsure = 0
@@ -109,9 +108,9 @@ def score_pair2(ans, key):
 
 
 def score_duel2(ans, key):
-    """No answer key: this is a PREFERENCE between two arms. We count wins per arm and test them
+    """No answer key: this is a preference between two arms. We count wins per arm and test them
     against a coin flip. The winning arm is not 'the right one', it is the one the eye picks more
-    often -- and without both counts the sentence means nothing."""
+    often, and without both counts the sentence means nothing."""
     wins, unsure, rows = {}, 0, []
     for it in key["items"]:
         a = ans[it["slot"]]
@@ -136,7 +135,7 @@ def score_duel2(ans, key):
 
 
 def score_rank3(ans, key):
-    """Two readings, as the board asked for them: the mean RANK per variant (relative comparison,
+    """Two readings, as the board asked for them: the mean rank per variant (relative comparison,
     which survives even if no variant convinces) and the absolute judgment."""
     ranks, judge, duels = {}, {}, {}
     for it in key["items"]:

@@ -1,10 +1,9 @@
 #!/usr/bin/env python
-# ============================================================================================
-# SELFTESTS v2, MODEL side -- the AnchorFrameDecoder contracts that the three fixes rely on.
-# CPU only, tiny dims, ~10 s. Loads wan/modules/video_memory.py DIRECTLY by path (the `wan`
-# package __init__ pulls diffusers/flash-attn, which no audit box needs).
-#   python reference/runs/frame_dec/selftest_v2_model.py
-# ============================================================================================
+"""Selftests v2, model side, the AnchorFrameDecoder contracts that the three fixes rely on.
+CPU only, tiny dims, ~10 s. Loads wan/modules/video_memory.py directly by path (the `wan`
+package __init__ pulls diffusers/flash-attn, which no audit box needs).
+  python reference/runs/frame_dec/selftest_v2_model.py
+"""
 import importlib.util
 import os
 import sys
@@ -52,7 +51,7 @@ check("M1 mixer=False creates no module", set(d1.state_dict()) == set(d1b.state_
 check("M1b no `mixer.` key exists when off",
       not [k for k in d1.state_dict() if k.startswith("mixer.")])
 
-# --- M2: zero-init head emits an EXACTLY null frame -------------------------------------------
+# --- M2: zero-init head emits an exactly null frame -------------------------------------------
 # The rule the project wrote in blood: never xavier noise into the cache.
 st = make_states()
 with torch.no_grad():
@@ -62,7 +61,7 @@ check("M2b output shape is one latent frame",
       tuple(y0.shape) == (B, 1, 16, KW["grid_h"] * 2, KW["grid_w"] * 2), f"got {tuple(y0.shape)}")
 
 # --- M3: the mixer is the identity at init, so a v1 ckpt warm-starts with no functional change -
-# THE contract of cause 2. If this fails, "--mixer" means "throw the decoder away".
+# the contract of cause 2. If this fails, "--mixer" means "throw the decoder away".
 d2 = AnchorFrameDecoder(mixer=True, mixer_blocks=2, mixer_hidden=48, **KW)
 missing, unexpected = d2.load_state_dict(d1.state_dict(), strict=False)
 new_keys = assert_mixer_warm_start(list(missing), list(unexpected))
@@ -77,7 +76,7 @@ with torch.no_grad():
 check("M3b mixer at init reproduces the v1 output exactly",
       torch.equal(ya, yb), f"max|diff| = {float((ya - yb).abs().max())}")
 
-# --- M4: once trained, the mixer CAN mix (it is not dead code) ---------------------------------
+# --- M4: once trained, the mixer can mix (it is not dead code) ---------------------------------
 # Catches the opposite failure: a mixer that is identity for ever, so the mosaic never goes.
 with torch.no_grad():
     for blk in d2.mixer:
@@ -89,7 +88,7 @@ check("M4 a perturbed mixer changes the output", not torch.equal(ya, yc))
 # --- M5: the two loss terms are commensurate at init ------------------------------------------
 # Both are exactly 1.0 for the null output, which is what makes --sharp_w a readable ratio.
 tgt = torch.randn(B, 1, 16, KW["grid_h"] * 2, KW["grid_w"] * 2)
-# import train_decoder for its loss WITHOUT dragging in the `wan` package (diffusers,
+# import train_decoder for its loss without dragging in the `wan` package (diffusers,
 # flash-attn): register the standalone module under the name train_decoder expects.
 import types  # noqa: E402
 _pkg = types.ModuleType("wan"); _pkg.__path__ = []

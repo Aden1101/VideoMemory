@@ -1,17 +1,16 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ECHELLE DE FIDELITE -- driver de generation (GPU).
-#
-# 6 barreaux x 10 scenarios, forme A(0-81) B(81-162) A(162-240) via le chemin legacy
-# pipeline.inference() (celui des bras oracle1 / oracle1twin / oracle1blur de la batterie
-# d'arbitrage, hooks valides). Les 6 bras d'un scenario partagent la MEME graine, le MEME
-# bruit et le MEME flux RNG : ils ne different que par le contenu insere au retour.
-#
-#   python run_fidelity.py --scenarios scenario01,scenario02      # ou --half A|B|all
-#
-# Prerequis : extract_refs.py (refs/manifest.json + twin/other/main81 .pt).
-# GPU : env longlive, CUDA_VISIBLE_DEVICES=<une carte>, CUDA_DEVICE_ORDER=PCI_BUS_ID.
-# ============================================================================================
+"""ECHELLE de FIDELITE, driver de generation (GPU).
+
+6 barreaux x 10 scenarios, forme A(0-81) B(81-162) A(162-240) via le chemin legacy
+pipeline.inference() (celui des bras oracle1 / oracle1twin / oracle1blur de la batterie
+d'arbitrage, hooks valides). Les 6 bras d'un scenario partagent la MEME graine, le MEME
+bruit et le MEME flux RNG : ils ne different que par le contenu insere au retour.
+
+  python run_fidelity.py --scenarios scenario01,scenario02      # ou --half A|B|all
+
+Prerequis : extract_refs.py (refs/manifest.json + twin/other/main81 .pt).
+GPU : env longlive, CUDA_VISIBLE_DEVICES=<une carte>, CUDA_DEVICE_ORDER=PCI_BUS_ID.
+"""
 import argparse
 import gc
 import json
@@ -42,7 +41,7 @@ for _k, _v in _OFF.items():
 
 
 def two_step_noise(seed, device):
-    """Le bruit de la collecte v2 ([1, 90, ...] sur le generateur GLOBAL apres set_seed),
+    """Le bruit de la collecte v2 ([1, 90, ...] sur le generateur global apres set_seed),
     puis les 150 frames restantes sur un generateur SEPARE : le flux RNG global au premier
     bloc est exactement celui de collect_pairs.rollout_collect -> segment A bit a bit."""
     from utils.misc import set_seed
@@ -105,7 +104,7 @@ def run_arm(pipeline, sid, arm, meta, device):
         return None
     for k, v in C.ARM_ENV[arm].items():
         os.environ[k] = v
-    # dump/verif de l'ancre : TOUT bras dumpe (1er arrive) puis RE-VERIFIE bit a bit que son
+    # dump/verif de l'ancre : tout bras dumpe (1er arrive) puis re-VERIFIE bit a bit que son
     # segment A est le meme (assert du hook) -> integrite "seule l'insertion change"
     os.environ["ORACLE_ANCHOR_DUMP"] = C.anchor_pt(sid)
     if arm == "meme_categorie":

@@ -1,29 +1,28 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ETAPE 1 -- LES SIGNATURES (lecture FONCTIONNELLE de l'etat) + LA BORNE SUPERIEURE.
-#
-# "On passe une batterie fixe d'entrees-sondes a travers le module a poids rapides et on
-#  recueille ses sorties (sa signature comportementale : c'est ainsi que le decodeur le lit,
-#  par requetes)." + renfort (a) : "BORNE SUPERIEURE obligatoire : le MEME pipeline applique
-#  aux activations brutes (qui contiennent tout) doit etre quasi parfait : sinon c'est le
-#  protocole qui est casse, pas la memoire : on construit sur ce cas facile d'abord, PUIS ON NE
-#  CHANGE QUE L'ENTREE."
-#
-# C'est litteralement ce que fait ce fichier : UN SEUL chemin `signature()`, et un flag
-# `--source {state,h}` qui ne change QUE le lecteur d'un bloc :
-#     state -> swiglu_apply(sondes, w0, w1, w2)    (la lecture du decodeur, verbatim)
-#     h     -> lecture associative LINEAIRE des memes sondes sur les tokens h bruts
-# Les deux rendent (n_blocs, n_sondes, 1536) ; tout l'aval (blanchiment, ACP, MLP, evaluation)
-# est identique et ne sait meme pas quelle source a produit le tenseur.
-#
-# Le blanchiment N'EST PAS fait ici : il depend du split (stats du TRAIN uniquement) et vit
-# donc dans train_probe.py. Ici on ne stocke que la signature brute, en float16.
-#
-# Usage :
-#   CUDA_VISIBLE_DEVICES=7 python reference/runs/probe1/build_signatures.py --source state
-#   CUDA_VISIBLE_DEVICES=7 python reference/runs/probe1/build_signatures.py --source h
-#   CUDA_VISIBLE_DEVICES=7 python .../build_signatures.py --source hdirect_masked   # borne v3
-# ============================================================================================
+"""ETAPE 1, les signatures (lecture FONCTIONNELLE de l'etat) + la borne SUPERIEURE.
+
+"On passe une batterie fixe d'entrees-sondes a travers le module a poids rapides et on
+ recueille ses sorties (sa signature comportementale : c'est ainsi que le decodeur le lit,
+ par requetes)." + renfort (a) : "borne SUPERIEURE obligatoire : le MEME pipeline applique
+ aux activations brutes (qui contiennent tout) doit etre quasi parfait : sinon c'est le
+ protocole qui est casse, pas la memoire : on construit sur ce cas facile d'abord, PUIS ON ne
+ change QUE L'entree."
+
+C'est litteralement ce que fait ce fichier : un SEUL chemin `signature()`, et un flag
+`--source {state,h}` qui ne change QUE le lecteur d'un bloc :
+    state -> swiglu_apply(sondes, w0, w1, w2)    (la lecture du decodeur, verbatim)
+    h     -> lecture associative LINEAIRE des memes sondes sur les tokens h bruts
+Les deux rendent (n_blocs, n_sondes, 1536) ; tout l'aval (blanchiment, ACP, MLP, evaluation)
+est identique et ne sait meme pas quelle source a produit le tenseur.
+
+Le blanchiment N'EST pas fait ici : il depend du split (stats du train uniquement) et vit
+donc dans train_probe.py. Ici on ne stocke que la signature brute, en float16.
+
+Usage :
+  CUDA_VISIBLE_DEVICES=7 python reference/runs/probe1/build_signatures.py --source state
+  CUDA_VISIBLE_DEVICES=7 python reference/runs/probe1/build_signatures.py --source h
+  CUDA_VISIBLE_DEVICES=7 python .../build_signatures.py --source hdirect_masked   # borne v3
+"""
 import argparse
 import os
 import sys
@@ -43,7 +42,7 @@ from wan.modules.video_memory import swiglu_apply  # noqa: E402
 from build_states import LIN_SPEC, MLP_SPEC  # noqa: E402  (oracles ecriture, 06-07/08)
 
 LIN_SOURCES = tuple(sorted(LIN_SPEC))
-MLP_SOURCES = tuple(sorted(MLP_SPEC))       # ARM MLP-CORRECTEUR (07/08)
+MLP_SOURCES = tuple(sorted(MLP_SPEC))       # arm MLP-CORRECTEUR (07/08)
 SOURCES = ("state", "h", "hdirect", "hdirect_masked") + LIN_SOURCES + MLP_SOURCES
 
 
@@ -63,16 +62,16 @@ def read_state(probes_b, payload_b):
 def read_h(probes_b, payload_b):
     """probes_b (P, dim), payload_b = h (Lw, dim) -> reponse (P, dim).
 
-    La BORNE SUPERIEURE. L'etat des poids rapides EST une memoire associative NON LINEAIRE
+    La borne SUPERIEURE. L'etat des poids rapides EST une memoire associative non LINEAIRE
     construite a partir de ces h ; la borne superieure lit donc la memoire associative
-    LINEAIRE construite a partir des MEMES h avec les MEMES sondes :
+    LINEAIRE construite a partir des memes h avec les memes sondes :
 
         R(q) = (q h^T) h / (L * dim)   =   q (h^T h) / (L * dim)
 
     Meme forme fonctionnelle (une matrice-memoire lue par une requete), meme forme de sortie,
-    et SURTOUT aucun hyperparametre. C'est la raison du choix : une lecture par attention
-    softmax aurait exige une TEMPERATURE, donc un reglage libre au coeur de la mesure qui
-    decide si le protocole est valide -- exactement ce qu'un juge ne doit pas avoir. Les deux
+    et surtout aucun hyperparametre. C'est la raison du choix : une lecture par attention
+    softmax aurait exige une temperature, donc un reglage libre au coeur de la mesure qui
+    decide si le protocole est valide, exactement ce qu'un juge ne doit pas avoir. Les deux
     constantes de division sont fixes et l'echelle est de toute facon absorbee par le
     blanchiment ; elles ne servent qu'a rester dans la dynamique du stockage."""
     h = payload_b.to(torch.float32)
@@ -83,27 +82,27 @@ def read_h(probes_b, payload_b):
 
 
 def read_hdirect(probes_b, payload_b):
-    """LA BORNE DE VALIDITE v2 (mission 04/08, defaut n 2 du verdict PROTOCOLE INVALIDE) :
-    les activations sont sondees DIRECTEMENT, SANS AUCUNE ECRITURE DANS LA BOUCLE.
+    """La borne de VALIDITE v2 (mission 04/08, defaut n 2 du verdict PROTOCOLE INVALIDE) :
+    les activations sont sondees DIRECTEMENT, sans AUCUNE ECRITURE dans la BOUCLE.
 
-    `read_h` (v1) lisait deja une memoire associative -- lineaire, mais une memoire quand meme
+    `read_h` (v1) lisait deja une memoire associative, lineaire, mais une memoire quand meme
     (q h^T h) : si la forme d'ecriture etait le goulot, la borne le subissait AUSSI, et un echec
     ne separait pas "le materiau ne porte pas l'identite" de "la lecture par sonde ne la voit
     pas". Ici il n'y a plus de sonde du tout du cote de la charge utile : on POOLE les tokens h
     par chunk (moyenne et max sur les tokens), puis on agrege sur tous les chunks ecrits jusqu'a
-    cet age -- ce qui est exactement l'ensemble des activations que l'etat a absorbees (audit
-    A2 : l'ancienne borne ne voyait QUE le dernier write, l'etat les voit TOUS).
+    cet age, ce qui est exactement l'ensemble des activations que l'etat a absorbees (audit
+    A2 : l'ancienne borne ne voyait QUE le dernier write, l'etat les voit tous).
 
-    payload_b = LISTE de tenseurs h (Lw, dim), un par chunk ecrit jusqu'a l'age -- ou, pour
-    `hdirect_masked` (CORRECTIF DE BORNE du 05/08 nuit), une liste de couples (h, tokens
-    retenus). Les DEUX sources partagent CE lecteur, a l'octet pres : la seule difference est
-    QUELS TOKENS entrent dans le pooling, et elle est portee par la charge utile
+    payload_b = LISTE de tenseurs h (Lw, dim), un par chunk ecrit jusqu'a l'age, ou, pour
+    `hdirect_masked` (CORRECTIF de borne du 05/08 nuit), une liste de couples (h, tokens
+    retenus). Les DEUX sources partagent ce lecteur, a l'octet pres : la seule difference est
+    quels tokens entrent dans le pooling, et elle est portee par la charge utile
     (`load_payload`), pas par une branche de lecture. Masque plein => sortie identique bit a
     bit a `hdirect`.
-    Sortie : (dim, 2) -- MEME ORIENTATION que la matrice-reponse des sondes (une ligne = une
+    Sortie : (dim, 2), MEME orientation que la matrice-reponse des sondes (une ligne = une
     unite de reponse, une colonne = une coordonnee) : ligne = canal, colonnes = [moyenne sur les
     tokens, max sur les tokens]. La compression generique (moyenne+max sur les colonnes) s'y
-    applique donc TELLE QUELLE, sans savoir d'ou vient le tenseur -- et sans rien perdre : de
+    applique donc TELLE QUELLE, sans savoir d'ou vient le tenseur, et sans rien perdre : de
     ((m+M)/2, M) on retrouve (m, M) exactement.
     Aucun hyperparametre, aucune sonde, rien a regler."""
     hs = payload_b if isinstance(payload_b, (list, tuple)) else [payload_b]
@@ -124,11 +123,11 @@ def read_hdirect(probes_b, payload_b):
 
 
 def read_lin(probes_b, payload_b):
-    """ORACLE REGLE LINEAIRE : payload_b = W (d, d), fp16 du snapshot -> reponse (P, d).
+    """Oracle regle LINEAIRE : payload_b = W (d, d), fp16 du snapshot -> reponse (P, d).
     "Lecture de W pour les signatures : sorties = W @ sondes" (registre) : la ligne p de la
     reponse est W @ q_p, calculee en fp32 comme read_state (probes @ W^T == (W q)^T ligne a
-    ligne). Meme forme de sortie que read_state, donc TOUT l'aval (compression moyenne+max,
-    blanchiment, tete, evaluation) est bit a bit le meme code. LES QUATRE bras lineaires
+    ligne). Meme forme de sortie que read_state, donc tout l'aval (compression moyenne+max,
+    blanchiment, tete, evaluation) est bit a bit le meme code. Les quatre bras lineaires
     pointent sur CETTE fonction : seule l'ecriture (regle, masque) change, jamais la lecture."""
     W = payload_b.to(torch.float32)
     if W.dim() == 3:
@@ -137,24 +136,24 @@ def read_lin(probes_b, payload_b):
     return probes_b.to(torch.float32) @ W.transpose(0, 1)
 
 
-# `hdirect` et `hdirect_masked` pointent sur LA MEME fonction : un seul chemin de lecture,
+# `hdirect` et `hdirect_masked` pointent sur la MEME fonction : un seul chemin de lecture,
 # verifie par selftest (T5 : READERS["hdirect_masked"] is READERS["hdirect"]).
 READERS = {"state": read_state, "h": read_h, "hdirect": read_hdirect,
            "hdirect_masked": read_hdirect}
-READERS.update({s: read_lin for s in LIN_SOURCES})   # 4 bras, UN lecteur
-# ARM MLP-CORRECTEUR : l'etat reste (w0, w1, w2) d'une cellule SwiGLU -- seule l'ECRITURE
-# change. La LECTURE est donc, litteralement, celle du bras historique `state` : MEME objet
+READERS.update({s: read_lin for s in LIN_SOURCES})   # 4 bras, un lecteur
+# arm MLP-CORRECTEUR : l'etat reste (w0, w1, w2) d'une cellule SwiGLU, seule l'ECRITURE
+# change. La lecture est donc, litteralement, celle du bras historique `state` : MEME objet
 # fonction (selftest D0 : READERS["mlp_delta_all"] is READERS["state"]).
 READERS.update({s: read_state for s in MLP_SOURCES})
-# Les sources dont la charge utile est la SEQUENCE des h ecrits jusqu'a l'age (et non le seul
+# Les sources dont la charge utile est la sequence des h ecrits jusqu'a l'age (et non le seul
 # dernier write) : c'est le correctif de l'asymetrie relevee par l'audit A2.
 SEQ_SOURCES = ("hdirect", "hdirect_masked")
-# Les sources dont la charge utile porte, EN PLUS, le masque-sujet par chunk.
+# Les sources dont la charge utile porte, en plus, le masque-sujet par chunk.
 MASKED_SOURCES = ("hdirect_masked",)
 
 
 # ---------------------------------------------------------------------------------------------
-# LA COMPRESSION (defaut n 1 du verdict PROTOCOLE INVALIDE : 1 179 648 dimensions pour 36
+# la compression (defaut n 1 du verdict PROTOCOLE INVALIDE : 1 179 648 dimensions pour 36
 # videos d'entrainement, c'est-a-dire 8 000 dimensions par exemple).
 # ---------------------------------------------------------------------------------------------
 def compress_signature(sig):
@@ -177,8 +176,8 @@ def compress_signature(sig):
 # ---------------------------------------------------------------------------------------------
 @torch.no_grad()
 def signature(source, probes, payload, blocks):
-    """probes (n_blocs, P, dim) ; payload {bloc: charge utile} ; -> (n_blocs, lignes, cols) fp32.
-    UN SEUL chemin pour la borne de validite et pour les etats : seul `source` change, et il ne
+    """Probes (n_blocs, P, dim) ; payload {bloc: charge utile} ; -> (n_blocs, lignes, cols) fp32.
+    un SEUL chemin pour la borne de validite et pour les etats : seul `source` change, et il ne
     selectionne qu'un lecteur par bloc. La matrice-reponse d'un bloc est toujours 2-D et de
     MEME forme pour tous les blocs ; l'aval (compression, blanchiment, tete, evaluation) ne
     sait pas quelle source l'a produite."""
@@ -218,11 +217,11 @@ def load_payload(source, meta, age, cache, blocks, device, states=None, state_di
     (oracle_maskwrite/states_<bras>/) ; None = le repertoire historique, INCHANGE."""
     if source in LIN_SOURCES:
         # oracle regle lineaire : W vient TOUJOURS du rejeu en memoire (mode --stream,
-        # lin_states) -- il n'existe aucun stockage disque de W.
+        # lin_states), il n'existe aucun stockage disque de W.
         assert states is not None, f"source {source}: mode --stream obligatoire"
         return {b: states[int(age["i"])][b].to(device) for b in blocks}
     if source in MLP_SOURCES:
-        # ARM MLP-CORRECTEUR : etat (w0, w1, w2) rejoue a la volee (--stream obligatoire :
+        # arm MLP-CORRECTEUR : etat (w0, w1, w2) rejoue a la volee (--stream obligatoire :
         # aucun etat correcteur n'est materialise sur disque), charge utile IDENTIQUE a `state`.
         assert states is not None, f"source {source}: mode --stream obligatoire"
         return {b: tuple(t.to(device) for t in states[int(age["i"])][b]) for b in blocks}
@@ -237,12 +236,12 @@ def load_payload(source, meta, age, cache, blocks, device, states=None, state_di
         return {b: tuple(t.to(device) for t in ck["state"][b]) for b in blocks}
     rec = D.get_record(meta, cache)
     if source in SEQ_SOURCES:
-        # TOUS les h ecrits jusqu'a cet age (l'etat, lui, les a tous absorbes)
+        # tous les h ecrits jusqu'a cet age (l'etat, lui, les a tous absorbes)
         seqs = {b: rec["h_seq"][str(b)][:int(age["i"]) + 1] for b in blocks}
         if source not in MASKED_SOURCES:
             return {b: [t.to(device) for t in s] for b, s in seqs.items()}
         # LE SEUL embranchement de `hdirect_masked` : on attache a chaque chunk les tokens
-        # sous le masque-sujet. Le masque ne depend PAS du bloc (c'est une geometrie d'image) :
+        # sous le masque-sujet. Le masque ne depend pas du bloc (c'est une geometrie d'image) :
         # il est calcule une fois et partage, ce qui garantit que les 3 blocs poolent
         # exactement les memes positions.
         grids = C.video_mask_grids(meta["video_id"])
@@ -262,7 +261,7 @@ def load_payload(source, meta, age, cache, blocks, device, states=None, state_di
 
 def stream_states(meta, ages, cache, blocks, device, cells=None, keep=None, grad_fn=None,
                   micro_batch=None):
-    """Rejoue les ecritures d'UNE video et rend les etats aux ages demandes SANS RIEN ECRIRE SUR
+    """Rejoue les ecritures d'UNE video et rend les etats aux ages demandes sans RIEN ECRIRE sur
     LE DISQUE (170 MB par etat : 4 ages x 165 videos = 112 GB qu'on n'a pas). Le rejeu est
     exactement `build_states.replay_video`, donc la trajectoire est celle de l'inference.
     `keep` (ADDITIF oracle 06/08) : liste de tokens gardes par ecriture (`maskwrite_keep`) --
@@ -397,7 +396,7 @@ def main():
         elif cells is not None and todo:
             keep = None
             if args.source in MLP_SOURCES:
-                # BRAS MLP : le masque est porte par le NOM DU BRAS (comme les bras lineaires),
+                # bras MLP : le masque est porte par le NOM DU bras (comme les bras lineaires),
                 # jamais par --write-mask ; meme chemin de masque que l'oracle masque
                 # (maskwrite_keep -> C.chunk_token_mask, min_frac=0.0). L'objectif, le
                 # calendrier et le pas viennent de la table MLP_ARMS, via `mlp_arm`.
@@ -437,7 +436,7 @@ def main():
             sig16 = sig.to(torch.float16)
             assert torch.isfinite(sig16).all(), \
                 (f"{meta['video_id']}/{age['name']}: reponse hors dynamique fp16 "
-                 f"(|max| = {amax:.4g}) -- repasser le stockage en float32")
+                 f"(|max| = {amax:.4g}), repasser le stockage en float32")
             os.makedirs(os.path.dirname(p), exist_ok=True)
             torch.save({"sig": sig16.cpu(), "source": args.source, "sig_tag": src_tag,
                         "video_id": meta["video_id"], "age": age["name"],

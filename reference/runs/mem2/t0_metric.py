@@ -1,34 +1,33 @@
 #!/usr/bin/env python
-# ============================================================================================
-# MEMOIRE 2.1 -- LA METRIQUE T0 (correlation bande-basse), PARTAGEE par le builder de banque,
-# le trainer, le pre-ecran et les selftests.  UNE seule definition, importee partout.
-#
-# POURQUOI T0 ET PAS DINO / LE COSINUS LATENT (les deux termes d'instance deja morts) :
-#   - DINO (phase B) : gate pos_gap = -0.185, 10/10 val negatives, et la dose-reponse de flou
-#     montre que meme la VERITE TERRAIN floutee a sigma=8 px echoue le gate. Le cosinus DINO
-#     d'une image hors-variete mesure "a quel point c'est flou", pas "qui c'est".
-#   - cosinus latent crop60 (J3) : pos_gap -0.19..-0.36 a tous les poolings, centre ou non.
-#   - T0 est la SEULE metrique du dossier qui (a) VOIT le defaut (elle mesure ancre vs A* +0.042
-#     contre vs B +0.298, B > A sur 21/24, p = 3e-4) et (b) TOLERE le flou par construction
-#     (moyenne n x n : elle vit dans la bande que le decodeur atteint reellement).
-#
-# DEFINITION GELEE (identique a reference/runs/reid_scen/prescreen_offensif.lowband, verifiee
-# BITWISE par selftest_t0.py test 1 -- la fonction de reference est importee, pas recopiee) :
-#     frames (T,3,H,W) in [0,1] -> niveaux de gris 0.299/0.587/0.114
-#                               -> adaptive_avg_pool2d(n) -> aplatir
-#                               -> CENTRER par frame -> L2-normaliser
-#     corr(ancre, ensemble) = moyenne sur les frames de l'ensemble du produit scalaire.
-# Deux vecteurs unitaires centres : le produit scalaire EST la correlation de Pearson.
-#
-# VARIANTE LATENTE (l'espace a departager, regle D0 du registre) : memes operations sur le
-# latent (B,16,60,104), avec deux reductions de canal possibles
-#     'chan' : pooling n x n PAR CANAL   -> dim 16*n*n (garde la couleur/structure par canal)
-#     'gray' : moyenne des 16 canaux     -> dim n*n    (l'analogue exact du niveau de gris)
-# Le choix est fait par space_decision_t0.py (regle D0 scellee), pas par gout.
-#
-# TOUT EST DIFFERENTIABLE cote ancre (c'est le point : le gradient du terme T0 remonte par le
-# decodeur jusqu'a l'ecrivain). Aucune operation en place, aucun no_grad ici.
-# ============================================================================================
+"""MEMOIRE 2.1, la METRIQUE T0 (correlation bande-basse), PARTAGEE par le builder de banque,
+le trainer, le pre-ecran et les selftests.  UNE seule definition, importee partout.
+
+POURQUOI T0 ET pas DINO / LE COSINUS latent (les deux termes d'instance deja morts) :
+  - DINO (phase B) : gate pos_gap = -0.185, 10/10 val negatives, et la dose-reponse de flou
+    montre que meme la verite terrain floutee a sigma=8 px echoue le gate. Le cosinus DINO
+    d'une image hors-variete mesure "a quel point c'est flou", pas "qui c'est".
+  - cosinus latent crop60 (J3) : pos_gap -0.19..-0.36 a tous les poolings, centre ou non.
+  - T0 est la SEULE metrique du dossier qui (a) VOIT le defaut (elle mesure ancre vs A* +0.042
+    contre vs B +0.298, B > A sur 21/24, p = 3e-4) et (b) TOLERE le flou par construction
+    (moyenne n x n : elle vit dans la bande que le decodeur atteint reellement).
+
+Definition GELEE (identique a reference/runs/reid_scen/prescreen_offensif.lowband, verifiee
+bitwise par selftest_t0.py test 1, la fonction de reference est importee, pas recopiee) :
+    frames (T,3,H,W) in [0,1] -> niveaux de gris 0.299/0.587/0.114
+                              -> adaptive_avg_pool2d(n) -> aplatir
+                              -> CENTRER par frame -> L2-normaliser
+    corr(ancre, ensemble) = moyenne sur les frames de l'ensemble du produit scalaire.
+Deux vecteurs unitaires centres : le produit scalaire EST la correlation de Pearson.
+
+VARIANTE LATENTE (l'espace a departager, regle D0 du registre) : memes operations sur le
+latent (B,16,60,104), avec deux reductions de canal possibles
+    'chan' : pooling n x n par canal   -> dim 16*n*n (garde la couleur/structure par canal)
+    'gray' : moyenne des 16 canaux     -> dim n*n    (l'analogue exact du niveau de gris)
+Le choix est fait par space_decision_t0.py (regle D0 scellee), pas par gout.
+
+Tout EST differentiable cote ancre (c'est le point : le gradient du terme T0 remonte par le
+decodeur jusqu'a l'ecrivain). Aucune operation en place, aucun no_grad ici.
+"""
 import math
 
 import torch
@@ -42,9 +41,9 @@ GRAY_W = (0.299, 0.587, 0.114)
 def _finish(z, eps=1e-6, return_scale=False):
     """Aplatir -> centrer par frame -> L2-normaliser. Deux sorties de _finish ont un produit
     scalaire EGAL a la correlation de Pearson de leurs entrees.
-    `return_scale` renvoie EN PLUS la norme AVANT normalisation (= le CONTRASTE de la bande
+    `return_scale` renvoie en plus la norme AVANT normalisation (= le CONTRASTE de la bande
     basse, exactement ce que la normalisation efface). C'est le tripwire anti-effondrement de
-    G1, et il doit vivre dans l'espace de la metrique -- AUDIT 2026-08-04."""
+    G1, et il doit vivre dans l'espace de la metrique, audit 2026-08-04."""
     z = z.flatten(1)
     z = z - z.mean(1, keepdim=True)
     s = z.norm(dim=1, keepdim=True).clamp_min(eps)
@@ -81,10 +80,10 @@ def t0_embed(x, space, n=DEFAULT_N, lat_mode="chan", vae=None, use_checkpoint=Fa
              return_scale=False):
     """L'entree unique du terme T0 et de la banque.
       space='latent' : x = frames latentes (B,16,60,104) ou (B,1,...)   -> lowband_lat
-      space='pixel'  : x = frames latentes -> VAE decode (DIFFERENTIABLE) -> lowband_px
+      space='pixel'  : x = frames latentes -> VAE decode (differentiable) -> lowband_px
     Le VAE n'est jamais appele en espace latent (le terme reste gratuit).
     `return_scale` renvoie (z, contraste) ou le contraste est l'ecart-type spatial de la bande
-    basse DANS L'ESPACE DE LA METRIQUE (tripwire G1)."""
+    basse dans L'ESPACE de la METRIQUE (tripwire G1)."""
     if space == "latent":
         return lowband_lat(x, n=n, mode=lat_mode, return_scale=return_scale)
     if space == "pixel":
@@ -101,7 +100,7 @@ def t0_dim(space, n=DEFAULT_N, lat_mode="chan", C=16):
 
 # ----------------------------- correlations -------------------------------------------------------
 def corr_set(z, E):
-    """z (K,D) ancres unitaires, E (M,D) references unitaires -> (K,) correlation MOYENNE de
+    """z (K,D) ancres unitaires, E (M,D) references unitaires -> (K,) correlation moyenne de
     chaque ancre avec l'ensemble E. C'est exactement `corr()` de prescreen_offensif applique a
     un ensemble de frames (moyenne des produits scalaires)."""
     assert z.dim() == 2 and E.dim() == 2 and z.shape[1] == E.shape[1], \
@@ -110,7 +109,7 @@ def corr_set(z, E):
 
 
 def t0_margin(z, E_a, E_b):
-    """LA quantite des gates : corr(ancre, A) - corr(ancre, B). Mesuree aujourd'hui a
+    """La quantite des gates : corr(ancre, A) - corr(ancre, B). Mesuree aujourd'hui a
     -0.256 (24 cellules S2 : +0.042 vs +0.298)."""
     return corr_set(z, E_a) - corr_set(z, E_b)
 
@@ -118,7 +117,7 @@ def t0_margin(z, E_a, E_b):
 # ----------------------------- la perte -----------------------------------------------------------
 def t0_loss(z, E_a, E_b, E_o, tau=0.10, m0=0.30, kind="both", w_margin=1.0, w_b=1.0):
     """Terme contrastif T0 sur l'ancre decodee.
-        z   (K,D) ancres decodees (unitaires, DIFFERENTIABLES)
+        z   (K,D) ancres decodees (unitaires, differentiables)
         E_a (Na,D) frames du segment A de la MEME video       -> POSITIFS
         E_b (Nb,D) frames du segment B de la MEME video       -> NEGATIFS DURS (l'interlude)
         E_o (No,D) frames des AUTRES videos (jumeau inclus)   -> NEGATIFS
@@ -160,8 +159,8 @@ def t0_loss(z, E_a, E_b, E_o, tau=0.10, m0=0.30, kind="both", w_margin=1.0, w_b=
 
 
 def anchor_spatial_std(x, space="latent"):
-    """Ecart-type spatial du LATENT de l'ancre (diagnostic secondaire).
-    AUDIT 2026-08-04 : cette fonction IGNORE `space` -- elle mesure toujours le latent. Le
+    """Ecart-type spatial du latent de l'ancre (diagnostic secondaire).
+    audit 2026-08-04 : cette fonction ignore `space`, elle mesure toujours le latent. Le
     tripwire anti-Goodhart de G1 doit vivre dans l'espace de la METRIQUE (un latent bruite peut
     tres bien decoder en une image plate) ; il passe donc par `t0_embed(..., return_scale=True)`.
     Gardee pour le diagnostic latent uniquement."""

@@ -1,44 +1,43 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ECHELLE DE FIDELITE (ETAPE 0 du plan reference/plan_entrainement_video_2026-08-07.md).
-#
-# Scenario de revisite A -> B -> A (forme S1 du harnais reid_scen : A(0-81) B(81-162)
-# A(162-240), 240 frames latentes). Au retour (frame 162), UNE frame latente est inseree dans
-# la fenetre KV par le canal valide (+0.83) : ORACLE_SPLICE=1 / ORACLE_SPLICE_FRAMES=1, la
-# frame inseree REMPLACE le slot de recence. Les 6 barreaux ne different QUE par le CONTENU
-# de cette frame (meme prompt, meme graine, meme schedule, meme flux RNG) :
-#
-#   rien            aucune insertion (memzero verbatim)
-#   oracle          la vraie frame latente 80 du segment A de CE rollout (bras oracle1)
-#   flou_leger      la meme, VAE decode -> flou gaussien sigma=6 px -> VAE encode
-#                   (hook ORACLE_BLUR_SIGMA, bras oracle1blur de la batterie d'arbitrage)
-#   flou_fort       idem, sigma=24 px (= la fidelite documentee de nos decodeurs :
-#                   "the decoded anchor sits beyond sigma=32 px in DINO space", et le
-#                   bras oracle1blur historique tournait a sigma=24)
-#   meme_categorie  la frame latente 80 du JUMEAU v2 (meme prompt, graine +100000), lue
-#                   dans les shards du corpus v2 (hook ORACLE_ANCHOR_SRC, bras oracle1twin)
-#   autre_categorie la frame latente 80 de la video v2 PRINCIPALE d'un AUTRE scenario,
-#                   d'une autre categorie (tirage deterministe : donor = (i+5) % 10)
-#
-# MATERIAU : 10 paires du corpus v2 (30 paires meme-prompt sans attribut), toutes dans la
-# liste scellee ADEN_V2_STRONG_19 (sujets juges DISTINGUABLES par l'oeil d'Aden, registre
-# 05/08). Plage de numeros de planche v2 : board_no = corpus_idx - 9000000 + 1 (l'ordre
-# lexicographique des video_id "main:90000xx" est l'ordre numerique, verifie par selftest).
-#
-# REPRODUCTION BIT A BIT DU SEGMENT A : la graine du rollout = la graine v2 de la video
-# principale (config.seed 42 + 500000 + corpus_idx, lue dans l'index, jamais recalculee a
-# l'aveugle), et le bruit est tire en DEUX temps : d'abord torch.randn([1, 90, ...]) sur le
-# generateur GLOBAL (exactement ce que collect_pairs.rollout_collect a consomme), puis les
-# 150 frames restantes sur un torch.Generator SEPARE (le flux global n'est pas touche). Les
-# blocs 0..26 (frames 0..80) consomment ensuite les memes tirages add_noise que la collecte
-# -> segment A identique a la video v2 que l'oeil d'Aden a jugee (verifie contre les latents
-# stockes par run_fidelity, non fatal : en cas d'ecart residuel (autre carte GPU), on decode
-# les deux frames 80 et l'ecart est documente au rapport).
-#
-# ANONYMISATION : fichiers scenarioNN_L.mp4 (L dans A..F), permutation des barreaux par
-# scenario tiree d'un hash deterministe (sel fige ci-dessous), table de correspondance dans
-# reference/runs/fidelity_ladder/key.json UNIQUEMENT.
-# ============================================================================================
+"""ECHELLE de FIDELITE (ETAPE 0 du plan reference/plan_entrainement_video_2026-08-07.md).
+
+Scenario de revisite A -> B -> A (forme S1 du harnais reid_scen : A(0-81) B(81-162)
+A(162-240), 240 frames latentes). Au retour (frame 162), UNE frame latente est inseree dans
+la fenetre KV par le canal valide (+0.83) : ORACLE_SPLICE=1 / ORACLE_SPLICE_FRAMES=1, la
+frame inseree REMPLACE le slot de recence. Les 6 barreaux ne different QUE par le CONTENU
+de cette frame (meme prompt, meme graine, meme schedule, meme flux RNG) :
+
+  Rien            aucune insertion (memzero verbatim)
+  oracle          la vraie frame latente 80 du segment A de ce rollout (bras oracle1)
+  flou_leger      la meme, VAE decode -> flou gaussien sigma=6 px -> VAE encode
+                  (hook ORACLE_BLUR_SIGMA, bras oracle1blur de la batterie d'arbitrage)
+  flou_fort       idem, sigma=24 px (= la fidelite documentee de nos decodeurs :
+                  "the decoded anchor sits beyond sigma=32 px in DINO space", et le
+                  bras oracle1blur historique tournait a sigma=24)
+  meme_categorie  la frame latente 80 du JUMEAU v2 (meme prompt, graine +100000), lue
+                  dans les shards du corpus v2 (hook ORACLE_ANCHOR_SRC, bras oracle1twin)
+  autre_categorie la frame latente 80 de la video v2 PRINCIPALE d'un AUTRE scenario,
+                  d'une autre categorie (tirage deterministe : donor = (i+5) % 10)
+
+MATERIAU : 10 paires du corpus v2 (30 paires meme-prompt sans attribut), toutes dans la
+liste scellee ADEN_V2_STRONG_19 (sujets juges DISTINGUABLES par l'oeil d'Aden, registre
+05/08). Plage de numeros de planche v2 : board_no = corpus_idx - 9000000 + 1 (l'ordre
+lexicographique des video_id "main:90000xx" est l'ordre numerique, verifie par selftest).
+
+Reproduction bit A bit DU segment A : la graine du rollout = la graine v2 de la video
+principale (config.seed 42 + 500000 + corpus_idx, lue dans l'index, jamais recalculee a
+l'aveugle), et le bruit est tire en DEUX temps : d'abord torch.randn([1, 90, ...]) sur le
+generateur global (exactement ce que collect_pairs.rollout_collect a consomme), puis les
+150 frames restantes sur un torch.Generator SEPARE (le flux global n'est pas touche). Les
+blocs 0..26 (frames 0..80) consomment ensuite les memes tirages add_noise que la collecte
+-> segment A identique a la video v2 que l'oeil d'Aden a jugee (verifie contre les latents
+stockes par run_fidelity, non fatal : en cas d'ecart residuel (autre carte GPU), on decode
+les deux frames 80 et l'ecart est documente au rapport).
+
+ANONYMISATION : fichiers scenarioNN_L.mp4 (L dans A..F), permutation des barreaux par
+scenario tiree d'un hash deterministe (sel fige ci-dessous), table de correspondance dans
+reference/runs/fidelity_ladder/key.json UNIQUEMENT.
+"""
 import hashlib
 import json
 import os
@@ -74,11 +73,11 @@ BLUR_SIGMA_LIGHT = 6.0    # px a 480x832 : adoucissement visible, details fins p
 BLUR_SIGMA_STRONG = 24.0  # px : le niveau documente de nos decodeurs (bras oracle1blur)
 
 # ---- les 10 scenarios ------------------------------------------------------------------------
-# board_no dans ADEN_V2_STRONG_19 (labels scelles 05/08). Prompts VERBATIM du manifeste v2
+# board_no dans ADEN_V2_STRONG_19 (labels scelles 05/08). Prompts verbatim du manifeste v2
 # (verifies contre l'index par selftest). Interludes B choisis dans les prompts d'interlude
 # eprouves du harnais reid_scen (scenarios.py), en evitant toute collision de categorie avec
 # le sujet A ET avec le sujet du donneur `autre_categorie`.
-# donor = scenario (i+5) % 10 : les 10 appariements sont TOUS inter-categories (selftest).
+# donor = scenario (i+5) % 10 : les 10 appariements sont tous inter-categories (selftest).
 SCENARIOS = [
     {"sid": "scenario01", "board_no": 5, "cidx": 9000004, "category": "person",
      "prompt": "a farmer walks between rows of crops in a field",
@@ -121,7 +120,7 @@ def donor_of(i):
 
 # ---- table des bras --------------------------------------------------------------------------
 # Copie LITTERALE de run_reid_probe._OFF (l'union des cles que chaque bras remet a zero,
-# lecon MEM_WRITER) + les cles ajoutees par les campagnes ulterieures. run_fidelity verifie a
+# lecon MEM_WRITER) + les cles ajoutees par les campagnes ulterieures. Run_fidelity verifie a
 # l'import que cette copie COUVRE run_reid_probe._OFF avec les memes valeurs (aucune derive
 # silencieuse possible).
 OFF = {"MEM_ZERO_ALL": "0", "MEM_EPISODIC": "0", "ORACLE_SPLICE": "0",
@@ -140,7 +139,7 @@ OFF = {"MEM_ZERO_ALL": "0", "MEM_EPISODIC": "0", "ORACLE_SPLICE": "0",
        "MEM_DECODE_ROUTED": "0", "MEM_DECODE_COMPOSITE": "0", "MEM_ADDITIVE_KV": "0",
        "MEM_DECODE_SLOT_OFFSET": "-1", "MEM_ANCHOR_T": "0", "MEM_EVICT_DEBUG": "0"}
 
-# ordre canonique des barreaux (celui de la permutation d'anonymisation, PAS celui des
+# ordre canonique des barreaux (celui de la permutation d'anonymisation, pas celui des
 # fichiers livres : les lettres A..F sont permutees par scenario)
 ARMS = ("oracle", "flou_leger", "flou_fort", "meme_categorie", "autre_categorie", "rien")
 
@@ -180,7 +179,7 @@ def letter_perm(sid):
 
 # ---- refs ------------------------------------------------------------------------------------
 def anchor_pt(sid):
-    """Dump natif (bf16) de la frame 80 du rollout `rien` de CE scenario (hook
+    """Dump natif (bf16) de la frame 80 du rollout `rien` de ce scenario (hook
     ORACLE_ANCHOR_DUMP) ; re-verifie bit a bit par tous les autres bras."""
     return os.path.join(REFS_DIR, f"anchor_{sid}.pt")
 

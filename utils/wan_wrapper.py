@@ -21,17 +21,17 @@ import os
 class WanTextEncoder(torch.nn.Module):
     """Text encoder, with an on-disk cache and optionally lazy construction.
 
-    TWO ADDITIONS (2026-09-09), both inert by default on the original install:
+    Two additions (2026-09-09), both inert by default on the original install:
 
     1. `forward` consults the embedding cache first (utils/prompt_cache). A cached prompt
-       returns the tensor EXACTLY as it was produced, same dtype, so the output is bitwise
+       returns the tensor exactly as it was produced, same dtype, so the output is bitwise
        identical to an uncached run. Always on: it is a pure time saving (encoding one prompt
        costs ~90 s here) with no effect on results.
 
-    2. AF_LAZY_TEXT_ENCODER=1 defers CONSTRUCTION of the 11.4 GB until the first prompt that
+    2. AF_LAZY_TEXT_ENCODER=1 defers construction of the 11.4 GB until the first prompt that
        misses the cache. With a full cache the encoder is never built and the memory stays with
-       the generator. By default the flag is absent and loading stays EAGER, exactly as before
-       -- the CUDA path is untouched, including its interaction with DynamicSwapInstaller, which
+       the generator. By default the flag is absent and loading stays eager, exactly as before
+      , the CUDA path is untouched, including its interaction with DynamicSwapInstaller, which
        walks the submodules at install time.
     """
 
@@ -41,7 +41,7 @@ class WanTextEncoder(torch.nn.Module):
         self._lazy = os.environ.get("AF_LAZY_TEXT_ENCODER", "") == "1"
         self.text_encoder = None
         self._resident_device = af_device
-        # DTYPE PROBE. inference.py does `pipeline = pipeline.to(dtype=torch.bfloat16)`, which
+        # DTYPE probe. Inference.py does `pipeline = pipeline.to(dtype=torch.bfloat16)`, which
         # casts this encoder too. In lazy mode it does not exist yet at that moment and would
         # escape the cast; this buffer does undergo it, and tells us which precision the pipeline
         # wants to work in. Without it the cache would hand float32 to a bfloat16 model (Metal
@@ -71,7 +71,7 @@ class WanTextEncoder(torch.nn.Module):
                        map_location='cpu', weights_only=False)
         )
         
-        # The text encoder stays on CPU except on CUDA -- that is the ORIGINAL semantics
+        # The text encoder stays on CPU except on CUDA, that is the original semantics
         # (`if torch.cuda.is_available()`), and it was right.
         #
         # 2026-09-09, fixing a mistake introduced earlier the same day: generalising this test to
@@ -81,18 +81,18 @@ class WanTextEncoder(torch.nn.Module):
         # RAM on each access, and it can do nothing if the model is already on the device.
         if torch.cuda.is_available():
             self.text_encoder = self.text_encoder.cuda()
-        # where the weights actually RESIDE, so inputs can be sent there
+        # where the weights actually reside, so inputs can be sent there
         self._resident_device = next(self.text_encoder.parameters()).device
 
 
     @property
     def device(self):
-        """The device to send inputs to. It is NOT necessarily the accelerator.
+        """The device to send inputs to. It is not necessarily the accelerator.
 
-        Three cases, and confusing them gives "Passed CPU tensor to MPS op":
+        Three cases, and confusing them gives "Passed CPU tensor to mps op":
           - model not built yet (lazy mode) -> the accelerator, by default;
           - model wrapped by DynamicSwapInstaller -> its weights are streamed to the accelerator
-            on EVERY access, so the inputs must be there too;
+            on every access, so the inputs must be there too;
           - otherwise -> wherever the model actually resides (CPU off CUDA, since the original
             semantics were restored).
         """
@@ -118,10 +118,10 @@ class WanTextEncoder(torch.nn.Module):
         return context
 
     def forward(self, text_prompts: List[str]) -> dict:
-        """Cache first, encoder second, and ONLY for the missing prompts.
+        """Cache first, encoder second, and only for the missing prompts.
 
         Missing prompts are encoded in a single batch (the encoder works batch-wise) then written
-        to the cache. The result is reassembled in INPUT ORDER: shuffling the rows would pair a
+        to the cache. The result is reassembled in input order: shuffling the rows would pair a
         prompt with another one's conditioning, an error that raises no exception and would
         falsify an entire campaign."""
         want = self._dtype_probe.dtype

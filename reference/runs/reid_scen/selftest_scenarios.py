@@ -1,34 +1,33 @@
 #!/usr/bin/env python
-# ============================================================================================
-# MANDATORY selftests for the scenario matrix + the Echo-Forcing-style frame-bank baseline.
-#
-#   (a) LEGACY BITWISE   : pipeline.inference_schedule() with the legacy [(0,A),(sw1,B),(sw2,A)]
-#                          schedule == pipeline.inference() bitwise, on memzero / oracle /
-#                          oracle1 / oracle3b / memdec20. This is what makes the whole thing
-#                          "additive": the existing campaigns stay reproducible.
-#   (b) FRAMEBANK == ORACLE1 : on A->B->A the pool holds a single A scene, so the bank ceiling
-#                          (framebank_oracle) AND the real router (framebank) must splice the
-#                          exact frame oracle1 splices -> bitwise equality, i.e. the baseline
-#                          differs from the upper bound ONLY by its selection.
-#   (c) NO ENV LEAK      : memzero replayed AFTER every other arm == the first memzero bitwise.
-#   (d) FIRST-APPEARANCE SCORING : synthetic S2-shaped videos where the textures are known.
-#                          Video 1 (honest) must score ~1; video 2 (segment 0 repainted with the
-#                          revisit texture, first appearance repainted differently) must score
-#                          LOW -- a "always compare to segment 0" bug scores ~1 there.
-#   (g) MEM_DECODE SPLICE GATING : the decoded anchor must fire ONLY when a subject that has
-#                          already been seen re-enters -- 0 splice on the opening switch and on
-#                          every fresh scene, 1 in S2/S3, 2 in S4. Counted from the
-#                          "[MEM_DECODE] decoded anchor spliced" lines of a real rollout. Also
-#                          covers MEM_DECODE_ROUTED (arm memdec20r): same QUAND as framebank
-#                          (its router's own decision), and BITWISE legacy when the variable is
-#                          absent from the environment.
-#   (e) py_compile        : every file touched.
-#   (f) HELD-OUT GREP     : none of the 36 scenario prompts appears in the writer/decoder
-#                          training corpus (nor in the v3 shards actually on disk).
-#
-# CPU-only subset:  python selftest_scenarios.py --cpu-only        (e, f, and the index math)
-# Full (needs a GPU with >25 GB free):  python selftest_scenarios.py
-# ============================================================================================
+"""Mandatory selftests for the scenario matrix + the Echo-Forcing-style frame-bank baseline.
+
+  (a) legacy bitwise   : pipeline.inference_schedule() with the legacy [(0,A),(sw1,B),(sw2,A)]
+                         schedule == pipeline.inference() bitwise, on memzero / oracle /
+                         oracle1 / oracle3b / memdec20. This is what makes the whole thing
+                         "additive": the existing campaigns stay reproducible.
+  (b) FRAMEBANK == ORACLE1 : on A->B->A the pool holds a single A scene, so the bank ceiling
+                         (framebank_oracle) and the real router (framebank) must splice the
+                         exact frame oracle1 splices -> bitwise equality, i.e. the baseline
+                         differs from the upper bound only by its selection.
+  (c) no ENV leak      : memzero replayed after every other arm == the first memzero bitwise.
+  (d) first-appearance scoring : synthetic S2-shaped videos where the textures are known.
+                         Video 1 (honest) must score ~1; video 2 (segment 0 repainted with the
+                         revisit texture, first appearance repainted differently) must score
+                         low, a "always compare to segment 0" bug scores ~1 there.
+  (g) MEM_DECODE splice gating : the decoded anchor must fire only when a subject that has
+                         already been seen re-enters, 0 splice on the opening switch and on
+                         every fresh scene, 1 in S2/S3, 2 in S4. Counted from the
+                         "[MEM_DECODE] decoded anchor spliced" lines of a real rollout. Also
+                         covers MEM_DECODE_ROUTED (arm memdec20r): same QUAND as framebank
+                         (its router's own decision), and bitwise legacy when the variable is
+                         absent from the environment.
+  (e) py_compile        : every file touched.
+  (f) HELD-OUT GREP     : none of the 36 scenario prompts appears in the writer/decoder
+                         training corpus (nor in the v3 shards actually on disk).
+
+CPU-only subset:  python selftest_scenarios.py --cpu-only        (e, f, and the index math)
+Full (needs a GPU with >25 GB free):  python selftest_scenarios.py
+"""
 import argparse
 import json
 import os
@@ -52,14 +51,12 @@ _RESULTS = []
 
 def check(name, ok, detail=""):
     _RESULTS.append((name, bool(ok), detail))
-    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  --  {detail}" if detail else ""),
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f": {detail}" if detail else ""),
           flush=True)
     assert ok, f"SELFTEST FAILED: {name} ({detail})"
 
 
-# ============================================================================================
 # (e) py_compile
-# ============================================================================================
 def test_e_compile():
     files = [os.path.join(REPO, "pipeline/switch_causal_inference.py"),
              os.path.join(HERE, "scenarios.py"),
@@ -73,9 +70,7 @@ def test_e_compile():
               r.stderr.strip()[:200])
 
 
-# ============================================================================================
 # (f) held-out grep: the scenario prompts must be absent from the training corpus
-# ============================================================================================
 def test_f_heldout():
     import scenarios as S
     from collect_pairs import find_l1_corpus_path, _norm_text
@@ -117,9 +112,7 @@ def test_f_heldout():
     check("(f) TRIPLES[0:8][:2] == the 8 legacy PAIRS verbatim", ok)
 
 
-# ============================================================================================
 # index math / schedule bookkeeping (pure python, no GPU)
-# ============================================================================================
 def test_schedule_math():
     import scenarios as S
     exp = {
@@ -145,10 +138,10 @@ def test_schedule_math():
         ok = all(bounds[i][0] < wins[i][0] and wins[i][1] < bounds[i][1] for i in wins)
         check(f"(d0) {scen} scoring windows stay strictly inside their segment", ok,
               f"{wins} in {bounds}")
-    # S2's re-ID reference is segment 1, NOT the opening -- the whole point of the matrix
+    # S2's re-ID reference is segment 1, not the opening, the whole point of the matrix
     check("(d0) S2 re-ID reference is the NON-OPENING segment 1",
           S.first_appearance("S2")[S.seg_roles("S2")[3]] == 1)
-    # the paraphrase variants must keep EXACTLY the same subject bookkeeping while changing the
+    # the paraphrase variants must keep exactly the same subject bookkeeping while changing the
     # prompt index of every revisit (that is the whole point: same experiment, harder routing)
     for base in ("S2", "S3", "S4"):
         p = base + "p"
@@ -165,10 +158,8 @@ def test_schedule_math():
               f"prompt indices {pi}, revisits {rev}")
 
 
-# ============================================================================================
-# (ss) SAME-SCENE tier: the prompts of a same-scene triple must describe ONE decor and differ
+# (ss) same-scene tier: the prompts of a same-scene triple must describe one decor and differ
 #      only by the subject, and the SS scenarios must be the S2 / S1 shapes on that tier.
-# ============================================================================================
 def test_ss_samescene():
     import scenarios as S
 
@@ -182,7 +173,7 @@ def test_ss_samescene():
         check(f"(ss) triple {i}: the 3 prompts share a verbatim scene clause (>= 8 words)",
               len(suf.split()) >= 8 and all(p.endswith(suf) for p in (A, B, C)),
               f"'{suf}'")
-        # A and B differ ONLY by their leading subject clause: identical from the scene clause on
+        # A and B differ only by their leading subject clause: identical from the scene clause on
         check(f"(ss) triple {i}: A and B differ only by the subject",
               A[: -len(suf)] != B[: -len(suf)] and A != B,
               f"A subject='{A[: -len(suf)].strip()}' | B subject='{B[: -len(suf)].strip()}'")
@@ -211,9 +202,7 @@ def test_ss_samescene():
           S.fb_tau("SS2") == 0.90 and S.fb_tau("SS1") == 0.90)
 
 
-# ============================================================================================
 # (d) first-appearance scoring on synthetic videos
-# ============================================================================================
 def test_d_scoring(device):
     import torch
     import scenarios as S
@@ -225,7 +214,7 @@ def test_d_scoring(device):
                             "desc": "synthetic scoring test"}
     H, W, NPIX = 96, 160, 4 * 60
     # 4 patterns DINO actually separates (measured cos: diag 1.0, off-diag 0.41-0.71). Random
-    # noise textures do NOT work: DINO maps them all to "colored noise" (cos 0.996).
+    # noise textures do not work: DINO maps them all to "colored noise" (cos 0.996).
     import math
     yy = torch.linspace(0, 1, H).view(H, 1).expand(H, W)
     xx = torch.linspace(0, 1, W).view(1, W).expand(H, W)
@@ -260,7 +249,7 @@ def test_d_scoring(device):
     p1 = os.path.join(OUT, "synth_honest.mp4")
     p2 = os.path.join(OUT, "synth_trap.mp4")
     make(p1, {0: 0, 1: 1, 2: 2, 3: 1})    # honest: revisit (seg3) == first appearance (seg1)
-    make(p2, {0: 1, 1: 3, 2: 2, 3: 1})    # trap: seg3 == SEGMENT 0, first appearance differs
+    make(p2, {0: 1, 1: 3, 2: 2, 3: 1})    # trap: seg3 == segment 0, first appearance differs
     s1 = R.score_video_scen(p1, "TSTS2", device, settle=2, resettle=2)
     s2 = R.score_video_scen(p2, "TSTS2", device, settle=2, resettle=2)
     check("(d) honest synthetic: revisit matches its FIRST APPEARANCE (segment 1)",
@@ -283,9 +272,7 @@ def test_d_scoring(device):
     del S.SCENARIOS["TSTS2"]
 
 
-# ============================================================================================
-# (a) (b) (c) -- the GPU tests, one pipeline build for all of them
-# ============================================================================================
+# (a) (b) (c), the GPU tests, one pipeline build for all of them
 def test_abc(device):
     import torch
     from omegaconf import OmegaConf
@@ -366,7 +353,7 @@ def test_abc(device):
               json.dumps(first[0] if first else {})[:220])
         lat[arm] = b
 
-    # ---- (b2) a REAL multi-candidate route: S4-shaped A->B->A->C->A on 36 frames -----------
+    # ---- (b2) a real multi-candidate route: S4-shaped A->B->A->C->A on 36 frames -----------
     C = S.TRIPLES[0][2]
     sched4 = ((0, 0), (9, 1), (15, 0), (24, 2), (30, 0))
     _, ev4 = run_sched("framebank", S.SCEN_ARM_ENV, sched4, prompts=[A, B, C])
@@ -383,10 +370,10 @@ def test_abc(device):
           not any(e["recalled"] for e in off),
           " | ".join(f"seg{e['seg']} smax={e.get('s_max', float('nan')):.4f}" for e in off))
 
-    # ---- (b3) PARAPHRASED revisit: the revisit is conditioned on A', subject stays 0 --------
+    # ---- (b3) paraphrased revisit: the revisit is conditioned on A', subject stays 0 --------
     # Triple 6 is used here (measured margin cos(A',A) 0.7803 vs worst distractor 0.5805): the
-    # point of this check is the SUBJECT bookkeeping and the non-trivial match, not the value of
-    # tau at its edge -- triples 0 and 10 sit within 0.01 of the default threshold on purpose.
+    # point of this check is the subject bookkeeping and the non-trivial match, not the value of
+    # tau at its edge, triples 0 and 10 sit within 0.01 of the default threshold on purpose.
     A6, B6, C6, Ap6 = S.TRIPLES[6][0], S.TRIPLES[6][1], S.TRIPLES[6][2], S.PARAPHRASES[6]
     sched4p = ((0, 0), (9, 1), (15, 3), (24, 2), (30, 3))
     _, ev5 = run_sched("framebank", S.SCEN_ARM_ENV, sched4p, prompts=[A6, B6, C6, Ap6],
@@ -394,7 +381,7 @@ def test_abc(device):
     rev5 = [e for e in ev5 if e["seg"] in (2, 4)]
     check("(b3) paraphrased revisit: the SUBJECT bookkeeping still marks segments 2 and 4",
           len(rev5) == 2, f"routing events at {[e['seg'] for e in ev5]}")
-    # seg2 is the only NON-TRIVIAL match (A' vs the verbatim A of segment 0). By seg4 the bank
+    # seg2 is the only non-trivial match (A' vs the verbatim A of segment 0). By seg4 the bank
     # already holds segment 2, itself conditioned on A', so a cosine of exactly 1.0 there is the
     # correct behaviour, not a leak.
     check("(b3) paraphrased revisit: the router matches A' to the verbatim A scene",
@@ -403,10 +390,10 @@ def test_abc(device):
           " | ".join(f"seg{e['seg']}->seg{e['chosen_seg']} smax={e['s_max']:.4f} "
                      f"correct={e['correct']}" for e in rev5))
 
-    # ---- (g) MEM_DECODE splice GATING ------------------------------------------------------
-    # The decoded anchor is an intervention that only makes sense at a RETURN. Firing it on a
+    # ---- (g) MEM_DECODE splice gating ------------------------------------------------------
+    # The decoded anchor is an intervention that only makes sense at a return. Firing it on a
     # first appearance would contaminate the very segment the re-ID is scored against, so the
-    # count and the POSITION of the splices are pinned here on the three schedule shapes.
+    # count and the position of the splices are pinned here on the three schedule shapes.
     import contextlib
     import io as _io
 
@@ -418,8 +405,8 @@ def test_abc(device):
 
     def splice_segments(txt):
         """Segment indices at which a decoded anchor was spliced. `_switch_recache` prints the
-        splice line BEFORE inference_schedule announces the segment it just switched to, so a
-        pending splice is attributed to the NEXT 'switch to segment' line."""
+        splice line before inference_schedule announces the segment it just switched to, so a
+        pending splice is attributed to the next 'switch to segment' line."""
         pending, out = 0, []
         for line in txt.splitlines():
             if "[MEM_DECODE] decoded anchor spliced" in line:
@@ -446,7 +433,7 @@ def test_abc(device):
         check(f"(g) memdec20 splices ONLY at the revisits [{name}]", got == expect,
               f"splices at segments {got}, expected {expect}")
 
-    # the paraphrase case: the revisit is asked for with A', the SUBJECT bookkeeping must still
+    # the paraphrase case: the revisit is asked for with A', the subject bookkeeping must still
     # be what fires the hook (a "same prompt string" rule would splice nothing here).
     A6, B6, C6, Ap6 = S.TRIPLES[6][0], S.TRIPLES[6][1], S.TRIPLES[6][2], S.PARAPHRASES[6]
     _, _, txt = run_capture("memdec20", S.SCEN_ARM_ENV, ((0, 2), (9, 0), (18, 1), (27, 3)),
@@ -454,7 +441,7 @@ def test_abc(device):
     check("(g) memdec20 splices at a PARAPHRASED revisit [S2p-shaped]",
           splice_segments(txt) == [3], f"splices at {splice_segments(txt)}")
 
-    # ---- (g2) MEM_DECODE_ROUTED: same WHEN as framebank, different WHAT --------------------
+    # ---- (g2) MEM_DECODE_ROUTED: same when as framebank, different what --------------------
     for name, (sched, subj, expect) in shapes.items():
         _, ev_fb, _ = run_capture("framebank", S.SCEN_ARM_ENV, sched, prompts=[A, B, C0],
                                   subjects=subj)
@@ -468,7 +455,7 @@ def test_abc(device):
         check(f"(g2) memdec20r splices where its router recalled [{name}]",
               got == [s for s, r in dec_rt if r], f"splices {got}, router {dec_rt}")
 
-    # ---- (g3) the variable ABSENT from the environment changes nothing ---------------------
+    # ---- (g3) the variable absent from the environment changes nothing ---------------------
     apply_env("memdec20", S.SCEN_ARM_ENV)
     os.environ.pop("MEM_DECODE_ROUTED", None)
     _, l_abs = pipeline.inference(

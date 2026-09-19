@@ -1,19 +1,18 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ECHELLE DE FIDELITE -- selftest CPU (aucun GPU, aucune video) :
-#   (a) table des scenarios : 10 sid uniques, board_no TOUS dans ADEN_V2_STRONG_19 (copie
-#       litterale + verif contre probe1_common si importable), mapping board_no <-> corpus_idx
-#       verifie CONTRE L'INDEX v2 (ordre lexicographique des video_id = ordre numerique) ;
-#   (b) prompts de la table = prompts de l'index, mode single 90f, graines main/twin ;
-#   (c) donneurs : bijection, jamais soi-meme, TOUJOURS inter-categories ;
-#   (d) interludes : ne contiennent ni le mot-tete du sujet A ni celui du sujet donneur ;
-#   (e) table des bras : chaque bras remet TOUTES les cles de l'union OFF (lecon MEM_WRITER),
-#       `rien` ne splice pas, les 5 autres splicent 1 frame, les flous portent leur sigma ;
-#   (f) anonymisation : permutation deterministe (2 tirages identiques), bijective par
-#       scenario, et differente d'un scenario a l'autre (au moins 5 permutations distinctes
-#       sur 10 : une table constante serait un canal de fuite) ;
-#   (g) forme du scenario : 81/162 multiples de 3, ancre = 80, 240 frames.
-# ============================================================================================
+"""ECHELLE de FIDELITE, selftest CPU (aucun GPU, aucune video) :
+  (a) table des scenarios : 10 sid uniques, board_no tous dans ADEN_V2_STRONG_19 (copie
+      litterale + verif contre probe1_common si importable), mapping board_no <-> corpus_idx
+      verifie CONTRE L'INDEX v2 (ordre lexicographique des video_id = ordre numerique) ;
+  (b) prompts de la table = prompts de l'index, mode single 90f, graines main/twin ;
+  (c) donneurs : bijection, jamais soi-meme, TOUJOURS inter-categories ;
+  (d) interludes : ne contiennent ni le mot-tete du sujet A ni celui du sujet donneur ;
+  (e) table des bras : chaque bras remet toutes les cles de l'union OFF (lecon MEM_WRITER),
+      `rien` ne splice pas, les 5 autres splicent 1 frame, les flous portent leur sigma ;
+  (f) anonymisation : permutation deterministe (2 tirages identiques), bijective par
+      scenario, et differente d'un scenario a l'autre (au moins 5 permutations distinctes
+      sur 10 : une table constante serait un canal de fuite) ;
+  (g) forme du scenario : 81/162 multiples de 3, ancre = 80, 240 frames.
+"""
 import json
 import os
 import sys
@@ -51,7 +50,7 @@ def main():
         assert tuple(REF19) == ADEN_V2_STRONG_19, "copie litterale STRONG_19 desynchronisee"
         print("[selftest] (a2) copie ADEN_V2_STRONG_19 == probe1_common : OK")
     except ImportError as e:
-        print(f"[selftest] (a2) probe1_common non importable ici ({e}) -- copie non re-verifiee")
+        print(f"[selftest] (a2) probe1_common non importable ici ({e}), copie non re-verifiee")
     # mapping verifie contre l'index : l'ordre lexicographique des main video_id est
     # l'ordre numerique des corpus_idx (tous "main:90000xx", meme longueur)
     with open(C.V2_INDEX) as f:

@@ -1,46 +1,45 @@
 #!/usr/bin/env python
-# ============================================================================================
-# BLIND JUDGING BOARDS -- generator. Rebuilt 2026-09-09 from the sixteen boards published
-# between 13 and 29 August (their source is gone with the working tree; only the HTML pages
-# survived, and their exact wording, answer options and "copy my answers" mechanism were read
-# back from them).
-#
-# NOTE ON LANGUAGE: the strings SHOWN TO THE JUDGE stay in French, deliberately. They are the
-# experimental protocol -- the August campaigns were judged with that exact wording, and
-# changing it would break comparability with those judgments. Only the code is in English.
-#
-# THREE FORMATS, one per question the campaign asked:
-#
-#   pair2   "Reconnait-on la personne ?" (22/08, 30 questions)
-#           one image on top (decoder output OR the real image blurred), two real people below,
-#           which one is it?  ->  measures the INSTANCE FIDELITY of the output against the blur
-#           ladder.  Options: left | right | cannot tell.
-#
-#   rank3   "La mosaique a-t-elle disparu ?" (23/08, 10 rows x 6 answers)
-#           the real person on the left, three shuffled reconstructions (the old one + two new):
-#           rank all three, then judge each.  ->  compares DECODER VARIANTS against each other.
-#           Judgment options: yes | roughly | no.
-#
-#   duel2   "Lequel est bien la personne du debut ?" (23 to 29 August, up to 20 scenes)
-#           two PAIRED versions of the same video return, left and right, which one brings the
-#           person back.  ->  the final test, on video, between two arms.  Options: L | R |
-#           cannot tell.
-#
-# HOUSE RULES, all applied here and all verified by selftest_boards.py:
-#  1. The answer key lives in key_<id>.json, NEVER in the page. The selftest reads the produced
-#     HTML back and fails if it finds an arm name, a file path or the real column order.
-#  2. The permutation comes from a FROZEN salted hash (like fidelity_common.letter_perm): the
-#     same board regenerated gives the same shuffle, so a lost board can be rebuilt.
-#  3. "Cannot tell" is a first-class answer, never a blank: the instructions tell the judge to
-#     use it, and the scorer counts it separately instead of diluting it into chance.
-#  4. The side / letter of the true subject is drawn PER QUESTION, never per board.
-#  5. The page is self-contained: no external script, no external font, media as data URIs. It
-#     goes into an Artifact as is (16 MB ceiling, checked at build time).
-#
-# Usage:
-#   python boards.py demo --out /tmp/demo          # builds one board of each type
-#   from boards import build_pair2, build_rank3, build_duel2
-# ============================================================================================
+"""Blind judging boards, generator. Rebuilt 2026-09-09 from the sixteen boards published
+between 13 and 29 August (their source is gone with the working tree; only the HTML pages
+survived, and their exact wording, answer options and "copy my answers" mechanism were read
+back from them).
+
+Note ON language: the strings shown to the JUDGE stay in French, deliberately. They are the
+experimental protocol, the August campaigns were judged with that exact wording, and
+changing it would break comparability with those judgments. Only the code is in English.
+
+Three formats, one per question the campaign asked:
+
+  pair2   "Reconnait-on la personne ?" (22/08, 30 questions)
+          one image on top (decoder output or the real image blurred), two real people below,
+          which one is it?  ->  measures the instance fidelity of the output against the blur
+          ladder.  Options: left | right | cannot tell.
+
+  rank3   "La mosaique a-t-elle disparu ?" (23/08, 10 rows x 6 answers)
+          the real person on the left, three shuffled reconstructions (the old one + two new):
+          rank all three, then judge each.  ->  compares DECODER variants against each other.
+          Judgment options: yes | roughly | no.
+
+  duel2   "Lequel est bien la personne du debut ?" (23 to 29 August, up to 20 scenes)
+          two paired versions of the same video return, left and right, which one brings the
+          person back.  ->  the final test, on video, between two arms.  Options: L | R |
+          cannot tell.
+
+House rules, all applied here and all verified by selftest_boards.py:
+ 1. The answer key lives in key_<id>.json, never in the page. The selftest reads the produced
+    HTML back and fails if it finds an arm name, a file path or the real column order.
+ 2. The permutation comes from a frozen salted hash (like fidelity_common.letter_perm): the
+    same board regenerated gives the same shuffle, so a lost board can be rebuilt.
+ 3. "Cannot tell" is a first-class answer, never a blank: the instructions tell the judge to
+    use it, and the scorer counts it separately instead of diluting it into chance.
+ 4. The side / letter of the true subject is drawn per question, never per board.
+ 5. The page is self-contained: no external script, no external font, media as data URIs. It
+    goes into an Artifact as is (16 MB ceiling, checked at build time).
+
+Usage:
+  python boards.py demo --out /tmp/demo          # builds one board of each type
+  from boards import build_pair2, build_rank3, build_duel2
+"""
 import base64
 import hashlib
 import html
@@ -49,7 +48,7 @@ import mimetypes
 import os
 import time
 
-# FROZEN salt. Changing it invalidates every board already judged: never touch it.
+# frozen salt. Changing it invalidates every board already judged: never touch it.
 SALT = "eyeboards-2026-09-09"
 CODE_VERSION = "1"
 ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
@@ -197,8 +196,8 @@ def _page(title, lede, cells, board_id, nslots, checksum):
 
 def _finish(out_dir, board_id, title, lede, cells, slots, key, kind, nslots):
     os.makedirs(out_dir, exist_ok=True)
-    # The checksum depends ONLY on the board: it authenticates the returned code (right board,
-    # right version), it encrypts nothing -- the key lives elsewhere.
+    # The checksum depends only on the board: it authenticates the returned code (right board,
+    # right version), it encrypts nothing, the key lives elsewhere.
     checksum = code_checksum(board_id, kind)
     page = _page(title, lede, cells, board_id, nslots, checksum)
     html_path = os.path.join(out_dir, f"{board_id}.html")
@@ -219,10 +218,10 @@ def _finish(out_dir, board_id, title, lede, cells, slots, key, kind, nslots):
 
 # ----------------------------- pair2 ----------------------------------------------------------
 def build_pair2(items, out_dir, board_id="pair2", title="Reconnait-on la personne ?"):
-    """items: [{id, probe, true, twin, meta?}] -- probe = the image to judge (decoder output or
+    """Items: [{id, probe, true, twin, meta?}], probe = the image to judge (decoder output or
     the real image blurred), true/twin = the two real people.
 
-    The side of the true subject is drawn PER QUESTION (rule 4): knowing where the probe comes
+    The side of the true subject is drawn per question (rule 4): knowing where the probe comes
     from therefore does not help, which the instructions state explicitly to the judge."""
     lede = ('<p class="lede">En haut, <b>une image</b>. En dessous, <b>deux personnes '
             'reelles</b> : l\'une est celle de l\'image, l\'autre est son sosie, genere avec '
@@ -252,7 +251,7 @@ def build_pair2(items, out_dir, board_id="pair2", title="Reconnait-on la personn
             f'<div class="q">cette image, c\'est laquelle des deux personnes ?</div>'
             f'<div class="row">{"".join(cols)}</div>'
             f'<div class="opts">{opts}</div></div>')
-        # the key: which side holds the TRUE subject
+        # the key: which side holds the true subject
         true_side = "g" if order[0] == 0 else "d"
         key.append({"id": it["id"], "slot": total, "true_side": true_side,
                     "meta": it.get("meta", {})})
@@ -263,9 +262,9 @@ def build_pair2(items, out_dir, board_id="pair2", title="Reconnait-on la personn
 
 # ----------------------------- rank3 -----------------------------------------------------------
 def build_rank3(items, out_dir, board_id="rank3", title="La mosaique a-t-elle disparu ?"):
-    """items: [{id, truth, variants: {name: path} (exactly 3), meta?}].
+    """Items: [{id, truth, variants: {name: path} (exactly 3), meta?}].
 
-    Two answers per variant -- a RANK (1..3) and a judgment -- because the 23/08 board asked for
+    Two answers per variant, a rank (1..3) and a judgment, because the 23/08 board asked for
     both: the rank compares variants against each other (which survives even if none is good),
     the judgment says whether one clears the absolute bar."""
     lede = ('<p class="lede">A gauche <b>la vraie personne</b>. A droite, trois '
@@ -310,7 +309,7 @@ def build_rank3(items, out_dir, board_id="rank3", title="La mosaique a-t-elle di
 # ----------------------------- duel2 ------------------------------------------------------------
 def build_duel2(items, out_dir, board_id="duel2",
                 title="Lequel est bien la personne du debut ?"):
-    """items: [{id, arms: {arm_name: video_path} (exactly 2), meta?}].
+    """Items: [{id, arms: {arm_name: video_path} (exactly 2), meta?}].
 
     This is the final board of 29 August. There is no right answer in the answer-key sense: we
     count preferences per arm, and the scorer tests them against a coin flip."""

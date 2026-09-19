@@ -1,24 +1,23 @@
 #!/usr/bin/env python
-# ============================================================================================
-# The README figure: one panel per training run, the memory-on and memory-zeroed arms traced
-# across checkpoints, each panel against its own unmodified-model reference.
-#
-# WHY SMALL MULTIPLES. The first version of this figure put all four runs in one scatter. That
-# was wrong: c1, c2, c3 and l1 are four different models with different objectives -- and l1
-# does not even share the others' base or their reference point -- so a single cloud implied a
-# homogeneity that does not exist, and it hid the thing that matters, which is how each run
-# MOVES as training proceeds.
-#
-# WHAT IS EXCLUDED, and why. Each run was also evaluated with an EMA checkpoint and at 480
-# frames. Those are different evaluation settings of the same step, not different steps, so
-# mixing them into one trajectory would make the line meaningless. Only the plain
-# `eval<step>[_sink1]` series is drawn, one comparable point per checkpoint.
-#
-# Reads reference/runs/*/eval*/metrics_c1_step*.txt directly, so the figure is regenerated from
-# the measured numbers and never from a hand-copied table.
-#
-#   python reference/runs/make_figure.py        # writes assets/motion_identity.png
-# ============================================================================================
+"""README figure: one panel per training run.
+
+Each panel traces the memory-on and memory-zeroed arms across checkpoints, against that
+run's own unmodified-model reference.
+
+Small multiples rather than one scatter, because the four runs are four different models
+and l1 does not even share the others' base or reference point. A single cloud implied a
+homogeneity that does not exist, and hid what matters: how each run moves as training
+proceeds.
+
+Each run was also evaluated with an EMA checkpoint and at 480 frames. Those are different
+evaluation settings of the same step, not different steps, so mixing them into one
+trajectory makes the line meaningless. Only the plain eval<step>[_sink1] series is drawn.
+
+Reads reference/runs/*/eval*/metrics_c1_step*.txt directly, so the figure comes from the
+measured numbers and never from a hand-copied table.
+
+    python reference/runs/make_figure.py        # writes assets/motion_identity.png
+"""
 import os
 import re
 
@@ -27,18 +26,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-# Panels are numbered and titled by WHAT CHANGED between runs, in plain words. The directory
-# names on the left are internal run codes: they mean nothing to a reader, and they appear here
-# only so the data behind each panel can be traced back to reference/runs/.
+# Panels are numbered and titled by what changed between runs. The directory names on the
+# left are internal run codes, kept only so each panel can be traced back to reference/runs/.
 #
-# All four share the same backbone (Wan2.1-1.3B, frozen), the same LoRA co-training (rank 256,
-# unfrozen on every block) and the same objective: plain DMD distillation. Every extra loss term
-# in the codebase -- identity, anti-freeze, counterfactual advantage, motion matching,
-# anti-flicker -- is weighted 0 in all four configs. What differs is listed in the titles.
-RUNS = [("c1_cotrain", "1 · writes the frames it is generating"),
-        ("c2_eviction", "2 · writes the frames just forgotten"),
-        ("c3_stable", "3 · same, plus stability fixes"),
-        ("l1_longlive", "4 · same, from the previous fine-tune")]
+# All four share the same backbone (Wan2.1-1.3B, frozen), the same LoRA co-training (rank
+# 256, unfrozen on every block) and the same objective: plain DMD distillation. Every extra
+# loss term in the codebase (identity, anti-freeze, counterfactual advantage, motion
+# matching, anti-flicker) is weighted 0 in all four configs. What differs is in the titles.
+RUNS = [("c1_cotrain", "1. writes the frames it is generating"),
+        ("c2_eviction", "2. writes the frames just forgotten"),
+        ("c3_stable", "3. same, plus stability fixes"),
+        ("l1_longlive", "4. same, from the previous fine-tune")]
 KEEP = re.compile(r"^eval(\d+)(_sink1)?$")      # plain series only: no _ema, no _480, no _msc05
 C = {"memon": "#2a78d6", "memzero": "#eb6834", "stock": "#1baf7a"}
 M = {"memon": "o", "memzero": "^", "stock": "*"}
@@ -85,7 +83,7 @@ for ax, (run, label) in zip(axes.ravel(), RUNS):
     sx, sy = pts[0][2]["stock"], pts[0][1]["stock"]
     ax.scatter([sx], [sy], s=240, marker=M["stock"], c=C["stock"],
                linewidths=1.2, edgecolors="#ffffff", zorder=4)
-    # an arrowhead on the last leg of each line, so the direction of training is unambiguous
+    # arrowhead on the last leg, so the direction of training is unambiguous
     for arm in ("memzero", "memon"):
         (x0, y0), (x1, y1) = ((pts[-2][2][arm], pts[-2][1][arm]), (pts[-1][2][arm], pts[-1][1][arm]))
         ax.annotate("", xy=(x1, y1), xytext=(x0 + (x1 - x0) * .55, y0 + (y1 - y0) * .55),
@@ -108,9 +106,9 @@ axes[0][0].set_xlim(-0.05, 1.09)
 axes[0][0].set_ylim(0.22, 0.83)
 fig.supxlabel("motion   (VBench dynamic degree)", fontsize=10.5, color=INK2, y=0.055)
 fig.supylabel("identity kept   (DINO, first vs last frame)", fontsize=10.5, color=INK2, x=0.035)
-# Title only. The axes are labelled, the legend names the series and the step labels give the
-# direction of training, so there is nothing left for a subtitle to say. The caveats (6 prompts
-# per point, EMA and 480-frame evaluations excluded) live in the README paragraph next to it.
+# Title only: the axes are labelled, the legend names the series, the step labels give the
+# direction. Caveats (6 prompts per point, EMA and 480-frame evaluations excluded) are in the
+# README paragraph next to the figure.
 fig.suptitle("No run beats the unmodified model",
              fontsize=14, color=INK, fontweight="bold", x=0.035, ha="left", y=0.965)
 fig.legend(handles=[
@@ -126,8 +124,8 @@ fig.legend(handles=[
 fig.tight_layout(rect=[0.045, 0.075, 1, 0.925])
 fig.savefig("assets/motion_identity.png", facecolor="#ffffff", bbox_inches="tight")
 
-# The title is a claim about the data; check it rather than trust it. "Beats" means strictly
-# better on BOTH axes than this run's own unmodified reference.
+# The title is a claim about the data, so check it. "Beats" means strictly better on both
+# axes than this run's own unmodified reference.
 beaten = []
 for run, _ in RUNS:
     pts = load(run)

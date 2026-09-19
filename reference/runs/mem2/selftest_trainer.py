@@ -1,28 +1,27 @@
 #!/usr/bin/env python
-# ============================================================================================
-# SELFTESTS for the memory 2.0 writer trainer (J3 deliverable E).
-#
-# Everything that can be checked WITHOUT a GPU is checked without one (shapes, split, twin in
-# the softmax, target ages, mask semantics, loss identities, warm-start delta == 0 on CPU, and
-# the F3.3 end-to-end gradient path on a TINY cell). --gpu adds a short real smoke (2 steps,
-# batch 1, --load direct so it starts in seconds) on the actual shards.
-#
-# The DIE-ON items each have a test here:
-#   F2.3  S-E5  warm start == l1@2000-EMA bit for bit (delta_l1 == 0), on CPU.
-#   F3.3  S-E6  AnchorFrameDecoder(detach_states=False) + a real backward that reaches
-#               qkv/lrs/k_norm/decay_logit THROUGH the decoder (S1 test 2 only backprop'd a
-#               dummy loss on the state, so this path was never covered).
-#   F1.6  S-E4  sampled targets are AGED (never younger than --min_age) and the anchor target
-#               is the last frame of A at a post-switch state.
-#   F1.1  S-E2/S-E8  the same-prompt twin IS in the softmax; same-video negatives are masked
-#               ONLY near the target (the other segment stays a negative).
-#   F4.1  S-E3  per-video split, >= 20 val videos, twins never split.
-#
-# Usage:
-#   python reference/runs/mem2/selftest_trainer.py            # CPU only
-#   CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
-#   CUDA_VISIBLE_DEVICES=1 python reference/runs/mem2/selftest_trainer.py --gpu
-# ============================================================================================
+"""Selftests for the memory 2.0 writer trainer (J3 deliverable E).
+
+Everything that can be checked without a GPU is checked without one (shapes, split, twin in
+the softmax, target ages, mask semantics, loss identities, warm-start delta == 0 on CPU, and
+the F3.3 end-to-end gradient path on a tiny cell). --gpu adds a short real smoke (2 steps,
+batch 1, --load direct so it starts in seconds) on the actual shards.
+
+The die-ON items each have a test here:
+  F2.3  S-E5  warm start == l1@2000-EMA bit for bit (delta_l1 == 0), on CPU.
+  F3.3  S-E6  AnchorFrameDecoder(detach_states=False) + a real backward that reaches
+              qkv/lrs/k_norm/decay_logit through the decoder (S1 test 2 only backprop'd a
+              dummy loss on the state, so this path was never covered).
+  F1.6  S-E4  sampled targets are aged (never younger than --min_age) and the anchor target
+              is the last frame of A at a post-switch state.
+  F1.1  S-E2/S-E8  the same-prompt twin is in the softmax; same-video negatives are masked
+              only near the target (the other segment stays a negative).
+  F4.1  S-E3  per-video split, >= 20 val videos, twins never split.
+
+Usage:
+  python reference/runs/mem2/selftest_trainer.py            # CPU only
+  CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
+  CUDA_VISIBLE_DEVICES=1 python reference/runs/mem2/selftest_trainer.py --gpu
+"""
 import argparse
 import os
 import random
@@ -49,7 +48,7 @@ _FAILS = []
 
 
 def check(name, ok, detail=""):
-    print(f"[selftest][{'PASS' if ok else 'FAIL'}] {name}" + (f" -- {detail}" if detail else ""),
+    print(f"[selftest][{'PASS' if ok else 'FAIL'}] {name}" + (f": {detail}" if detail else ""),
           flush=True)
     if not ok:
         _FAILS.append(name)
@@ -74,12 +73,12 @@ def s_e1():
 # ----------------------------- S-E2/S-E8 InfoNCE + bank semantics ------------------------------
 def s_e2(bank_path):
     if not os.path.exists(bank_path):
-        check("S-E2 bank present", False, f"{bank_path} missing -- run build_bank.py first")
+        check("S-E2 bank present", False, f"{bank_path} missing, run build_bank.py first")
         return None
     bank = TW.Bank(bank_path, torch.device("cpu"))
     vids = bank.videos
     by_id = {v["video_id"]: v for v in vids}
-    # a switch video that HAS a twin is ideal; else any switch video
+    # a switch video that has a twin is ideal; else any switch video
     metas = [v for v in vids if v["mode"] == "switch"]
     meta = metas[0]
     tgt_chunk = meta["write_chunks"][len(meta["write_chunks"]) // 2]
@@ -109,7 +108,7 @@ def s_e2(bank_path):
         neg2, mask2, pool2 = bank.negatives(side, tv, [tv["write_chunks"][5]], n_neg=0)
         tw_entries = set(bank.twin_entries(tv).tolist())
         ok_full = bool(tw_entries & set(pool2.tolist()))
-        # subsampled bank: the twin must be FORCE-added (mandate)
+        # subsampled bank: the twin must be force-added (mandate)
         neg3, mask3, pool3 = bank.negatives(side, tv, [tv["write_chunks"][5]], n_neg=64)
         ok_forced = bool(tw_entries & set(pool3.tolist()))
         check("S-E2 the same-prompt TWIN is in the softmax (full bank AND n_neg subsample)",
@@ -191,7 +190,7 @@ def s_e5(config_path):
     d = TW.delta_l1(cells, ref)
     check("S-E5 F2.3 warm start: writer/delta_l1 == 0 vs the l1@2000-EMA checkpoint",
           d == 0.0, f"delta_l1={d:.3e}, source={src}, blocks={blocks}")
-    # and it is NOT trivially zero: perturb one tensor and the metric must move
+    # and it is not trivially zero: perturb one tensor and the metric must move
     with torch.no_grad():
         cells[blocks[0]].qkv.weight.add_(0.01)
     d2 = TW.delta_l1(cells, ref)
@@ -237,7 +236,7 @@ def s_e6():
     dead = all(p.grad is None or float(p.grad.abs().sum()) == 0.0
                for n, p in cell2.named_parameters() if n in TW.WRITE_PARAMS)
     check("S-E6c the default decoder (detach_states=True) gives the writer EXACTLY ZERO "
-          "gradient -- the 2-day flat curve F3.3 predicted", dead)
+          "gradient, the 2-day flat curve F3.3 predicted", dead)
 
 
 # ----------------------------- S-E7 latent embedding --------------------------------------------

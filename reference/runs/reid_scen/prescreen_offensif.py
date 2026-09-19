@@ -1,28 +1,27 @@
 #!/usr/bin/env python
-# ============================================================================================
-# LOT OFFENSIF 2026-08-04 -- LES DEUX ANALYSES A ~0 ROLLOUT, predictions scellees au registre
-# (`memory2_probes_registry.md`, section "LOT OFFENSIF DE LA NUIT").
-#
-#   T0   correlation BANDE-BASSE (8x8) des retours `wronganchor` / `memdec20` deja sur disque
-#        avec l'ancre ETRANGERE (celle reellement splicee par wronganchor) vs l'ancre PROPRE.
-#        Design apparie 2x2 par cellule :
-#            exces = [c(ret_wrong, anc_etr) - c(ret_wrong, anc_prop)]
-#                  + [c(ret_dec,   anc_prop) - c(ret_dec,   anc_etr)]
-#        > 0 = chaque retour ressemble davantage a l'ancre QU'IL A RECUE => copie de layout.
-#        Si l'exces est net, "pas lu" (§11.5, mesure DINO) devient "lu dans une bande que le
-#        juge ignore". Deux fenetres : `early` (juste apres le splice) et `scored`.
-#
-#   L1   PRE-ECRAN de la legende-VLM : notre ancre decodee porte-t-elle la COULEUR du sujet ?
-#        avantage = d(ancre ETRANGERE, A*) - d(ancre PROPRE, A*)   (juge couleur de
-#        score_textpoor2.py : histogramme teinte pondere S*V + moyennes S/V, sur le crop 60 %).
-#        REGLE SCELLEE : avantage moyen <= 0 OU <= 12/24 signes => LEVIER 1 MORT, aucun rollout.
-#
-# Le seul calcul GPU est le VAE sur 24 ancres latentes (~0.02 GPU-h) ; tout le reste est du CPU
-# sur des mp4 deja rendus. Les images d'ancres decodees sont mises en cache sur le disque projet.
-#
-#   python prescreen_offensif.py                 # tout
-#   python prescreen_offensif.py --only t0       # une seule analyse
-# ============================================================================================
+"""Lot OFFENSIF 2026-08-04, les DEUX analyses A ~0 ROLLOUT, predictions scellees au registre
+(`memory2_probes_registry.md`, section "lot OFFENSIF de la NUIT").
+
+  T0   correlation bande-BASSE (8x8) des retours `wronganchor` / `memdec20` deja sur disque
+       avec l'ancre ETRANGERE (celle reellement splicee par wronganchor) vs l'ancre PROPRE.
+       Design apparie 2x2 par cellule :
+           exces = [c(ret_wrong, anc_etr) - c(ret_wrong, anc_prop)]
+                 + [c(ret_dec,   anc_prop) - c(ret_dec,   anc_etr)]
+       > 0 = chaque retour ressemble davantage a l'ancre QU'IL A RECUE => copie de layout.
+       Si l'exces est net, "pas lu" (§11.5, mesure DINO) devient "lu dans une bande que le
+       juge ignore". Deux fenetres : `early` (juste apres le splice) et `scored`.
+
+  L1   PRE-ECRAN de la legende-VLM : notre ancre decodee porte-t-elle la COULEUR du sujet ?
+       avantage = d(ancre ETRANGERE, A*) - d(ancre PROPRE, A*)   (juge couleur de
+       score_textpoor2.py : histogramme teinte pondere S*V + moyennes S/V, sur le crop 60 %).
+       regle SCELLEE : avantage moyen <= 0 OU <= 12/24 signes => levier 1 mort, aucun rollout.
+
+Le seul calcul GPU est le VAE sur 24 ancres latentes (~0.02 GPU-h) ; tout le reste est du CPU
+sur des mp4 deja rendus. Les images d'ancres decodees sont mises en cache sur le disque projet.
+
+  python prescreen_offensif.py                 # tout
+  python prescreen_offensif.py --only t0       # une seule analyse
+"""
 import argparse
 import json
 import os
@@ -68,7 +67,7 @@ def anchor_px(ti, si, device):
 
 # ----------------------------------------------------------------- juges ----------------------
 def hsv_hist(frames01, bins=12):
-    """Juge couleur de score_textpoor2.py, VERBATIM (histogramme teinte pondere S*V sur le crop
+    """Juge couleur de score_textpoor2.py, verbatim (histogramme teinte pondere S*V sur le crop
     central 60 %, + les moyennes S et V qui portent le noir/blanc)."""
     from run_reid_probe import center_crop
     x = center_crop(frames01)
@@ -96,7 +95,7 @@ def hist_dist(a, b):
 
 def lowband(frames01, n=8):
     """(T,3,H,W) -> (T, n*n) niveaux de gris moyennes en n x n, centres-reduits par frame.
-    C'est LA bande basse : layout des masses + luminance, ce que DINO ne regarde pas."""
+    C'est la bande basse : layout des masses + luminance, ce que DINO ne regarde pas."""
     gray = (0.299 * frames01[:, 0] + 0.587 * frames01[:, 1] + 0.114 * frames01[:, 2])[:, None]
     z = F.adaptive_avg_pool2d(gray, n).flatten(1)
     z = z - z.mean(1, keepdim=True)
@@ -123,7 +122,7 @@ def sign_p(npos, nneg):
 def run_t0(device):
     """Design apparie 2x2 + DEUX controles ajoutes apres le premier passage (le resultat etait
     trop gros pour etre publie sans eux) :
-      * ancre NULLE : une TROISIEME ancre (celle de t+2), que NI l'un NI l'autre bras n'a recue.
+      * ancre NULLE : une TROISIEME ancre (celle de t+2), que ni l'un ni l'autre bras n'a recue.
         Si la correlation avec elle est du niveau de l'ancre non-recue, le +0.52 est bien
         specifique a ce qui a ete splice et non "deux images floues se ressemblent".
       * ECHELLE de bande : n x n pour n = 4, 8, 16, 32, 64. Localise la bande ou la copie meurt,
@@ -176,7 +175,7 @@ def run_t0(device):
               flush=True)
 
     print("\n" + "=" * 96)
-    print("T0 -- CORRELATION BANDE-BASSE (8x8). exces > 0 = chaque retour copie le layout de "
+    print("T0, CORRELATION BANDE-BASSE (8x8). exces > 0 = chaque retour copie le layout de "
           "L'ANCRE QU'IL A RECUE")
     print("=" * 96)
     summ = {"n": len(rows), "cells": rows, "verdict": {}}
@@ -192,7 +191,7 @@ def run_t0(device):
             print(f"  {tag:7s} {band:5s}: exces moyen {m:+.4f}  sd {sd:.4f}  "
                   f"sem {sd / len(v) ** 0.5:.4f}  signes {npos}+/{len(v) - npos}-  "
                   f"p {sign_p(npos, len(v) - npos):.4f}")
-    # niveaux absolus + CONTROLE NUL (ancre recue par personne)
+    # niveaux absolus + CONTROLE nul (ancre recue par personne)
     print("\n  [niveaux] correlation 8x8 du RETOUR avec chaque ancre (RECUE = celle que ce bras "
           "a effectivement splicee)")
     for tag in ("early", "scored"):
@@ -205,7 +204,7 @@ def run_t0(device):
             summ["verdict"][f"levels_{tag}_{name}"] = {"recue": a, "non_recue": b, "nulle": c}
             print(f"    {tag:7s} retour {name:5s}: ancre RECUE {a:+.4f} | ancre NON RECUE "
                   f"{b:+.4f} | ancre NULLE (t+2, recue par personne) {c:+.4f}")
-    print("\n  [echelle de bande] exces apparie a la resolution n x n (gris) -- ou meurt la copie")
+    print("\n  [echelle de bande] exces apparie a la resolution n x n (gris), ou meurt la copie")
     for tag in ("early", "scored"):
         line = f"    {tag:7s}: "
         for n in (4, 8, 16, 32, 64):
@@ -256,7 +255,7 @@ def run_l1(device):
     npos = sum(1 for x in v if x > 0)
     dead = (m <= 0) or (npos <= 12)
     print("\n" + "=" * 96)
-    print("L1 PRE-ECRAN -- notre ancre decodee porte-t-elle la COULEUR du sujet ?")
+    print("L1 PRE-ECRAN, notre ancre decodee porte-t-elle la COULEUR du sujet ?")
     print("=" * 96)
     print(f"  avantage moyen {m:+.4f}  sd {sd:.4f}  sem {sd / len(v) ** 0.5:.4f}  "
           f"signes {npos}+/{len(v) - npos}-  p {sign_p(npos, len(v) - npos):.4f}")

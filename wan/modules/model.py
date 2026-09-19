@@ -7,8 +7,8 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
 
-# 2026-09-09: these classes called flash_attention DIRECTLY, bypassing the `attention`
-# dispatcher in the same module. Consequence: cross-attention required flash-attn -- on ANY
+# 2026-09-09: these classes called flash_attention directly, bypassing the `attention`
+# dispatcher in the same module. Consequence: cross-attention required flash-attn, on any
 # machine, including an NVIDIA one where the package is not installed, it raised
 # "assert q.device.type == 'cuda'". The dispatcher picks flash when available (hence identical
 # behaviour on a README-conformant install) and PyTorch's standard attention otherwise.
@@ -49,7 +49,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 def rope_freqs_to(freqs, device):
-    """Move the RoPE frequency table to `device`, lowering precision ONLY where float64 does not
+    """Move the RoPE frequency table to `device`, lowering precision only where float64 does not
     exist.
 
     2026-09-09. `rope_params` builds the table in complex128 (phases computed in float64). Metal

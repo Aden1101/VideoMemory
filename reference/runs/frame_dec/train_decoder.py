@@ -1,35 +1,34 @@
 #!/usr/bin/env python
-# ============================================================================================
-# OFFLINE trainer for AnchorFrameDecoder (design v1 "frame de rappel decodee",
-# plan_final_sink_virtuel.md DESIGN v1 FINAL + localplan_D_pivot.md).
-#
-# Trains the state->latent-frame decoder on (states, evicted frame) pairs written by the
-# collector agent. Shard format (.pt = torch.save'd LIST OF DICTS, the exact contract):
-#   {"states": [3 x (w0, w1, w2) fp16 cpu],       # memory_layers order, leading axis B*nh = 1
-#    "target": fp16 (16, 60, 104),                # the evicted latent frame
-#    "prompt": str, "chunk_idx": int}
-# Collector format v2 adds "cond_emb" (pooled T5, fp16 (4096,)) per pair; v1 shards (no
-# cond_emb) remain fully trainable WITHOUT --cond.
-#
-# v1.1 (recency-bias attack, plan_final CORRECTIF v1):
-#   --cond            FiLM-condition the decoder on the pooled prompt embedding (v2 shards
-#                     REQUIRED: clear error if a v1 shard is in the glob)
-#   --warm_start CKPT initialize from a v1.0 checkpoint (weights only; the new cond/FiLM
-#                     params keep their zero-init => step-0 function == the v1.0 model;
-#                     optimizer/scheduler start fresh). Exclusive with --resume.
-#
-# Loss = per-sample MSE in latent space, normalized by the target's mean square (RMS^2)
-# -> scale-free, init loss == 1.0 exactly (zero-init head). Optional --dino flag is a v2
-# placeholder (NOT implemented in v1).
-#
-# wandb MANDATORY (house rule: never disabled), project anchor-forcing-memory, run frame_dec_v1.
-# Every --viz_every steps: side-by-side PNG grid target-vs-reconstruction through the REAL VAE
-# decode (VAE loaded like run_reid_probe.py::build_pipeline, but ONLY the VAE).
-#
-# Usage (single GPU, e.g. GPU 0):
-#   python reference/runs/frame_dec/train_decoder.py \
-#       --data_glob "reference/runs/frame_dec/data/*.pt" --steps 20000
-# ============================================================================================
+"""OFFLINE trainer for AnchorFrameDecoder (design v1 "frame de rappel decodee",
+plan_final_sink_virtuel.md design v1 final + localplan_D_pivot.md).
+
+Trains the state->latent-frame decoder on (states, evicted frame) pairs written by the
+collector agent. Shard format (.pt = torch.save'd list of DICTS, the exact contract):
+  {"states": [3 x (w0, w1, w2) fp16 cpu],       # memory_layers order, leading axis B*nh = 1
+   "target": fp16 (16, 60, 104),                # the evicted latent frame
+   "prompt": str, "chunk_idx": int}
+Collector format v2 adds "cond_emb" (pooled T5, fp16 (4096,)) per pair; v1 shards (no
+cond_emb) remain fully trainable without --cond.
+
+v1.1 (recency-bias attack, plan_final CORRECTIF v1):
+  --cond            FiLM-condition the decoder on the pooled prompt embedding (v2 shards
+                    required: clear error if a v1 shard is in the glob)
+  --warm_start CKPT initialize from a v1.0 checkpoint (weights only; the new cond/FiLM
+                    params keep their zero-init => step-0 function == the v1.0 model;
+                    optimizer/scheduler start fresh). Exclusive with --resume.
+
+Loss = per-sample MSE in latent space, normalized by the target's mean square (RMS^2)
+-> scale-free, init loss == 1.0 exactly (zero-init head). Optional --dino flag is a v2
+placeholder (not implemented in v1).
+
+Wandb mandatory (house rule: never disabled), project anchor-forcing-memory, run frame_dec_v1.
+Every --viz_every steps: side-by-side PNG grid target-vs-reconstruction through the real VAE
+decode (VAE loaded like run_reid_probe.py::build_pipeline, but only the VAE).
+
+Usage (single GPU, e.g. GPU 0):
+  python reference/runs/frame_dec/train_decoder.py \
+      --data_glob "reference/runs/frame_dec/data/*.pt" --steps 20000
+"""
 import argparse
 import glob
 import math
@@ -59,7 +58,7 @@ from decoder_v2 import (BestTracker, EmaWeights, assert_mixer_warm_start,  # noq
 def norm_mse(pred, target, eps=1e-8, subject_weight=1.0):
     """MSE normalized per-sample by the target's mean square (RMS^2), then batch-averaged.
     Scale-free: a decoder stuck at zero scores exactly 1.0.
-    subject_weight > 1 (v1.2): the CENTER crop60 region (where subjects live, what re-ID
+    subject_weight > 1 (v1.2): the center crop60 region (where subjects live, what re-ID
     measures) is weighted W in the squared error; weights are mean-normalized so the loss
     scale (and the =1.0-at-zero property) is preserved. W=1.0 = exact v1.0/v1.1 loss."""
     pf = pred.float()
@@ -82,8 +81,8 @@ def norm_mse(pred, target, eps=1e-8, subject_weight=1.0):
 # ----------------------------- data ---------------------------------------------------------
 def _load_pairs(path, require_cond=False):
     """Collector shards are DICTS {'format_version', ..., 'pairs': [...]} (collect_pairs.py
-    format v1 or v2) -- unwrap to the pair list. Tolerates a bare list for forward-compat.
-    require_cond=True (--cond): fail LOUDLY on a v1 shard (pairs without 'cond_emb')."""
+    format v1 or v2), unwrap to the pair list. Tolerates a bare list for forward-compat.
+    require_cond=True (--cond): fail loudly on a v1 shard (pairs without 'cond_emb')."""
     obj = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(obj, dict):
         assert "pairs" in obj, f"shard {path} has no 'pairs' key (keys: {list(obj)[:8]})"
@@ -102,7 +101,7 @@ class ShardStream:
     """Streams collector shards without ever holding more than one in RAM (a single sample's
     states are ~170MB fp16: a shard is GBs). Per epoch: shuffle shard order, load one shard,
     shuffle its items, yield full batches (batches never straddle shards; remainder dropped).
-    Optional holdout: the FIRST `holdout` items of the FIRST shard (sorted paths, deterministic)
+    Optional holdout: the first `holdout` items of the first shard (sorted paths, deterministic)
     are reserved as a fixed val/viz set and excluded from training."""
 
     def __init__(self, paths, batch_size, holdout=0, seed=0, require_cond=False):
@@ -166,9 +165,9 @@ def collate(items, device, want_cond=False):
 
 # ----------------------------- VAE (viz only) -----------------------------------------------
 def build_vae(device):
-    """ONLY the VAE, loaded exactly as run_reid_probe.py::build_pipeline does for the full
+    """Only the VAE, loaded exactly as run_reid_probe.py::build_pipeline does for the full
     pipeline: WanVAEWrapper (reads wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth relative to the
-    repo root -> caller must chdir(REPO) first), cast bf16, moved to device. Frozen."""
+    repo root -> caller must chdir(repo) first), cast bf16, moved to device. Frozen."""
     from utils.wan_wrapper import WanVAEWrapper
     vae = WanVAEWrapper().to(dtype=torch.bfloat16)
     vae.to(device=device)
@@ -245,7 +244,7 @@ def parse_args():
                          "new cond/FiLM params keep their zero-init (exact v1.0 function at "
                          "step 0); optimizer/scheduler fresh. Exclusive with --resume.")
     # ---- v2 (2026-09-09): the three fixes named by the 17/08 eye board. Every default
-    # below reproduces v1 EXACTLY: sharp_w 0 => the term is not built, mixer off => no module
+    # below reproduces v1 exactly: sharp_w 0 => the term is not built, mixer off => no module
     # created, ema off => no shadow, patience 0 => no early stop.
     ap.add_argument("--mixer", action="store_true",
                     help="v2 cause 2 (the mosaic): enable the spatial mixer on the token grid. "
@@ -277,9 +276,9 @@ def main():
     args = parse_args()
     if args.dino:
         raise NotImplementedError("--dino is a v2 placeholder (perceptual loss); v1 = latent MSE only")
-    # house rule: wandb is NEVER disabled
+    # house rule: wandb is never disabled
     assert os.environ.get("WANDB_MODE", "") != "disabled", \
-        "house rule: WANDB_MODE=disabled is forbidden -- every run logs live to wandb"
+        "house rule: WANDB_MODE=disabled is forbidden, every run logs live to wandb"
 
     os.chdir(REPO)  # WanVAEWrapper + default data_glob use repo-relative paths
     torch.manual_seed(args.seed)
@@ -312,7 +311,7 @@ def main():
         print(f"[frame_dec] holdout meta -> {meta}", flush=True)
 
     # ---- model / opt ----
-    # fp32 params; bf16 autocast for the matmuls. cond_dim=0 (no --cond) is the STRICT v1.0
+    # fp32 params; bf16 autocast for the matmuls. Cond_dim=0 (no --cond) is the strict v1.0
     # module (no cond params created, state_dict identical).
     decoder = AnchorFrameDecoder(cond_dim=(args.cond_dim if args.cond else 0),
                                  cond_hidden=args.cond_hidden,
@@ -332,7 +331,7 @@ def main():
                if not k.startswith(("cond_norm.", "cond_in.", "cond_out.", "mixer."))]
         assert not bad, f"warm_start missing NON-cond/NON-mixer keys (wrong ckpt?): {bad[:5]}"
         if args.mixer:
-            # the contract of v2 cause 2: turning the mixer on must NEVER silently mean
+            # the contract of v2 cause 2: turning the mixer on must never silently mean
             # "restart from a partly random decoder"
             new_mix = assert_mixer_warm_start(
                 [k for k in missing if not k.startswith(("cond_norm.", "cond_in.", "cond_out."))],
@@ -358,10 +357,10 @@ def main():
 
     ema = EmaWeights(decoder, decay=args.ema_decay) if args.ema else None
     val_prompts = [it.get("prompt", f"_u{i}") for i, it in enumerate(stream.holdout_items)]
-    # Decide the selection criterion ONCE, here, from the holdout itself -- never mid-run:
+    # Decide the selection criterion once, here, from the holdout itself, never mid-run:
     # flipping the tracker's polarity after it already holds a best would compare a loss to
     # an accuracy. If --select_on pair is asked for but the holdout has no same-prompt twin,
-    # the metric is not merely absent, it is UNCOMPUTABLE, and we say so instead of scoring 0.
+    # the metric is not merely absent, it is uncomputable, and we say so instead of scoring 0.
     from decoder_v2 import twin_groups  # noqa: E402
     select_on = args.select_on
     if select_on == "pair" and not twin_groups(val_prompts):
@@ -431,7 +430,7 @@ def main():
                     vlog = {"val/loss": vloss.item()}
                     if args.sharp_w > 0.0:
                         vlog["val/sharp"] = grad_match_loss(vpred, val_target).item()
-                    # THE board metric: right subject rather than its twin, chance 0.5.
+                    # the board metric: right subject rather than its twin, chance 0.5.
                     # This is the 62-68 % of the 17/08 page, which the v1 trainer never saw.
                     pd = pair_discrimination(vpred.float(), val_target, val_prompts)
                     if pd["acc"] is not None:

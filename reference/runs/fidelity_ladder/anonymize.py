@@ -1,21 +1,20 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ECHELLE DE FIDELITE -- anonymisation + planche (CPU + ffmpeg).
-#
-# Entree : videos_raw/{sid}_{arm}.mp4 (60 fichiers). Sorties :
-#   anon/scenarioNN_L.mp4        pleine resolution 480x832, x264 crf 22, metadonnees purgees
-#   anon/micro/scenarioNN_L.mp4  micro-clip telephone < 0.3 MB : extrait du segment A
-#                                (t=8..13 s) + retour complet (t=40.3125 s -> fin), 416x240,
-#                                x264 2 passes a debit cible -- MEME decoupe pour les 6 bras
-#   anon/planche.html            la page recapitulative (10 scenarios x 6 videos + LA question)
-#   anon/answer_sheet.txt        grille de reponse texte
-#   reference/runs/fidelity_ladder/key.json   LA table de correspondance (jamais copiee
-#                                             pres des videos)
-#
-# La permutation lettre->barreau vient de fidelity_common.letter_perm (hash deterministe,
-# sel fige). Les mtimes des fichiers anonymises sont uniformises (aucune fuite par la date),
-# et l'ordre d'encodage est l'ordre alphabetique des lettres, pas celui des barreaux.
-# ============================================================================================
+"""ECHELLE de FIDELITE, anonymisation + planche (CPU + ffmpeg).
+
+Entree : videos_raw/{sid}_{arm}.mp4 (60 fichiers). Sorties :
+  anon/scenarioNN_L.mp4        pleine resolution 480x832, x264 crf 22, metadonnees purgees
+  anon/micro/scenarioNN_L.mp4  micro-clip telephone < 0.3 MB : extrait du segment A
+                               (t=8..13 s) + retour complet (t=40.3125 s -> fin), 416x240,
+                               x264 2 passes a debit cible, MEME decoupe pour les 6 bras
+  anon/planche.html            la page recapitulative (10 scenarios x 6 videos + la question)
+  anon/answer_sheet.txt        grille de reponse texte
+  reference/runs/fidelity_ladder/key.json   la table de correspondance (jamais copiee
+                                            pres des videos)
+
+La permutation lettre->barreau vient de fidelity_common.letter_perm (hash deterministe,
+sel fige). Les mtimes des fichiers anonymises sont uniformises (aucune fuite par la date),
+et l'ordre d'encodage est l'ordre alphabetique des lettres, pas celui des barreaux.
+"""
 import argparse
 import json
 import os
@@ -129,7 +128,7 @@ oui / à peu près / non.</p>
 
 
 def build_answer_sheet(path):
-    lines = [f"{C.PLANCHE_TITLE} -- grille de reponse",
+    lines = [f"{C.PLANCHE_TITLE}, grille de reponse",
              "Question unique par video : le sujet est-il bien revenu a la fin ?",
              "Reponses possibles : oui / a peu pres / non", ""]
     for sc in C.SCENARIOS:

@@ -390,9 +390,9 @@ class Trainer:
         ema_weight = config.ema_weight
         self.generator_ema = None
         if (ema_weight is not None) and (ema_weight > 0.0):
-            # c3: EMA now runs in LoRA mode too, as a TRAINABLE-ONLY shadow (EMA_FSDP skips
+            # c3: EMA now runs in LoRA mode too, as a trainable-only shadow (EMA_FSDP skips
             # non-requires_grad params). It damps the late-training slow-mem-param ramp that
-            # drives the c2 flicker. It does NOT alter the training trajectory (a read-only CPU
+            # drives the c2 flicker. It does not alter the training trajectory (a read-only CPU
             # shadow updated after optimizer.step); eval must set use_ema:true to load it.
             if self.is_main_process:
                 _mode = "trainable-only (LoRA)" if self.is_lora_enabled else "full"
@@ -410,7 +410,7 @@ class Trainer:
         
         
         # Step 4: Initialize the optimizer
-        # memory params (full-rank, excluded from LoRA, un-frozen BEFORE the FSDP wrap), get their own LR group.  
+        # memory params (full-rank, excluded from LoRA, un-frozen before the FSDP wrap), get their own LR group.  
         gen = self.model.generator
         mem_params = [p for n, p in gen.named_parameters() if "memory" in n and p.requires_grad]
         other_params = [p for n, p in gen.named_parameters() if "memory" not in n and p.requires_grad]
@@ -426,13 +426,13 @@ class Trainer:
             weight_decay=config.weight_decay
         )
         # c3: handles for (C) explicit mem-grad clip and (B) cosine lr schedule.
-        # mem params are FSDP-IGNORED, so generator.clip_grad_norm_() (an FSDP method) SKIPS them
+        # mem params are FSDP-ignored, so generator.clip_grad_norm_() (an FSDP method) skips them
         # -> they were unclipped in c1/c2. Default max_grad_norm_mem is effectively-off (1e9).
         self.mem_params = mem_params
         self.max_grad_norm_mem = float(getattr(config, "max_grad_norm_mem", 1e9))
         # per-group base lrs [LoRA, (mem)]; the cosine multiplier is applied to these each step.
         self._base_lrs = [g["lr"] for g in self.generator_optimizer.param_groups]
-        # lr_decay_start defaults BEYOND max_iters => schedule never fires => lr constant (byte-identical).
+        # lr_decay_start defaults beyond max_iters => schedule never fires => lr constant (byte-identical).
         self._lr_decay_start = int(getattr(config, "lr_decay_start", 10**9))
         self._lr_floor_frac = float(getattr(config, "lr_floor_frac", 1.0))       # LoRA group floor
         self._lr_mem_floor_frac = float(getattr(config, "lr_mem_floor_frac", 1.0))  # mem group floor
@@ -1180,7 +1180,7 @@ class Trainer:
             # the write across chunk boundaries; graph alive for one backward, freed after = no leak).
             K_bptt = int(getattr(self.config, "bptt_window", 1))
             # e3: per-step random horizon K ~ U{bptt_window_min .. bptt_window} so the single grad
-            # chunk (W=1) supervises MANY horizons up to the freeze horizon, at proven W=1 VRAM.
+            # chunk (W=1) supervises many horizons up to the freeze horizon, at proven W=1 VRAM.
             # Rank-synced: FSDP collectives require every rank to run the same number of forwards.
             K_min = int(getattr(self.config, "bptt_window_min", K_bptt))
             if K_bptt > K_min:
@@ -1221,7 +1221,7 @@ class Trainer:
                         break
                     _used += 1
                     rg = (_k >= K_bptt - W) or (seed_step and _k == 0)   # +chunk 0 on seed steps
-                    # e3: build the mem-OFF counterfactual twin only for the LAST (grad-tail) chunk
+                    # e3: build the mem-OFF counterfactual twin only for the last (grad-tail) chunk
                     _mk_twin = (rg and _k == K_bptt - 1 and _e3_on)
                     _gc, _ci = self.streaming_model.generate_next_chunk(
                         requires_grad=rg, detach_state=(_k == K_bptt - W),
@@ -1233,7 +1233,7 @@ class Trainer:
                         if seed_step:   # per-chunk backward; sever the KV-cache grad link between chunks
                             _snap = self._snapshot_ttt_state()
                             torch.cuda.empty_cache()   # e4: reclaim the ~800MB reserved-but-unallocated cache
-                                                       # at the post-forward low-water mark, BEFORE chunk-0's
+                                                       # at the post-forward low-water mark, before chunk-0's
                                                        # backward peak (seed step only ~1/20). Fits the 4-GPU budget.
                             try:
                                 (_l / (self.gradient_accumulation_steps * _n_grad)).backward()
@@ -1599,7 +1599,7 @@ class Trainer:
                                     self.writer.add_scalar(f"generator/{_k}", generator_log_dict[_k].mean().item(), self.step)
                                 except Exception:
                                     pass
-                        # e3 counterfactual-objective terms (dose/dnh/motion-match) -- logged every
+                        # e3 counterfactual-objective terms (dose/dnh/motion-match), logged every
                         # generator step so act_floor is calibratable and mm_ext/motion is observable
                         for _k, _v in generator_log_dict.items():
                             if _k.startswith("e3_"):
@@ -1754,7 +1754,7 @@ class Trainer:
                         self.writer.add_scalar(f"memory/Pc_b{li}", p.detach().float().norm().item(), self.step)
                     elif n.endswith("proj_extra.weight"):
                         # gate_extra usage: proj_extra is zero-init, so per-input column-norm = how much
-                        # the gate learned to use each combo input. feature order is code-fixed:
+                        # the gate learned to use each combo input. Feature order is code-fixed:
                         # [agreement(1), denoising_step(GX_EMB=16), frames_since_switch(16)]. Normalize the
                         # 16-dim ones by sqrt(16) so all three are per-weight-RMS comparable.
                         w = p.detach().float(); E = 16
@@ -1883,7 +1883,7 @@ class Trainer:
                 "ema": {k: v.detach().to("cpu") for k, v in (getattr(c, "ema", {}) or {}).items()},
                 # c2 eviction-feed fifo: backward recompute re-appends inside the checkpointed
                 # block, so restore the pre-backward list. Entries are (idx, tensor) tuples
-                # REPLACED per write (tensors never mutated in place) -> a shallow list copy
+                # replaced per write (tensors never mutated in place) -> a shallow list copy
                 # of refs suffices, no device round-trip needed.
                 "fifo": list(getattr(c, "fifo", []) or []),
             }
@@ -1951,7 +1951,7 @@ class Trainer:
             print("[Warning] No fixed validation batch available for visualization.")
             return
 
-        # c2 cache-dropout: the vis pipeline SHARES the generator modules, so force the full
+        # c2 cache-dropout: the vis pipeline shares the generator modules, so force the full
         # config sink for visualization and re-assert the training rollout's runtime sink
         # afterwards (a dropout rollout may be mid-sequence). No-op when the flag is off.
         _cd_pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)

@@ -1,46 +1,45 @@
 #!/usr/bin/env python
-# ============================================================================================
-# DECODER v2 -- the three fixes named by the 2026-08-17 eye board "Ce que produit la memoire",
-# rebuilt 2026-09-09 after the loss of the post-13/08 working tree.
-#
-# WHAT THAT BOARD MEASURED (the only surviving numbers of the campaign, quoted verbatim from
-# the published page):
-#   - from the memory state ALONE, the decoder picks the right subject over its twin in
-#     62-68 % of cases (chance 50 %), on subjects never seen, confirmed on two independent
-#     trainings  =>  the identity information IS in the state;
-#   - but the rendering is unusable: it carries the palette and the coarse layout, the subject
-#     is not recognizable, and it sits BELOW the strong-blur rung (which already fails the eye).
-#
-# THE THREE CAUSES THE BOARD NAMED, and the fix each one gets here:
-#   1. "the best point is reached at 4 200 steps out of 12 000, and quality degrades after"
-#      -> BestTracker + EmaWeights: select on validation, never on the last step, and average
-#         the weights so a late-training excursion cannot be what we ship. NOT a new schedule:
-#         the v1 cosine schedule is fine, what was missing is that nothing kept the best point.
-#   2. "the output is made of independent blocks: nothing enforces coherence between
-#      neighbouring blocks, hence the mosaic"
-#      -> the mixer already EXISTS in AnchorFrameDecoder(mixer=True) (FrameMixerBlock, zero-init
-#         => identity at init => a v1 checkpoint warm-starts bitwise). It was never wired into
-#         the trainer. `assert_mixer_warm_start` enforces the contract that the ONLY missing
-#         keys are `mixer.*`, so "I turned the mixer on" can never silently mean "I reset the
-#         decoder".
-#   3. "no term of the objective pushes toward sharpness"
-#      -> grad_match_loss: MATCH the target's spatial finite differences, normalized by the
-#         target's own gradient energy. Matching, not maximizing: a maximizer is gamed by
-#         noise (the e2_amp lesson -- an unbounded "be more active" term always degenerates),
-#         a matcher is not. Scale-free and exactly 1.0 for a constant output, like norm_mse,
-#         so the zero-init head still starts every term at 1.0.
-#
-# THE METRIC THAT WAS MISSING FROM THE TRAINER. The 62-68 % is a PAIR DISCRIMINATION, and the
-# v1 trainer never computed it -- it selected on reconstruction loss, which the board proved is
-# NOT the quantity we care about (loss went on improving while the eye verdict went negative).
-# `pair_discrimination` computes it on the holdout: for each item whose same-prompt twin is
-# also in the holdout, is the decoded frame closer to ITS OWN target than to the twin's? It is
-# scored in the low-band (8x8 centred-reduced correlation), the same statistic the project used
-# for T0 in composite_gates_report §16.1, so the number is comparable to the sealed campaign.
-#
-# Everything here is pure torch on CPU-sized tensors and is covered by selftest_v2.py.
-# NOTHING in this file changes v1 behaviour: train_decoder.py calls it only behind new flags.
-# ============================================================================================
+"""Decoder v2, the three fixes named by the 2026-08-17 eye board "Ce que produit la memoire",
+rebuilt 2026-09-09 after the loss of the post-13/08 working tree.
+
+What that board measured (the only surviving numbers of the campaign, quoted verbatim from
+the published page):
+  - from the memory state alone, the decoder picks the right subject over its twin in
+    62-68 % of cases (chance 50 %), on subjects never seen, confirmed on two independent
+    trainings  =>  the identity information is in the state;
+  - but the rendering is unusable: it carries the palette and the coarse layout, the subject
+    is not recognizable, and it sits below the strong-blur rung (which already fails the eye).
+
+The three causes the board named, and the fix each one gets here:
+  1. "the best point is reached at 4 200 steps out of 12 000, and quality degrades after"
+     -> BestTracker + EmaWeights: select on validation, never on the last step, and average
+        the weights so a late-training excursion cannot be what we ship. Not a new schedule:
+        the v1 cosine schedule is fine, what was missing is that nothing kept the best point.
+  2. "the output is made of independent blocks: nothing enforces coherence between
+     neighbouring blocks, hence the mosaic"
+     -> the mixer already exists in AnchorFrameDecoder(mixer=True) (FrameMixerBlock, zero-init
+        => identity at init => a v1 checkpoint warm-starts bitwise). It was never wired into
+        the trainer. `assert_mixer_warm_start` enforces the contract that the only missing
+        keys are `mixer.*`, so "I turned the mixer on" can never silently mean "I reset the
+        decoder".
+  3. "no term of the objective pushes toward sharpness"
+     -> grad_match_loss: match the target's spatial finite differences, normalized by the
+        target's own gradient energy. Matching, not maximizing: a maximizer is gamed by
+        noise (the e2_amp lesson, an unbounded "be more active" term always degenerates),
+        a matcher is not. Scale-free and exactly 1.0 for a constant output, like norm_mse,
+        so the zero-init head still starts every term at 1.0.
+
+The metric that was missing from the trainer. The 62-68 % is a pair discrimination, and the
+v1 trainer never computed it, it selected on reconstruction loss, which the board proved is
+not the quantity we care about (loss went on improving while the eye verdict went negative).
+`pair_discrimination` computes it on the holdout: for each item whose same-prompt twin is
+also in the holdout, is the decoded frame closer to its own target than to the twin's? It is
+scored in the low-band (8x8 centred-reduced correlation), the same statistic the project used
+for T0 in composite_gates_report §16.1, so the number is comparable to the sealed campaign.
+
+Everything here is pure torch on CPU-sized tensors and is covered by selftest_v2.py.
+nothing in this file changes v1 behaviour: train_decoder.py calls it only behind new flags.
+"""
 import copy
 import math
 
@@ -51,13 +50,13 @@ import torch
 def grad_match_loss(pred, target, eps=1e-8):
     """Match the target's spatial finite differences. Scale-free, batch-averaged.
 
-    pred/target: (B, ..., H, W). Returns a scalar.
+    Pred/target: (B, ..., H, W). Returns a scalar.
 
     Properties that matter, and why (each one blocks a degeneracy we have already been bitten
     by elsewhere in this project):
-      - a CONSTANT output scores exactly 1.0, like norm_mse at the zero-init head, so the two
+      - a constant output scores exactly 1.0, like norm_mse at the zero-init head, so the two
         terms start commensurate and `--sharp_w` is a real ratio, not a scale guess;
-      - it is a MATCHING term, so pouring high-frequency noise into the output makes it WORSE,
+      - it is a matching term, so pouring high-frequency noise into the output makes it worse,
         not better (an energy-maximizing sharpness term is the same trap as e2_amp's rel_norm);
       - it is blind to the DC and to any smooth ramp, so it cannot be satisfied by the
         token-constant bias that the memory read learned in the e1/e2 era.
@@ -106,7 +105,7 @@ class BestTracker:
         return improved
 
     def should_stop(self, patience):
-        """patience <= 0 disables early stopping (the default: we prefer a full run plus a
+        """Patience <= 0 disables early stopping (the default: we prefer a full run plus a
         best-checkpoint over a truncated run, and the two are not the same experiment)."""
         return patience > 0 and self.since_best >= patience
 
@@ -143,10 +142,10 @@ class EmaWeights:
 def assert_mixer_warm_start(missing, unexpected):
     """Contract for `decoder.load_state_dict(v1_ckpt, strict=False)` when --mixer is on.
 
-    The mixer is zero-init on its last pointwise, so it is EXACTLY the identity at init and a
+    The mixer is zero-init on its last pointwise, so it is exactly the identity at init and a
     v1 checkpoint must warm-start into it with no functional change. The only acceptable
     missing keys are therefore `mixer.*`. Anything else means the checkpoint does not match
-    the architecture and the run would silently start from a partly random decoder -- the
+    the architecture and the run would silently start from a partly random decoder, the
     class of mistake that cost this project two campaigns.
     """
     bad_missing = [k for k in missing if not k.startswith("mixer.")]
@@ -165,7 +164,7 @@ def lowband(x, n=8, eps=1e-8):
     composite_gates_report §16.1 (VAE-free variant: we stay in latent space here).
 
     x: (B, C, H, W) or (B, 1, C, H, W). Returns (B, n*n), each row zero-mean unit-norm, so a
-    dot product between two rows IS their correlation.
+    dot product between two rows is their correlation.
     """
     if x.dim() == 5:
         assert x.shape[1] == 1, f"expected a single frame, got {tuple(x.shape)}"
@@ -179,7 +178,7 @@ def lowband(x, n=8, eps=1e-8):
 
 def twin_groups(prompts):
     """Group holdout indices by prompt. Returns the list of (i, j) ordered pairs such that i
-    and j share a prompt and i != j -- i.e. every (subject, its twin) query the board's
+    and j share a prompt and i != j, i.e. every (subject, its twin) query the board's
     "le bon sujet plutot que son jumeau" question is asked on.
 
     A prompt with k > 2 members contributes every ordered pair, which is what we want: the
@@ -199,15 +198,15 @@ def twin_groups(prompts):
 
 @torch.no_grad()
 def pair_discrimination(pred, target, prompts, n=8):
-    """THE board metric: does the decoded frame look more like its OWN target than like the
+    """The board metric: does the decoded frame look more like its own target than like the
     same-prompt twin's target?
 
-    pred/target: (B, 1, C, H, W) latent frames. prompts: list of B strings.
-    Returns dict(acc, n_pairs, margin) -- acc is the 62-68 % number, chance is 0.5, and
+    Pred/target: (B, 1, C, H, W) latent frames. Prompts: list of B strings.
+    Returns dict(acc, n_pairs, margin), acc is the 62-68 % number, chance is 0.5, and
     `margin` is the mean (own correlation - twin correlation), which says how far from the
     coin flip the wins are rather than just how many there were.
 
-    Returns acc=None when the holdout contains no twin pair at all: that is a SETUP error
+    Returns acc=None when the holdout contains no twin pair at all: that is a setup error
     (the holdout was cut without keeping both members of a pair together), not a score of
     zero, and the trainer must not select a checkpoint on it.
     """

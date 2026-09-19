@@ -1,47 +1,46 @@
 #!/usr/bin/env python
-# ============================================================================================
-# P0 -- MEMOIRE LINEAIRE NATIVE : TEST D'EQUIVALENCE GENERATION == REJEU HORS LIGNE.
-# (plan : reference/plan_entrainement_video_2026-08-07.md, section 2, bras M2 -- "le seul vrai
-#  developpement du programme", et LE test qui autorise la suite : sans lui on entrainerait un
-#  decodeur sur un etat qui n'est pas celui du deploiement.)
-#
-# Ce qui est teste, sur 2 videos du corpus v2 (main:9000000, main:9000001 par defaut) :
-#   N0  NON-REGRESSION EN GENERATION (memoire par DEFAUT, SwiGLU) : le rollout regenere
-#       (build_pipeline + rollout_collect, MEM_ZERO_ALL=1, poke fp16) reproduit BIT A BIT le
-#       shard v2 du disque -- latents fp16 et h fp16, chaque bloc, chaque ecriture. C'est la
-#       preuve en conditions reelles que le chemin par defaut n'a pas bouge apres l'ajout du
-#       type lineaire (en plus des selftests historiques rejoues a cote).
-#   T0  PARITE DES DEUX IMPLEMENTATIONS : video_memory.linear_delta_chunk_update (le coeur
-#       DEPLOYE) == build_states.lin_chunk_update rule='delta' (l'oracle scelle), torch.equal
-#       sur un chunk REEL (4680 x 1536) et sur un mini-cas synthetique.
-#   T1  IDENTITE DE REGENERATION (memoire LINEAIRE activee par config) : meme graine, memes
-#       write_chunks, latents et h bit a bit egaux au shard -- sous MEM_ZERO_ALL=1 l'etat ne
-#       nourrit que l'injection zeroisee, donc la memoire lineaire est INVISIBLE du backbone ;
-#       cette egalite prouve qu'on rejoue bien LES videos du corpus, pas des cousines.
-#   T2  EQUIVALENCE fp32, CHAQUE ECRITURE : l'etat W produit EN GENERATION (snapshot fp32
-#       apres chacune des 25 ecritures, 3 blocs) == la chaine hors ligne lin_chunk_update sur
-#       les h STOCKES (fp16 disque -> fp32, exact), torch.equal (bit a bit).
-#   T3  EQUIVALENCE CONTRE LA FONCTION DE PRODUCTION : build_states.lin_states (delta, tous
-#       tokens = bras lin_delta_all) aux ~4 ages scelles -> ses snapshots fp16 == fp16(W de
-#       generation) aux memes ecritures, bit a bit.
-#   Chrono + VRAM : s/video et pic memoire, memoire par defaut vs lineaire, meme GPU.
-#
-# Pourquoi le bit a bit est ATTEIGNABLE (et pas seulement un allclose) :
-#   - le collecteur remplace le h du fifo par son aller-retour fp16 AVANT l'ecriture (poke
-#     scelle de collect_pairs) : l'ecriture in-situ consomme EXACTEMENT les octets du shard ;
-#   - bf16 -> fp32 (generation) et fp16 -> fp32 (rejeu) sont exacts, memes valeurs ;
-#   - _linear_write force TF32 OFF (sauvegarde/restauration) et le rejeu tourne TF32 OFF
-#     (asserte ici) : memes kernels fp32, memes formes (T, d), meme ordre sequentiel ;
-#   - meme GPU, meme process pour les deux chemins.
-#
-# Usage (GPU obligatoire ; pre-check DANS la commande, jamais l'index 6, jamais une carte d'un
-# autre utilisateur) :
-#   cd /shared/ssd_14T/home/adenelmi/Anchor-Forcing && \
-#   CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
-#   CUDA_VISIBLE_DEVICES=<X> python reference/runs/probe1/selftest_lin_native.py
-# Options : --skip-baseline (saute N0), --n-videos 2, --config <yaml>.
-# Sortie : code 0 = tout vert ; JSON recapitulatif dans $HEAVY/runs/selftest_lin_native.json.
-# ============================================================================================
+"""P0, MEMOIRE LINEAIRE native : test D'equivalence generation == REJEU hors ligne.
+(plan : reference/plan_entrainement_video_2026-08-07.md, section 2, bras M2, "le seul vrai
+ developpement du programme", et LE test qui autorise la suite : sans lui on entrainerait un
+ decodeur sur un etat qui n'est pas celui du deploiement.)
+
+Ce qui est teste, sur 2 videos du corpus v2 (main:9000000, main:9000001 par defaut) :
+  N0  non-regression en generation (memoire par DEFAUT, SwiGLU) : le rollout regenere
+      (build_pipeline + rollout_collect, MEM_ZERO_ALL=1, poke fp16) reproduit bit A bit le
+      shard v2 du disque, latents fp16 et h fp16, chaque bloc, chaque ecriture. C'est la
+      preuve en conditions reelles que le chemin par defaut n'a pas bouge apres l'ajout du
+      type lineaire (en plus des selftests historiques rejoues a cote).
+  T0  PARITE des DEUX implementations : video_memory.linear_delta_chunk_update (le coeur
+      DEPLOYE) == build_states.lin_chunk_update rule='delta' (l'oracle scelle), torch.equal
+      sur un chunk reel (4680 x 1536) et sur un mini-cas synthetique.
+  T1  IDENTITE de regeneration (memoire LINEAIRE activee par config) : meme graine, memes
+      write_chunks, latents et h bit a bit egaux au shard, sous MEM_ZERO_ALL=1 l'etat ne
+      nourrit que l'injection zeroisee, donc la memoire lineaire est invisible du backbone ;
+      cette egalite prouve qu'on rejoue bien les videos du corpus, pas des cousines.
+  T2  equivalence fp32, CHAQUE ECRITURE : l'etat W produit en generation (snapshot fp32
+      apres chacune des 25 ecritures, 3 blocs) == la chaine hors ligne lin_chunk_update sur
+      les h stockes (fp16 disque -> fp32, exact), torch.equal (bit a bit).
+  T3  equivalence CONTRE la FONCTION de production : build_states.lin_states (delta, tous
+      tokens = bras lin_delta_all) aux ~4 ages scelles -> ses snapshots fp16 == fp16(W de
+      generation) aux memes ecritures, bit a bit.
+  Chrono + VRAM : s/video et pic memoire, memoire par defaut vs lineaire, meme GPU.
+
+Pourquoi le bit a bit est ATTEIGNABLE (et pas seulement un allclose) :
+  - le collecteur remplace le h du fifo par son aller-retour fp16 AVANT l'ecriture (poke
+    scelle de collect_pairs) : l'ecriture in-situ consomme EXACTEMENT les octets du shard ;
+  - bf16 -> fp32 (generation) et fp16 -> fp32 (rejeu) sont exacts, memes valeurs ;
+  - _linear_write force TF32 OFF (sauvegarde/restauration) et le rejeu tourne TF32 OFF
+    (asserte ici) : memes kernels fp32, memes formes (T, d), meme ordre sequentiel ;
+  - meme GPU, meme process pour les deux chemins.
+
+Usage (GPU obligatoire ; pre-check dans la commande, jamais l'index 6, jamais une carte d'un
+autre utilisateur) :
+  cd /shared/ssd_14T/home/adenelmi/Anchor-Forcing && \
+  CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
+  CUDA_VISIBLE_DEVICES=<X> python reference/runs/probe1/selftest_lin_native.py
+Options : --skip-baseline (saute N0), --n-videos 2, --config <yaml>.
+Sortie : code 0 = tout vert ; JSON recapitulatif dans $heavy/runs/selftest_lin_native.json.
+"""
 import argparse
 import os
 import sys
@@ -56,14 +55,14 @@ import torch  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 
 import mem2_data as D  # noqa: E402
-from selftest_lin import first_pair_videos  # noqa: E402  (les MEMES 2 videos que selftest_lin)
+from selftest_lin import first_pair_videos  # noqa: E402  (les memes 2 videos que selftest_lin)
 
 PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
 _failed = []
 
 
 def check(name, ok, detail=""):
-    print(f"  [{PASS if ok else FAIL}] {name}" + (f" -- {detail}" if detail else ""), flush=True)
+    print(f"  [{PASS if ok else FAIL}] {name}" + (f": {detail}" if detail else ""), flush=True)
     if not ok:
         _failed.append(name)
     return ok
@@ -125,7 +124,7 @@ def main():
     ap.add_argument("--config", default=C.DEFAULT_CONFIG)
     ap.add_argument("--n-videos", type=int, default=2)
     ap.add_argument("--skip-baseline", action="store_true",
-                    help="saute N0 (rollout memoire par defaut) -- equivalence seulement")
+                    help="saute N0 (rollout memoire par defaut), equivalence seulement")
     args = ap.parse_args()
 
     assert torch.cuda.is_available(), "GPU obligatoire (`import wan` touche CUDA)"

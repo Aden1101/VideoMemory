@@ -1,38 +1,37 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ECHELLE DE FIDELITE, CAMPAGNE 2 : REGIME DU SUJET NON-OUVRANT (correction d'Aden 11/08).
-#
-# DEFAUT DE LA CAMPAGNE 1 : forme S1 (A ouvre la video) -> la frame 0 du SUJET est epinglee
-# dans le sink (jamais evincee), donc le sujet peut revenir sans aucune insertion ; c'est le
-# terrain documente ou "le sink regne par le recache". La campagne 1 est CONSERVEE comme
-# reference "terrain facile".
-#
-# FORME RETENUE : S2 du harnais reid_scen (scenarios.py), VERBATIM :
-#     C(0-60)  A(60-120)  B(120-180)  A(180-240)      240 frames latentes
-# Pourquoi S2 et pas S2p : (1) S2 est LE terrain non-ouvrant canonique de la matrice scellee
-# (celui ou stockoff s'effondre structurellement, GEL 03/08) ; (2) la paraphrase de S2p ne
-# sert qu'au ROUTEUR de frame-bank, absent de cette campagne (insertion au planning) ; elle
-# changerait le conditionnement sans aucun gain ; (3) le prompt de retour VERBATIM et sans
-# attribut garde le meme conditionnement que la campagne 1 : seule la position du sujet dans
-# le planning change entre les deux campagnes.
-#
-# EVICTION PROUVEE (pas supposee) : sink_size=1 (frame 0 = C), local_attn_size=12 -> au
-# retour (frame 180) la fenetre couvre [169, 180) (queue de B) et le segment A [60, 120) est
-# sorti du cache depuis 48+ frames. La preuve RUNTIME est enregistree par run_fidelity2 sur
-# des cellules temoins : lecture des index du KV cache (global_end/local_end/sink) de CHAQUE
-# bloc a l'instant du recache de retour -> plus vieille frame non-sink retenue = 169 > 120.
-#
-# BARREAUX : identiques a la campagne 1 (rien / oracle / flou_leger / flou_fort /
-# meme_categorie / autre_categorie), ancre = frame 119 (derniere frame latente du segment A).
-# JUMEAU : dans ce regime le segment A ne peut pas etre la video v2 jugee (le sujet emerge en
-# cours de rollout) ; le jumeau est donc REGENERE dans le MEME regime : rollout de preparation
-# C(0-60) A(60-120) en 120 frames avec la graine main+100000, frame 119 -> "meme prompt,
-# graine +100000, meme regime d'apparition". Le donneur `autre_categorie` = le jumeau du
-# scenario donneur ((i+5) % 10, inter-categories). Les labels ADEN_V2_STRONG_19 se
-# transferent ici comme propriete du PROMPT (forte variabilite intra-classe), pas des
-# instances exactes : ECART DE PROTOCOLE documente au rapport, verifie a l'oeil sur les
-# planches de refs (sujet A du rollout vs jumeau insere).
-# ============================================================================================
+"""ECHELLE de FIDELITE, CAMPAGNE 2 : regime DU SUJET non-OUVRANT (correction d'Aden 11/08).
+
+DEFAUT de la CAMPAGNE 1 : forme S1 (A ouvre la video) -> la frame 0 du SUJET est epinglee
+dans le sink (jamais evincee), donc le sujet peut revenir sans aucune insertion ; c'est le
+terrain documente ou "le sink regne par le recache". La campagne 1 est CONSERVEE comme
+reference "terrain facile".
+
+Forme RETENUE : S2 du harnais reid_scen (scenarios.py), verbatim :
+    C(0-60)  A(60-120)  B(120-180)  A(180-240)      240 frames latentes
+Pourquoi S2 et pas S2p : (1) S2 est LE terrain non-ouvrant canonique de la matrice scellee
+(celui ou stockoff s'effondre structurellement, gel 03/08) ; (2) la paraphrase de S2p ne
+sert qu'au ROUTEUR de frame-bank, absent de cette campagne (insertion au planning) ; elle
+changerait le conditionnement sans aucun gain ; (3) le prompt de retour verbatim et sans
+attribut garde le meme conditionnement que la campagne 1 : seule la position du sujet dans
+le planning change entre les deux campagnes.
+
+Eviction PROUVEE (pas supposee) : sink_size=1 (frame 0 = C), local_attn_size=12 -> au
+retour (frame 180) la fenetre couvre [169, 180) (queue de B) et le segment A [60, 120) est
+sorti du cache depuis 48+ frames. La preuve RUNTIME est enregistree par run_fidelity2 sur
+des cellules temoins : lecture des index du KV cache (global_end/local_end/sink) de CHAQUE
+bloc a l'instant du recache de retour -> plus vieille frame non-sink retenue = 169 > 120.
+
+BARREAUX : identiques a la campagne 1 (rien / oracle / flou_leger / flou_fort /
+meme_categorie / autre_categorie), ancre = frame 119 (derniere frame latente du segment A).
+JUMEAU : dans ce regime le segment A ne peut pas etre la video v2 jugee (le sujet emerge en
+cours de rollout) ; le jumeau est donc REGENERE dans le MEME regime : rollout de preparation
+C(0-60) A(60-120) en 120 frames avec la graine main+100000, frame 119 -> "meme prompt,
+graine +100000, meme regime d'apparition". Le donneur `autre_categorie` = le jumeau du
+scenario donneur ((i+5) % 10, inter-categories). Les labels ADEN_V2_STRONG_19 se
+transferent ici comme propriete du prompt (forte variabilite intra-classe), pas des
+instances exactes : ECART de PROTOCOLE documente au rapport, verifie a l'oeil sur les
+planches de refs (sujet A du rollout vs jumeau insere).
+"""
 import os
 
 import fidelity_common as C1
@@ -90,7 +89,7 @@ ARMS = C1.ARMS
 ARM_ENV = C1.ARM_ENV
 SRC_ARMS = C1.SRC_ARMS
 
-# ---- anonymisation : SEL DIFFERENT de la campagne 1 (permutations independantes) ------------
+# ---- anonymisation : SEL different de la campagne 1 (permutations independantes) ------------
 ANON_SALT = "fidelity_ladder_nonopening_2026-08-11"
 LETTERS = C1.LETTERS
 
@@ -106,7 +105,7 @@ def letter_perm(sid):
 
 
 # ---- decoupe des micro-clips (anonymize --campaign nonopening) ------------------------------
-# apercu du SEGMENT DU SUJET (A : latents 60-120 -> t 14.8-29.8 s), puis le retour complet.
+# apercu du segment DU SUJET (A : latents 60-120 -> t 14.8-29.8 s), puis le retour complet.
 MICRO_GLIMPSE = (16.0, 21.0)
 MICRO_RETURN_T = (RETURN_FRAME * 4 - 3) / 16.0        # 44.8125 s
 PLANCHE_TITLE = "Échelle de fidélité (sujet non-ouvrant) — planche aveugle"
@@ -115,15 +114,13 @@ PLANCHE_NOTE = ("Chaque vidéo : une scène d'ouverture, PUIS le sujet, puis une
                 "phrase affichée).")
 
 
-# ============================================================================================
-# ECHELLE DE FLOU FINE (mission coordinateur 12/08, apres le verdict 7 scenarios) :
+# ECHELLE de FLOU FINE (mission coordinateur 12/08, apres le verdict 7 scenarios) :
 # le seuil decisif est peut-etre entre sigma=0 et sigma=6 -> 4 barreaux intermediaires
-# sigma = 1, 2, 3, 4 sur les 3 scenarios NON JUGES (08, 09, 10). Les barreaux sigma=0
+# sigma = 1, 2, 3, 4 sur les 3 scenarios non juges (08, 09, 10). Les barreaux sigma=0
 # (oracle), 6 (flou_leger) et 24 (flou_fort) existent deja et sont REUTILISES.
 # Paquet anonyme SEPARE : 3 scenarios x 7 niveaux, lettres A-G permutees par scenario
 # (sel independant : l'ordre croissant du flou ne doit pas etre devinable), cle dans
 # key_blur.json UNIQUEMENT.
-# ============================================================================================
 BLUR_FINE_SIGMAS = {"flou_s1": 1.0, "flou_s2": 2.0, "flou_s3": 3.0, "flou_s4": 4.0}
 BLUR_ARM_ENV = {name: dict(C1.ARM_ENV["oracle"], ORACLE_BLUR_SIGMA=str(s))
                 for name, s in BLUR_FINE_SIGMAS.items()}

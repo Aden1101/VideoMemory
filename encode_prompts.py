@@ -1,22 +1,21 @@
 #!/usr/bin/env python
-# ============================================================================================
-# PASS 1: encode the prompts, write the cache, and EXIT.
-#
-# The exit is the point. An in-process offload always leaves the 11.4 GB somewhere in the shared
-# pool of a unified-memory machine; only the end of the process actually returns them to the OS.
-# Pass 2 (inference/inference.py with AF_LAZY_TEXT_ENCODER=1) then never constructs the encoder
-# and keeps the memory for the generator.
-#
-#   python encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
-#   python encode_prompts.py --file inference/interactive_case.jsonl        # switch scenarios
-#   python encode_prompts.py --stats                                        # cache state
-#
-# Then:
-#   AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path ...
-#
-# Accepted formats: .txt (one prompt per line) and .jsonl (key "prompts", one list per line, the
-# revisit-scenario format). Duplicates are encoded only once.
-# ============================================================================================
+"""Pass 1: encode the prompts, write the cache, and exit.
+
+The exit is the point. An in-process offload always leaves the 11.4 GB somewhere in the
+shared pool of a unified-memory machine; only the end of the process returns them to the OS.
+Pass 2 (inference/inference.py with AF_LAZY_TEXT_ENCODER=1) then never constructs the
+encoder and keeps the memory for the generator.
+
+    python encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
+    python encode_prompts.py --file inference/interactive_case.jsonl        # switch scenarios
+    python encode_prompts.py --stats                                        # cache state
+
+Then:
+    AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path ...
+
+Accepted formats: .txt (one prompt per line) and .jsonl (key "prompts", one list per line,
+the revisit-scenario format). Duplicates are encoded once.
+"""
 import argparse
 import json
 import os
@@ -37,8 +36,8 @@ def read_prompts(path):
                 obj = json.loads(line)
                 out.extend(obj["prompts"] if isinstance(obj.get("prompts"), list) else [obj])
         return out
-    # FULL `.rstrip()`, not just the newline: this is exactly what utils.dataset.TextDataset
-    # does. The cache key is the verbatim text, so a trailing space left in here would produce a
+    # A full `.rstrip()`, not just the newline, which is what utils.dataset.TextDataset does.
+    # The cache key is the verbatim text, so a trailing space left in here would produce a
     # silent cache miss on every run.
     with open(path, encoding="utf-8") as f:
         return [l.rstrip() for l in f if l.strip()]
@@ -53,7 +52,7 @@ def main():
     ap.add_argument("--batch", type=int, default=4, help="prompts encoded per batch")
     ap.add_argument("--cache_dir", default=None)
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32", "float16"],
-                    help="encoding precision. bfloat16 by DEFAULT because inference.py does "
+                    help="encoding precision. bfloat16 by default because inference.py does "
                          "`pipeline.to(dtype=torch.bfloat16)`: pass 1 must encode in the same "
                          "precision as pass 2, otherwise the conditioning differs.")
     ap.add_argument("--stats", action="store_true", help="print the cache state and exit")
@@ -74,7 +73,7 @@ def main():
     if not prompts:
         ap.error("nothing to encode: give --file or --prompt")
 
-    # de-duplicate while PRESERVING order (so the log reads in file order)
+    # de-duplicate while preserving order, so the log reads in file order
     seen, uniq = set(), []
     for p in prompts:
         if p not in seen:
@@ -95,8 +94,8 @@ def main():
 
     print(describe(), flush=True)
     t0 = time.time()
-    te = WanTextEncoder()                      # EAGER load here: that is the point of this script
-    te = te.to(dtype=want)                     # SAME cast inference.py applies to the pipeline
+    te = WanTextEncoder()                      # eager load here, which is the point of this script
+    te = te.to(dtype=want)                     # the cast inference.py applies to the pipeline
     print(f"encoder loaded in {time.time()-t0:.0f} s, precision {a.dtype}", flush=True)
 
     done, t0 = 0, time.time()

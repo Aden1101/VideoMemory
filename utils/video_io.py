@@ -1,18 +1,15 @@
-# ============================================================================================
-# VIDEO WRITING -- one entry point.
-#
-# 2026-09-09. `torchvision.io.write_video` was deprecated and then REMOVED from recent
-# torchvision releases (gone as of 0.24). The repo imports it at the top of four files, so on
-# any recent install the inference path breaks at import time, with a message that says
-# nothing about the real problem.
-#
-# This module keeps torchvision when it is there (behaviour and encoding strictly unchanged on
-# a README-conformant install, torchvision 0.21) and otherwise falls back to imageio, which is
-# already in requirements.txt. Nothing to pin, nothing to reinstall.
-#
-# Contract shared by both paths: `frames` is a (T, H, W, C) uint8 tensor, as torchvision
-# requires.
-# ============================================================================================
+"""Video writing, one entry point.
+
+`torchvision.io.write_video` was deprecated and then removed (gone as of torchvision 0.24).
+The repo imports it at the top of four files, so on any recent install the inference path
+breaks at import time with a message that says nothing about the real problem.
+
+Torchvision is used when it is there, so behaviour and encoding are unchanged on a
+README-conformant install (torchvision 0.21). Otherwise this falls back to imageio, which is
+already in requirements.txt.
+
+Both paths take `frames` as a (T, H, W, C) uint8 tensor, as torchvision requires.
+"""
 import numpy as np
 import torch
 

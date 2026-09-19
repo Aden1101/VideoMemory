@@ -1,37 +1,36 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ETAPE 1 -- APPLICATION MECANIQUE DES SEUILS SCELLES (version v2, 2026-08-05).
-#
-# Ce script ne calcule rien : il LIT les JSON produits par train_probe.py et applique les
-# regles. Il n'y a donc aucune place pour une lecture narrative apres coup.
-#
-# LES REGLES, telles qu'elles sont scellees au registre (memory2_probes_registry.md) :
-#
-#   1. VALIDITE DU PROTOCOLE (borne). Texte d'origine : "le meme pipeline sur les ACTIVATIONS
-#      brutes doit atteindre >= 90 % de precision par paire". RE-ANCRAGE scelle le 05/08
-#      (section PLAFOND HUMAIN) apres le verdict d'oeil d'Aden : sur les materiaux v1 les deux
-#      jumeaux d'une paire sont souvent LE MEME individu (5 paires "quasi identiques", plafond
-#      humain estime ~74 %), donc 90 % etait inatteignable MEME POUR UN HUMAIN et ne pouvait
-#      pas juger l'instrument. La borne se juge desormais sur le sous-ensemble "CLAIREMENT
-#      DIFFERENTS" {01,02,11,12,19,27} = 6 paires, seuil >= 5/6 (mission 04/08). Le 90 % global
-#      reste IMPRIME, comme information, jamais comme verdict.
-#   2. CONTROLE EFFONDREMENT : etats permutes entre videos -> precision <= 55 %.
-#   3. SUCCES de l'etat : precision-sujet >= 65 % ET Wilcoxon p < 0.05 sur les marges ET
-#      (precision-sujet - precision-fond) >= +10 points.
-#   4. ZONE GRISE (55-75 % sans les 3 conditions) : +30 paires generees AVANT toute conclusion.
-#      ECHEC : < 55 % ou ecart sujet-fond nul -> ARRET du chantier memoire.
-#
-# LECTURE : "precision par paire" se lit PARTOUT en PAR PAIRE (reglage final n 1 du 04/08 au
-# soir : c'etait la lettre du protocole, et l'audit T9b a montre que la lecture par-ligne
-# plafonne a 0,911 meme a signal parfait). PRIMARY est fige a "pair" ; la lecture par ligne est
-# imprimee a cote.
-#
-# PROCEDURE : la primaire est la VALIDATION CROISEE PAR PAIRES sur les 30 paires
-# (train_probe.py --stage cv). Les fichiers de l'ancien split fixe 18/5/7 (final_*.json du
-# 04/08) ne sont PLUS lus du tout : en l'absence de `cv_*.json`, ce script sort sans verdict.
-#
-# Usage :  python reference/runs/probe1/gates.py [--corpus v1|v2] [--features pool|raw]
-# ============================================================================================
+"""ETAPE 1, application MECANIQUE des SEUILS SCELLES (version v2, 2026-08-05).
+
+Ce script ne calcule rien : il lit les JSON produits par train_probe.py et applique les
+regles. Il n'y a donc aucune place pour une lecture narrative apres coup.
+
+Les regles, telles qu'elles sont scellees au registre (memory2_probes_registry.md) :
+
+  1. VALIDITE DU PROTOCOLE (borne). Texte d'origine : "le meme pipeline sur les activations
+     brutes doit atteindre >= 90 % de precision par paire". re-ANCRAGE scelle le 05/08
+     (section PLAFOND HUMAIN) apres le verdict d'oeil d'Aden : sur les materiaux v1 les deux
+     jumeaux d'une paire sont souvent LE MEME individu (5 paires "quasi identiques", plafond
+     humain estime ~74 %), donc 90 % etait inatteignable MEME pour un HUMAIN et ne pouvait
+     pas juger l'instrument. La borne se juge desormais sur le sous-ensemble "CLAIREMENT
+     differents" {01,02,11,12,19,27} = 6 paires, seuil >= 5/6 (mission 04/08). Le 90 % global
+     reste imprime, comme information, jamais comme verdict.
+  2. CONTROLE EFFONDREMENT : etats permutes entre videos -> precision <= 55 %.
+  3. SUCCES de l'etat : precision-sujet >= 65 % ET Wilcoxon p < 0.05 sur les marges ET
+     (precision-sujet - precision-fond) >= +10 points.
+  4. zone GRISE (55-75 % sans les 3 conditions) : +30 paires generees AVANT toute conclusion.
+     ECHEC : < 55 % ou ecart sujet-fond nul -> ARRET du chantier memoire.
+
+Lecture : "precision par paire" se lit PARTOUT en par PAIRE (reglage final n 1 du 04/08 au
+soir : c'etait la lettre du protocole, et l'audit T9b a montre que la lecture par-ligne
+plafonne a 0,911 meme a signal parfait). PRIMARY est fige a "pair" ; la lecture par ligne est
+imprimee a cote.
+
+Procedure : la primaire est la validation CROISEE par paires sur les 30 paires
+(train_probe.py --stage cv). Les fichiers de l'ancien split fixe 18/5/7 (final_*.json du
+04/08) ne sont plus lus du tout : en l'absence de `cv_*.json`, ce script sort sans verdict.
+
+Usage :  python reference/runs/probe1/gates.py [--corpus v1|v2] [--features pool|raw]
+"""
 import argparse
 import os
 import sys
@@ -54,17 +53,17 @@ SUBSET_LABEL = {"all": "30 paires", "agent": "sous-ens. agent (regle des masques
                 "aden15": "sous-ens. oeil d'Aden", "decisive": "clairement differents",
                 "valid25": "masque valide (PRIMAIRE v2)", "strong19": "clairement differents"}
 
-# La REGLE 1 par corpus, citee du registre, jamais choisie ici :
+# La regle 1 par corpus, citee du registre, jamais choisie ici :
 #   v1  "hdirect_masked >= 5/6 (v1, decisif)"      -> sous-ensemble {01,02,11,12,19,27}
 #   v2  "hdirect_masked >= 16/19 (v2, fortes)"     -> les 19 paires "clairement differentes" v2
-# (sections "SCELLEMENT FINAL v2", "LABELS OEIL D'ADEN, CORPUS v2" et "CORRECTIF DE BORNE").
+# (sections "SCELLEMENT final v2", "labels OEIL D'ADEN, corpus v2" et "CORRECTIF de borne").
 RULE1 = {"v1": ("decisive", T_UPPER_DECISIVE), "v2": ("strong19", 16)}
 # Le sous-ensemble PRIMAIRE des regles 2/3/4, par corpus (registre : v1 = les 30 paires ;
 # v2 = "Primaire = les 25 valides ; rapport separe sur les 19 fortes").
 PRIMARY_SUBSET = {"v1": "all", "v2": "valid25"}
-# La source de la BORNE. `hdirect` = pooling uniforme (borne du 05/08 matin, echouee sur les
+# La source de la borne. `hdirect` = pooling uniforme (borne du 05/08 matin, echouee sur les
 # deux corpus) ; `hdirect_masked` = pooling sous le masque-sujet, la source scellee au registre
-# le 05/08 nuit ("CORRECTIF DE BORNE") et donc le defaut ici.
+# le 05/08 nuit ("CORRECTIF de borne") et donc le defaut ici.
 UPPER_SOURCES = ("hdirect_masked", "hdirect")
 
 
@@ -86,7 +85,7 @@ def acc(summary, name="all", reading=None):
 
 
 def subset_lines(res, title):
-    """Le tableau des sous-ensembles PRE-ENREGISTRES pour un bras, rapportes cote a cote.
+    """Le tableau des sous-ensembles PRE-enregistres pour un bras, rapportes cote a cote.
     Aucun d'eux ne rend de verdict, sauf `decisive` pour la regle 1 (re-ancrage scelle)."""
     out = [f"  {title}"]
     s = res["summary"]
@@ -132,7 +131,7 @@ def main():
 
     u_dec = up["summary"].get(sub1)
     u_all = acc(up["summary"], "all")
-    lines += subset_lines(up, f"BORNE DE VALIDITE -- source {args.upper_source} (activations "
+    lines += subset_lines(up, f"BORNE DE VALIDITE, source {args.upper_source} (activations "
                               "poolees DIRECTEMENT, sans aucune ecriture dans la boucle)")
     if u_dec is None:
         lines.append(f"  REGLE 1 : sous-ensemble '{sub1}' indisponible sur ce "
@@ -149,7 +148,7 @@ def main():
                      f"(seuil >= {thr1}/{n_dec}) -> "
                      f"{'PASS' if ok1 else 'PROTOCOLE INVALIDE'}")
         lines.append(f"  [information : lecture globale 30 paires = {u_all:.3f}, "
-                     f"ancien seuil {T_UPPER} -- inatteignable meme pour un humain sur les "
+                     f"ancien seuil {T_UPPER}, inatteignable meme pour un humain sur les "
                      f"materiaux v1 (plafond humain estime ~0.74)]")
     if not ok1:
         verdict = ("PROTOCOLE INVALIDE : la borne de validite n'est pas atteinte. On repare "
@@ -165,19 +164,19 @@ def main():
     # ces bras se relancent, ils sont bon marche.
     if prim not in st["summary"] or prim not in bg["summary"]:
         lines.append(f"REGLE 2/3/4 : les runs `state` du corpus {args.corpus} sont ANTERIEURS "
-                     f"au gel des sous-ensembles (pas de '{prim}' dans leur resume) -- "
+                     f"au gel des sous-ensembles (pas de '{prim}' dans leur resume), "
                      f"relance `train_probe.py --stage cv --audited --source state "
                      f"--target subject|background --corpus {args.corpus}`.")
         print("\n".join(lines))
         return
 
-    lines += subset_lines(st, "ETAT -- cible SUJET")
-    lines += subset_lines(bg, "ETAT -- cible FOND (le controle)")
+    lines += subset_lines(st, "ETAT, cible SUJET")
+    lines += subset_lines(bg, "ETAT, cible FOND (le controle)")
     s = acc(st["summary"], prim)
     b = acc(bg["summary"], prim)
-    # REGLE 2 : la lecture par paire, MOYENNEE SUR LES 25 DERANGEMENTS (audit 2 du 05/08).
-    # `acc_pair` ne porte que le PREMIER tirage : a 30 paires, un tirage unique a ~29 % de
-    # chance de depasser 0,55 alors que la vraie valeur est 0,50 -- la regle 2 aurait echoue
+    # regle 2 : la lecture par paire, MOYENNEE sur les 25 derangements (audit 2 du 05/08).
+    # `acc_pair` ne porte que le premier tirage : a 30 paires, un tirage unique a ~29 % de
+    # chance de depasser 0,55 alors que la vraie valeur est 0,50, la regle 2 aurait echoue
     # au hasard du tirage. On retombe sur l'ancien champ si le JSON est anterieur au correctif.
     perm1 = acc(st["summary"], "permuted")
     perm = st["summary"]["permuted"].get("acc_pair_25perm", perm1)
@@ -199,7 +198,7 @@ def main():
                      "declare l'echec que si l'ecart est NUL. Arbitrage Aden.")
 
     # `ok1` est en conjonction : sans la borne de validite, AUCUNE conclusion sur la memoire
-    # n'est autorisee -- le champ `success` du JSON ne doit donc jamais pouvoir valoir `true`
+    # n'est autorisee, le champ `success` du JSON ne doit donc jamais pouvoir valoir `true`
     # sous un verdict "PROTOCOLE INVALIDE" (audit 2 du 05/08).
     success = ok1 and (s >= T_SUCCESS) and (p < T_P) and (gap >= T_GAP) and (perm <= T_PERM)
     if verdict is None:

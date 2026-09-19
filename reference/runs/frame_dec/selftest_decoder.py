@@ -1,27 +1,26 @@
 #!/usr/bin/env python
-# ============================================================================================
-# Self-test for AnchorFrameDecoder (design v1 "frame de rappel decodee"). No data, no wandb,
-# no VAE -- light enough for GPU 0 alongside a training run (a few GB, <1 min).
-#
-#   T1  shapes: 3 synthetic block states (B=2) -> (2, 1, 16, 60, 104)
-#   T2  EXACT zero output at init (zero-init head: a null frame, never xavier noise)
-#   T3  gradient routing:
-#         (a) at zero-init, only the head gets gradient (documented zero-init consequence);
-#         (b) with a nudged head, queries / pos emb / fusion all get non-zero gradient;
-#         (a+b) the input STATES get NO gradient even with requires_grad=True (they are
-#               INPUTS, detached inside the decoder by default).
-#   T4  overfit sanity: 8 synthetic (states, frame) pairs, AdamW, 200 steps,
-#       normalized loss must drop below 10% of its init value (init == 1.0 by construction).
-#   T5  v1.1 FiLM conditioning (cond_dim>0): a v1.0 state_dict warm-starts it (strict=False,
-#       missing keys == cond modules only), and AT INIT the conditioned decoder's output is
-#       IDENTICAL to the v1.0 model, both with cond=None and with a random cond (zero-init
-#       FiLM = exact identity); cond on a cond_dim=0 decoder must raise; param budget.
-#   T6  cond gradient routing: at zero-init FiLM only cond_out gets gradient (cond_in gets
-#       exact zeros); after nudging cond_out, gradient reaches cond_in and cond_norm; the
-#       cond INPUT never receives gradient (data, detached inside like the states).
-#
-# Run:  python reference/runs/frame_dec/selftest_decoder.py
-# ============================================================================================
+"""Self-test for AnchorFrameDecoder (design v1 "frame de rappel decodee"). No data, no wandb,
+no VAE, light enough for GPU 0 alongside a training run (a few GB, <1 min).
+
+  T1  shapes: 3 synthetic block states (B=2) -> (2, 1, 16, 60, 104)
+  T2  exact zero output at init (zero-init head: a null frame, never xavier noise)
+  T3  gradient routing:
+        (a) at zero-init, only the head gets gradient (documented zero-init consequence);
+        (b) with a nudged head, queries / pos emb / fusion all get non-zero gradient;
+        (a+b) the input states get no gradient even with requires_grad=True (they are
+              inputs, detached inside the decoder by default).
+  T4  overfit sanity: 8 synthetic (states, frame) pairs, AdamW, 200 steps,
+      normalized loss must drop below 10% of its init value (init == 1.0 by construction).
+  T5  v1.1 FiLM conditioning (cond_dim>0): a v1.0 state_dict warm-starts it (strict=False,
+      missing keys == cond modules only), and at INIT the conditioned decoder's output is
+      identical to the v1.0 model, both with cond=None and with a random cond (zero-init
+      FiLM = exact identity); cond on a cond_dim=0 decoder must raise; param budget.
+  T6  cond gradient routing: at zero-init FiLM only cond_out gets gradient (cond_in gets
+      exact zeros); after nudging cond_out, gradient reaches cond_in and cond_norm; the
+      cond input never receives gradient (data, detached inside like the states).
+
+Run:  python reference/runs/frame_dec/selftest_decoder.py
+"""
 import math
 import os
 import sys
@@ -35,7 +34,7 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 import torch
 
 from wan.modules.video_memory import AnchorFrameDecoder
-from train_decoder import norm_mse  # the EXACT training loss, not a reimplementation
+from train_decoder import norm_mse  # the exact training loss, not a reimplementation
 
 DIM, DH = 1536, 6144  # cell head_dim (num_heads=1) and hidden (inter_multi=4)
 
@@ -57,7 +56,7 @@ def synth_states(B, device, num_blocks=3, seed=0, requires_grad=False):
 def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
-        print("[selftest] WARNING: no CUDA visible -- T4 (overfit) will be very slow on CPU")
+        print("[selftest] WARNING: no CUDA visible, T4 (overfit) will be very slow on CPU")
     torch.manual_seed(0)
 
     # ---------------- T0: param budget ----------------
@@ -99,7 +98,7 @@ def main():
     assert dec.queries.grad is None or dec.queries.grad.abs().sum() == 0, \
         "queries got gradient THROUGH a zero head (impossible -> graph is wrong)"
 
-    # (b) nudge the head so gradient flows everywhere upstream; states must STILL get none
+    # (b) nudge the head so gradient flows everywhere upstream; states must still get none
     with torch.no_grad():
         dec.head.weight.normal_(0, 0.02)
     dec.zero_grad(set_to_none=True)
@@ -115,7 +114,7 @@ def main():
     for b, st in enumerate(states):
         for j, w in enumerate(st):
             assert w.grad is None, \
-                f"state block {b} w{j} received gradient -- states are INPUTS, must stay detached"
+                f"state block {b} w{j} received gradient, states are INPUTS, must stay detached"
     print("[selftest] T3 PASS  grads: head-only at zero-init; queries/pos/fusion/head after "
           "nudge; states ALWAYS grad-free")
 
@@ -142,7 +141,7 @@ def main():
     print(f"[selftest] T4 PASS  overfit 8 pairs: {init_loss:.4f} -> {last:.4f} "
           f"({100*last/init_loss:.1f}% of init) in 200 steps")
 
-    # ---------------- T5: FiLM conditioning == EXACT v1.0 at init (warm-start) ----------------
+    # ---------------- T5: FiLM conditioning == exact v1.0 at init (warm-start) ----------------
     COND_DIM = 4096
     base = AnchorFrameDecoder().to(device)
     with torch.no_grad():                       # non-trivial output: a zero head would make
@@ -163,7 +162,7 @@ def main():
         out_base = base(states)
         out_none = cdec(states)                  # cond omitted
         out_cond = cdec(states, cond=cond_vec)   # random cond through zero-init FiLM
-    assert out_base.abs().max().item() > 0, "nudged base output is zero -- test is vacuous"
+    assert out_base.abs().max().item() > 0, "nudged base output is zero, test is vacuous"
     assert torch.equal(out_none, out_base), "cond decoder (cond=None) != v1.0 output at init"
     assert torch.equal(out_cond, out_base), \
         "cond decoder WITH cond != v1.0 output at init (zero-init FiLM broken)"
@@ -179,7 +178,7 @@ def main():
     target = torch.randn(2, 1, 16, 60, 104, device=device)
     cond_vec = torch.randn(2, COND_DIM, device=device, requires_grad=True)
     # (a) zero-init FiLM: cond_out gets gradient (same mechanism as the zero head in T3a),
-    #     cond_in can only get EXACT ZERO (chain through the zero cond_out weight)
+    #     cond_in can only get exact zero (chain through the zero cond_out weight)
     out = cdec(states, cond=cond_vec)
     loss = norm_mse(out, target)
     loss.backward()
@@ -191,7 +190,7 @@ def main():
     assert g_in is None or g_in.abs().sum() == 0, \
         "cond_in got gradient THROUGH a zero cond_out (impossible -> graph is wrong)"
     assert cond_vec.grad is None, \
-        "the cond INPUT received gradient -- cond is DATA, must stay detached inside"
+        "the cond INPUT received gradient, cond is DATA, must stay detached inside"
     # (b) nudge cond_out -> gradient reaches the whole cond MLP; cond input still none
     with torch.no_grad():
         cdec.cond_out.weight.normal_(0, 0.02)
@@ -203,10 +202,10 @@ def main():
                     ("cond_norm.weight", cdec.cond_norm.weight)):
         assert p.grad is not None and p.grad.abs().sum() > 0, f"{name} got no gradient"
     assert cond_vec.grad is None, "cond input received gradient after nudge"
-    # nudged FiLM must now actually CHANGE the output vs cond=None
+    # nudged FiLM must now actually change the output vs cond=None
     with torch.no_grad():
         d = (cdec(states, cond=cond_vec) - cdec(states)).abs().max().item()
-    assert d > 0, "nudged FiLM does not affect the output -- conditioning path dead"
+    assert d > 0, "nudged FiLM does not affect the output, conditioning path dead"
     print(f"[selftest] T6 PASS  grads: cond_out-only at zero-init; full cond MLP after nudge; "
           f"cond input ALWAYS grad-free; nudged FiLM changes output (max |d| = {d:.4f})")
 

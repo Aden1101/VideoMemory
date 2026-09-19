@@ -27,16 +27,17 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db
 
 .claude/
 
-# --- reference/ : CURATED ALLOWLIST -----------------------------------------------------
-# reference/ holds the full research record: ~650 files of probes, campaign scripts, run
-# configs, session notes and reports accumulated from June to August 2026. All of it stays
-# ON DISK and all of it is still in git history at commit cf1d8f1 -- nothing is lost. But
-# shipping 650 files makes the interesting ones unfindable, so the repo tracks an explicit
-# allowlist: the documents that carry the story and the method, the instruments that are
-# reusable, and the measured numbers. reference/README.md is the index.
+# --- reference/ : curated allowlist ---
+# reference/ holds the full research record: about 650 files of probes, campaign scripts, run
+# configs, session notes and reports accumulated from June to August 2026. All of it stays on
+# disk and all of it is still in git history at commit cf1d8f1. Shipping 650 files makes the
+# interesting ones unfindable, so the repo tracks an explicit allowlist: the documents that
+# carry the story and the method, the instruments that are reusable, and the measured numbers.
+# reference/README.md is the index.
 #
 # To put a file back under version control, add a `!` line for it here.
 reference/**
@@ -114,6 +115,7 @@ reference/**
 !reference/runs/l1_longlive/eval750_sink1/metrics_c1_step250.txt
 !reference/runs/l1_longlive/eval750_sink1_ema/metrics_c1_step250.txt
 !reference/runs/l1_longlive/l1_longlive.yaml
+!reference/runs/make_figure.py
 !reference/runs/mem2/mem2_data.py
 !reference/runs/mem2/selftest_memwriter.py
 !reference/runs/mem2/selftest_trainer.py
@@ -153,7 +155,5 @@ reference/**/*.safetensors
 # --- wandb local cache ---
 wandb/
 
-# --- debug log---
+# --- debug log ---
 tea_debug.log
-assets/Thumbs.db
-!reference/runs/make_figure.py

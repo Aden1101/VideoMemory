@@ -1,27 +1,26 @@
 #!/usr/bin/env python
-# ============================================================================================
-# Selftest of the MEM_WRITER hook (memory 2.0 phase A, arm memdec20).
-#
-#   T1 DEFAULT-OFF / TRIVIAL OVERLAY: a writer ckpt whose theta_w is COPIED FROM the live
-#       l1@2000-EMA cells (delta 0 by construction) must give a rollout BYTE-IDENTICAL to the
-#       same rollout without MEM_WRITER -- latents AND the three ttt states. This is the
-#       founding no-op: any hidden side effect of the hook (RNG draw, dtype churn, an extra
-#       parameter touched) breaks it.
-#   T2 REAL OVERLAY: MEM_WRITER=<A2 ckpt> logs a per-block L1 delta > 0 and the resulting
-#       memory states differ from the stock-writer states (the writer actually drives the
-#       write chain at inference).
-#   T3 RESTORE: turning MEM_WRITER back off restores the stock write params bitwise, and the
-#       rollout is byte-identical to T1 again (no leak into the next arm of the same process:
-#       run_reid_probe builds ONE pipeline for all MAG arms).
-#   T4 DECODER: the exported A2 decoder loads through the MEM_DECODE hook loader and decodes
-#       the live states into a finite (B,1,16,60,104) latent frame.
-#
-# Usage (GPU pre-check in the SAME command, house rule):
-#   CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
-#   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
-#     python reference/runs/mem2/selftest_memwriter.py
-# Optional args: --writer <ckpt> --decoder <ckpt> --frames 27 --sw1 12 --sw2 21
-# ============================================================================================
+"""Selftest of the MEM_WRITER hook (memory 2.0 phase A, arm memdec20).
+
+  T1 DEFAULT-OFF / trivial overlay: a writer ckpt whose theta_w is copied from the live
+      l1@2000-EMA cells (delta 0 by construction) must give a rollout BYTE-identical to the
+      same rollout without MEM_WRITER, latents and the three ttt states. This is the
+      founding no-op: any hidden side effect of the hook (RNG draw, dtype churn, an extra
+      parameter touched) breaks it.
+  T2 real overlay: MEM_WRITER=<A2 ckpt> logs a per-block L1 delta > 0 and the resulting
+      memory states differ from the stock-writer states (the writer actually drives the
+      write chain at inference).
+  T3 restore: turning MEM_WRITER back off restores the stock write params bitwise, and the
+      rollout is byte-identical to T1 again (no leak into the next arm of the same process:
+      run_reid_probe builds one pipeline for all MAG arms).
+  T4 decoder: the exported A2 decoder loads through the MEM_DECODE hook loader and decodes
+      the live states into a finite (B,1,16,60,104) latent frame.
+
+Usage (GPU pre-check in the same command, house rule):
+  CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-smi --query-gpu=index,memory.free --format=csv && \
+  CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+    python reference/runs/mem2/selftest_memwriter.py
+Optional args: --writer <ckpt> --decoder <ckpt> --frames 27 --sw1 12 --sw2 21
+"""
 import argparse
 import gc
 import os
@@ -125,7 +124,7 @@ def main():
     cm = _find_causal_model(pipeline.generator.model)
     assert cm is not None, "CausalWanModel not found under the peft wrappers"
 
-    # ---- the trivial writer ckpt: theta_w READ BACK from the live l1@2000-EMA cells --------
+    # ---- the trivial writer ckpt: theta_w read back from the live l1@2000-EMA cells --------
     stock = theta_w_now(cm)
     trivial_path = os.path.join(OUT_DIR, "writer_trivial_l1.pt")
     torch.save({"writer": {str(bi): {n: stock[(bi, n)] for n in _MEMWRITER_PARAMS}
@@ -133,7 +132,7 @@ def main():
                 "step": "trivial(l1@2000-EMA)"}, trivial_path)
     print(f"[selftest-memwriter] trivial writer ckpt -> {trivial_path}", flush=True)
 
-    # ---- T1: no MEM_WRITER  vs  trivial MEM_WRITER  (must be BYTE-IDENTICAL) ---------------
+    # ---- T1: no MEM_WRITER  vs  trivial MEM_WRITER  (must be BYTE-identical) ---------------
     lat_off, st_off = rollout(pipeline, config, device, args.frames, args.sw1, args.sw2, "no-writer")
     assert getattr(cm, "_memwriter_applied", None) is None, "hook fired with MEM_WRITER unset"
     lat_triv, st_triv = rollout(pipeline, config, device, args.frames, args.sw1, args.sw2,

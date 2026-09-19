@@ -1,30 +1,29 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ETAPE 1 -- LA BATTERIE DE SONDES (fixe, ecrite une fois, jamais re-tiree).
-#
-# "Lecture de l'etat : FONCTIONNELLE, pas directe : on passe une batterie fixe d'entrees-sondes
-#  a travers le module a poids rapides et on recueille ses sorties."
-# Renfort (b) du 04/08 : "sondes ALIGNEES SUR LES DONNEES (centroides k-means des activations
-#  du corpus + sous-echantillon des requetes apprises du decodeur), PAS de vecteurs aleatoires
-#  (recouvrement quasi nul avec les directions sujet en dim 1536)."
-#
-# La batterie est PAR BLOC (5 / 16 / 27) : les etats de blocs differents vivent dans des espaces
-# de features differents, une sonde unique ne parlerait pas les trois. Chaque bloc recoit :
-#   - 192 centroides k-means des activations h de ce bloc ;
-#   - 64 requetes du decodeur de CE bloc, sous-echantillonnees sur la grille 30x52 (8x8
-#     positions equidistantes) et prises APRES le q_norm du decodeur, c'est-a-dire exactement
-#     dans l'etat ou le decodeur les envoie a swiglu_apply.
-# Toutes les sondes sont RMS-normalisees a la fin : la batterie est homogene en echelle, ce qui
-# rend le blanchiment par sonde (build_signatures) interpretable.
-#
-# ANTI-FUITE : le k-means est ajuste UNIQUEMENT sur les videos `switch` du corpus (105), qui
-# n'appartiennent a AUCUNE paire -- donc ni au train, ni au val, ni au test du sondeur. La
-# batterie ne peut pas avoir vu une video de test. (--kmeans_source train restreint en plus aux
-# paires d'entrainement, si l'auditeur veut la version la plus stricte.)
-#
-# Usage :
-#   CUDA_VISIBLE_DEVICES=7 python reference/runs/probe1/build_probes.py
-# ============================================================================================
+"""ETAPE 1, la BATTERIE de sondes (fixe, ecrite une fois, jamais re-tiree).
+
+"Lecture de l'etat : FONCTIONNELLE, pas directe : on passe une batterie fixe d'entrees-sondes
+ a travers le module a poids rapides et on recueille ses sorties."
+Renfort (b) du 04/08 : "sondes ALIGNEES sur les donnees (centroides k-means des activations
+ du corpus + sous-echantillon des requetes apprises du decodeur), pas de vecteurs aleatoires
+ (recouvrement quasi nul avec les directions sujet en dim 1536)."
+
+La batterie est par bloc (5 / 16 / 27) : les etats de blocs differents vivent dans des espaces
+de features differents, une sonde unique ne parlerait pas les trois. Chaque bloc recoit :
+  - 192 centroides k-means des activations h de ce bloc ;
+  - 64 requetes du decodeur de ce bloc, sous-echantillonnees sur la grille 30x52 (8x8
+    positions equidistantes) et prises APRES le q_norm du decodeur, c'est-a-dire exactement
+    dans l'etat ou le decodeur les envoie a swiglu_apply.
+Toutes les sondes sont RMS-normalisees a la fin : la batterie est homogene en echelle, ce qui
+rend le blanchiment par sonde (build_signatures) interpretable.
+
+Anti-FUITE : le k-means est ajuste UNIQUEMENT sur les videos `switch` du corpus (105), qui
+n'appartiennent a AUCUNE paire, donc ni au train, ni au val, ni au test du sondeur. La
+batterie ne peut pas avoir vu une video de test. (--kmeans_source train restreint en plus aux
+paires d'entrainement, si l'auditeur veut la version la plus stricte.)
+
+Usage :
+  CUDA_VISIBLE_DEVICES=7 python reference/runs/probe1/build_probes.py
+"""
 import argparse
 import os
 import sys
@@ -76,7 +75,7 @@ def sample_h_tokens(vids, blocks, n_videos, n_writes, n_tokens, device, seed=0):
 
 
 def kmeans(x, k, iters=60, seed=0, device="cuda"):
-    """k-means++ (init deterministe a graine fixe) + Lloyd. x: (N, dim) fp32."""
+    """k-means++ (init deterministe a graine fixe) + Lloyd. X: (N, dim) fp32."""
     g = torch.Generator(device=x.device).manual_seed(seed)
     N = x.shape[0]
     cent = x[torch.randint(N, (1,), generator=g, device=x.device)]
@@ -102,8 +101,8 @@ def kmeans(x, k, iters=60, seed=0, device="cuda"):
 # 64 requetes du decodeur
 # ---------------------------------------------------------------------------------------------
 def decoder_queries(dec_ckpt, n_queries, device):
-    """Les requetes APPRISES du decodeur, sous-echantillonnees. On charge le decodeur par le
-    chemin EXACT du harness (`_memdec_get_decoder`, aucune recopie) et on prend
+    """Les requetes apprises du decodeur, sous-echantillonnees. On charge le decodeur par le
+    chemin exact du harness (`_memdec_get_decoder`, aucune recopie) et on prend
     q_norms[b](queries[b] + pos) : la requete telle qu'elle part vers swiglu_apply."""
     from pipeline.switch_causal_inference import _memdec_get_decoder
     dec = _memdec_get_decoder(dec_ckpt, torch.device(device))

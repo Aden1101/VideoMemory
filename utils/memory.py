@@ -4,7 +4,7 @@
 
 import torch
 
-# 2026-09-09: `gpu` was built by querying the CUDA driver AT IMPORT TIME, which crashed the
+# 2026-09-09: `gpu` was built by querying the CUDA driver at import time, which crashed the
 # whole inference path on a non-NVIDIA machine before the first weight was even loaded.
 # utils/device resolves the device once, without ever querying an absent driver, and delegates
 # to torch.cuda identically when CUDA is present.

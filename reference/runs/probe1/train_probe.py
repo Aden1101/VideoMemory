@@ -1,32 +1,31 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ETAPE 1 -- LE SONDEUR (l'instrument du verdict).
-#
-# "Tache : une petite tete (MLP) apprend a projeter cette signature vers un espace d'embedding
-#  ou elle est plus proche de l'embedding visuel (DINO) du crop du sujet de SA video que de
-#  celui de la video jumelle du meme prompt, et des autres videos."
-# "Le piege identifie et son controle : deux videos de meme prompt different AUSSI par le fond
-#  [...] on mesure donc la precision contre des references 'crop du sujet' ET contre des
-#  references 'fond seul' : l'ecart entre les deux = ce qui est specifiquement extractible du
-#  sujet. Autres controles : etats permutes entre videos, split strict par video."
-#
-# SEUILS SCELLES (memory2_probes_registry.md, derniere section) -- ils sont ECRITS ICI mais
-# JAMAIS appliques automatiquement a un run non audite :
-#   1. VALIDITE (borne superieure) : --source h doit atteindre >= 90 % de precision par paire
-#      sur le test. Sinon : protocole invalide, aucune conclusion sur la memoire.
-#   2. CONTROLE EFFONDREMENT : etats permutes entre videos -> precision <= 55 %.
-#   3. SUCCES de l'etat : precision-sujet test >= 65 % ET Wilcoxon p < 0.05 sur les marges ET
-#      (precision-sujet - precision-fond) >= +10 points.
-#   4. ZONE GRISE 55-75 % sans les 3 conditions -> +30 paires AVANT toute conclusion.
-#      ECHEC : < 55 % ou ecart sujet-fond nul -> ARRET du chantier memoire.
-#
-# GARDE-FOU D'EXECUTION : `--stage final` (la seule etape qui TOUCHE LE TEST) refuse de tourner
-# sans `--audited`. La recherche d'hyperparametres (`--stage hpsearch`) ne voit QUE le val.
-#
-# Usage :
-#   python reference/runs/probe1/train_probe.py --stage hpsearch --source h     --target subject
-#   python reference/runs/probe1/train_probe.py --stage final --audited --source state ...
-# ============================================================================================
+"""ETAPE 1, LE SONDEUR (l'instrument du verdict).
+
+"Tache : une petite tete (MLP) apprend a projeter cette signature vers un espace d'embedding
+ ou elle est plus proche de l'embedding visuel (DINO) du crop du sujet de sa video que de
+ celui de la video jumelle du meme prompt, et des autres videos."
+"Le piege identifie et son controle : deux videos de meme prompt different AUSSI par le fond
+ [...] on mesure donc la precision contre des references 'crop du sujet' ET contre des
+ references 'fond seul' : l'ecart entre les deux = ce qui est specifiquement extractible du
+ sujet. Autres controles : etats permutes entre videos, split strict par video."
+
+SEUILS SCELLES (memory2_probes_registry.md, derniere section), ils sont ECRITS ICI mais
+JAMAIS appliques automatiquement a un run non audite :
+  1. VALIDITE (borne superieure) : --source h doit atteindre >= 90 % de precision par paire
+     sur le test. Sinon : protocole invalide, aucune conclusion sur la memoire.
+  2. CONTROLE EFFONDREMENT : etats permutes entre videos -> precision <= 55 %.
+  3. SUCCES de l'etat : precision-sujet test >= 65 % ET Wilcoxon p < 0.05 sur les marges ET
+     (precision-sujet - precision-fond) >= +10 points.
+  4. zone GRISE 55-75 % sans les 3 conditions -> +30 paires AVANT toute conclusion.
+     ECHEC : < 55 % ou ecart sujet-fond nul -> ARRET du chantier memoire.
+
+GARDE-fou D'execution : `--stage final` (la seule etape qui TOUCHE LE test) refuse de tourner
+sans `--audited`. La recherche d'hyperparametres (`--stage hpsearch`) ne voit QUE le val.
+
+Usage :
+  python reference/runs/probe1/train_probe.py --stage hpsearch --source h     --target subject
+  python reference/runs/probe1/train_probe.py --stage final --audited --source state ...
+"""
 import argparse
 import itertools
 import json
@@ -55,7 +54,7 @@ FEATURES = ("pool", "raw")      # pool = compression moyenne+max par sonde ; raw
 # ---------------------------------------------------------------------------------------------
 def load_refs(video_id, target, seg="A"):
     """Embeddings DINO de reference d'une video : les crops-SUJET (l'individu) ou les
-    crops-FOND (le complement du masque). Seules les frames VALIDES du masque comptent."""
+    crops-fond (le complement du masque). Seules les frames valides du masque comptent."""
     p = os.path.join(C.REFS_DIR, C.seg_key(video_id, seg) + ".pt")
     if not os.path.exists(p):
         return None
@@ -68,7 +67,7 @@ def load_refs(video_id, target, seg="A"):
 
 def load_features(source, video_id, age_name, features):
     """LE point d'entree unique du sondeur. `features` :
-      pool = COMPRESSION moyenne+max par ligne de reponse (correctif n 1 du verdict
+      pool = compression moyenne+max par ligne de reponse (correctif n 1 du verdict
              PROTOCOLE INVALIDE : 3 x 256 x 2 = 1536 nombres au lieu de 1 179 648) ;
       raw  = la signature brute, laissee a l'ACP (variante ACP de la mission).
     Aucune des deux ne regarde le split : la compression n'a ni parametre ni donnees."""
@@ -136,13 +135,13 @@ def load_pretrain(source, target, n_ages=C.N_AGES, features="pool", verbose=True
 
     Pourquoi elles : leurs etats sont deja rejouables (memes h, meme ecrivain), elles
     n'appartiennent a AUCUNE paire (asserte ici, comme pour le k-means des sondes), et leur
-    tache est la BONNE tache -- retrouver le sujet du segment A -- avec en prime la condition
-    que les paires n'ont pas : l'INTERFERENCE du second sujet (les ages `end_seq` sont
+    tache est la BONNE tache, retrouver le sujet du segment A, avec en prime la condition
+    que les paires n'ont pas : l'interference du second sujet (les ages `end_seq` sont
     post-switch). 105 videos x 4 ages = 420 lignes, contre 144 : c'est la seule facon
     d'apprendre quoi que ce soit dans un espace qui, meme comprime, fait 1536 dimensions.
 
     La reference est le crop-sujet du segment A (le meme DINO, la meme construction).
-    Les negatifs y sont des videos de prompts DIFFERENTS : c'est un pre-entrainement, pas
+    Les negatifs y sont des videos de prompts differents : c'est un pre-entrainement, pas
     l'epreuve ; l'epreuve (separer deux jumeaux du MEME prompt) reste celle des paires."""
     vids, pairs = C.pair_dataset(verbose=False, corpus="v1")
     pair_ids = {p["main"] for p in pairs} | {p["twin"] for p in pairs}
@@ -176,12 +175,12 @@ def load_pretrain(source, target, n_ages=C.N_AGES, features="pool", verbose=True
     return ds
 
 
-ALL_ROWS = "__all__"        # pseudo-split du mode inter-corpus : TOUTES les lignes du jeu
+ALL_ROWS = "__all__"        # pseudo-split du mode inter-corpus : toutes les lignes du jeu
 
 
 def split_rows(ds, split):
     if split == ALL_ROWS:
-        # le corpus de TEST d'un run inter-corpus n'a pas de split interne : il est le test,
+        # le corpus de test d'un run inter-corpus n'a pas de split interne : il est le test,
         # en entier. (Aucune video ne porte jamais ce nom de split : pas de collision.)
         return torch.arange(ds["X"].shape[0], dtype=torch.long)
     keep = {i for i, v in enumerate(ds["videos"]) if v["split"] == split}
@@ -190,17 +189,17 @@ def split_rows(ds, split):
 
 
 # ---------------------------------------------------------------------------------------------
-# pretraitement : blanchiment par sonde + ACP, AJUSTES SUR LE TRAIN SEUL
+# pretraitement : blanchiment par sonde + ACP, AJUSTES sur LE train SEUL
 # ---------------------------------------------------------------------------------------------
 class Preproc:
     """1) blanchiment par sonde = standardisation coordonnee par coordonnee (moyenne / ecart-type
-          du TRAIN) : chaque sonde contribue alors a echelle egale, quelle que soit la norme
+          du train) : chaque sonde contribue alors a echelle egale, quelle que soit la norme
           brute de sa reponse ;
-       2) ACP ajustee sur le TRAIN SEUL, calculee par le tour de Gram (n_train << dimension) :
+       2) ACP ajustee sur le train SEUL, calculee par le tour de Gram (n_train << dimension) :
           on ne materialise JAMAIS la base de 1.18 M x k, la projection d'une ligne z vaut
           (z . Z_train^T) U lambda^{-1/2}. Exact, et le test ne peut pas fuir dans la base.
 
-    L'objet est construit UNE FOIS par jeu (l'eigendecomposition ne depend pas de k) ; `k` est
+    L'objet est construit UNE fois par jeu (l'eigendecomposition ne depend pas de k) ; `k` est
     tranche a la volee par `transform`, ce qui rend la recherche d'hyperparametres sur `sig_dim`
     gratuite et garantit que toutes les configs partagent EXACTEMENT la meme base.
     """
@@ -209,7 +208,7 @@ class Preproc:
         """`extra` (facultatif) = des lignes SUPPLEMENTAIRES, sans etiquette de test, qui
         entrent dans l'estimation de la moyenne / de l'ecart-type / de la base ACP : les
         signatures des videos `switch` du pre-entrainement. Elles n'appartiennent a aucune
-        paire, donc ni au val ni au test -- estimer un blanchiment de 1536 (ou 1,18 M)
+        paire, donc ni au val ni au test, estimer un blanchiment de 1536 (ou 1,18 M)
         dimensions sur 144 lignes etait l'autre visage du defaut n 1."""
         Z = Xtr.to(device=device, dtype=torch.float32)
         if extra is not None and extra.shape[0] > 0:
@@ -230,7 +229,7 @@ class Preproc:
         self.d_in = int(Z.shape[1])
 
     def dim(self, k):
-        """k <= 0 = PAS d'ACP du tout : les coordonnees standardisees telles quelles. C'est le
+        """k <= 0 = pas d'ACP du tout : les coordonnees standardisees telles quelles. C'est le
         regime naturel de la signature COMPRIMEE (1536 dimensions), ou l'ACP n'est plus une
         necessite mais un hyperparametre de plus."""
         return self.d_in if int(k) <= 0 else int(min(k, self.rank))
@@ -252,7 +251,7 @@ class Preproc:
 # ---------------------------------------------------------------------------------------------
 class ProbeMLP(nn.Module):
     """2-3 couches, signature (post-ACP) -> espace DINO. Sortie L2-normalisee : la tache est
-    une comparaison d'ANGLES, jamais de normes."""
+    une comparaison d'angles, jamais de normes."""
 
     def __init__(self, d_in, hidden=512, depth=2, out=C.DINO_DIM, dropout=0.1):
         super().__init__()
@@ -272,7 +271,7 @@ class ProbeMLP(nn.Module):
 # entrainement contrastif
 # ---------------------------------------------------------------------------------------------
 def get_preproc(ds, device="cpu"):
-    """L'ACP/blanchiment du jeu, ajuste UNE SEULE FOIS sur le TRAIN (+ le jeu de
+    """L'ACP/blanchiment du jeu, ajuste UNE SEULE fois sur le train (+ le jeu de
     pre-entrainement s'il y en a un, qui ne contient aucune video de paire) et memorise."""
     if ds.get("_pre") is None:
         pre_ds = ds.get("_pretrain")
@@ -290,7 +289,7 @@ def get_preproc(ds, device="cpu"):
 
 def transformed(ds, split, k, device="cpu"):
     """Les signatures d'un split, projetees, avec cache : la projection ne depend que de
-    (split, k), pas des hyperparametres du MLP -- la recherche n'en repaie donc jamais le prix,
+    (split, k), pas des hyperparametres du MLP, la recherche n'en repaie donc jamais le prix,
     et toutes les configs partagent EXACTEMENT la meme entree."""
     pre = get_preproc(ds, device=device)
     cache = ds.setdefault("_Z", {})
@@ -345,7 +344,7 @@ def _infonce(model, Z, y, R, cnt, Fmax, cfg, seed, device, steps=None, lr=None, 
 def pretrain_head(ds, cfg, seed=0, device="cpu", verbose=False):
     """Pre-entraine la tete sur les videos `switch` (jeu `ds['_pretrain']`), dans l'espace
     d'entree du fold courant (meme Preproc : le pre-entrainement ne peut donc rien apprendre
-    d'un blanchiment qui aurait vu le test -- il n'y en a pas)."""
+    d'un blanchiment qui aurait vu le test, il n'y en a pas)."""
     pds = ds["_pretrain"]
     pre = get_preproc(ds, device=device)
     Z = pre.transform(pds["X"], cfg["sig_dim"], device=device)
@@ -361,9 +360,9 @@ def pretrain_head(ds, cfg, seed=0, device="cpu", verbose=False):
 
 
 def train_one(ds, cfg, seed=0, device="cpu", verbose=False):
-    """Entraine le sondeur sur le TRAIN. Les negatifs du softmax = TOUTES les videos du train,
+    """Entraine le sondeur sur le train. Les negatifs du softmax = toutes les videos du train,
     ce qui inclut par construction le JUMEAU meme-prompt de chaque positif ; on l'ASSERTE.
-    Si `ds['_pretrain']` existe, la tete part des poids PRE-ENTRAINES sur les videos switch
+    Si `ds['_pretrain']` existe, la tete part des poids PRE-entraines sur les videos switch
     (aucune n'est dans une paire) au lieu d'une initialisation aleatoire."""
     torch.manual_seed(seed)
     tr_rows = split_rows(ds, "train")
@@ -400,18 +399,18 @@ def evaluate(ds, model, pre, split, device="cpu", permute=False, seed=1234, n_pe
     `permute` = LE CONTROLE D'EFFONDREMENT : les signatures sont permutees entre les videos du
     split (derangement), la precision doit retomber au hasard.
 
-    AUDIT 2026-08-04 : le controle permute est desormais moyenne sur `n_perm` DERANGEMENTS et
-    non plus estime sur UN SEUL tirage. Avec 7 paires de test, un tirage unique est lui-meme une
+    Audit 2026-08-04 : le controle permute est desormais moyenne sur `n_perm` derangements et
+    non plus estime sur un SEUL tirage. Avec 7 paires de test, un tirage unique est lui-meme une
     variable a ~14 degres de liberte : la regle scellee n 2 ("precision permutee <= 55 %")
     echouait ou passait au hasard du tirage. La quantite mesuree (la precision sous permutation)
-    est inchangee ; seule sa VARIANCE d'estimation baisse. Les marges detaillees et le Wilcoxon
-    restent ceux du PREMIER derangement (le tirage historique, graine 1234)."""
+    est inchangee ; seule sa variance d'estimation baisse. Les marges detaillees et le Wilcoxon
+    restent ceux du premier derangement (le tirage historique, graine 1234)."""
     rows = split_rows(ds, split)
     assert rows.numel() > 0, f"split {split} vide"
     if pre_ext is None:
         Z = transformed(ds, split, getattr(model, "_sig_dim", pre.rank), device=device)
     else:
-        # MODE INTER-CORPUS : le blanchiment et la base ACP viennent du corpus
+        # mode inter-corpus : le blanchiment et la base ACP viennent du corpus
         # D'ENTRAINEMENT (`pre_ext`) et n'ont JAMAIS vu une ligne de ce jeu-ci. C'est la
         # seule difference ; tout le calcul de score ci-dessous est le meme code.
         assert pre_ext.d_in == ds["X"].shape[1], \
@@ -459,9 +458,9 @@ def evaluate(ds, model, pre, split, device="cpu", permute=False, seed=1234, n_pe
         if k == 0:
             per_row, per_video = pr, pv
         accs.append(float(np.mean([d["correct"] for d in pr])))
-        # AUDIT 2 (2026-08-05) : la precision PAR PAIRE de CHAQUE derangement, pas seulement du
+        # audit 2 (2026-08-05) : la precision par PAIRE de CHAQUE derangement, pas seulement du
         # premier. Le reglage final n 1 a fige la lecture des seuils sur "par paire" ; sans
-        # cette ligne, la regle 2 (permute <= 55 %) retombait sur UN SEUL tirage -- exactement
+        # cette ligne, la regle 2 (permute <= 55 %) retombait sur un SEUL tirage, exactement
         # le defaut que l'audit du 04/08 avait corrige pour la lecture par ligne. A 30 paires,
         # un tirage unique a ~29 % de chance de depasser 0,55 alors que la vraie valeur est 0,50.
         pm = {}
@@ -500,12 +499,12 @@ def evaluate(ds, model, pre, split, device="cpu", permute=False, seed=1234, n_pe
 
 
 # ---------------------------------------------------------------------------------------------
-# recherche d'hyperparametres SUR LE VAL UNIQUEMENT
+# recherche d'hyperparametres sur LE val UNIQUEMENT
 # ---------------------------------------------------------------------------------------------
 GRID = {"sig_dim": [64, 128], "hidden": [256, 512], "depth": [2, 3],
         "lr": [1e-3, 3e-4], "wd": [1e-2, 1e-1], "temp": [0.05, 0.1], "dropout": [0.1, 0.3]}
-# Grille de la VALIDATION CROISEE : elle est parcourue 6 fois (une par pli), donc elle est
-# reduite -- et `sig_dim: 0` (pas d'ACP, les 1536 coordonnees comprimees telles quelles) y
+# Grille de la validation CROISEE : elle est parcourue 6 fois (une par pli), donc elle est
+# reduite, et `sig_dim: 0` (pas d'ACP, les 1536 coordonnees comprimees telles quelles) y
 # entre comme un choix a part entiere.
 GRID_CV = {"sig_dim": [0, 64], "hidden": [256], "depth": [2, 3],
            "lr": [1e-3, 3e-4], "wd": [1e-2], "temp": [0.05, 0.1], "dropout": [0.1, 0.3]}
@@ -539,7 +538,7 @@ def hpsearch(ds, device="cpu", seeds=(0, 1, 2), grid=None, verbose=True):
 
 
 # ---------------------------------------------------------------------------------------------
-# VALIDATION CROISEE PAR PAIRES (procedure PRIMAIRE scellee le 04/08 au soir, reglage n 2)
+# validation CROISEE par paires (procedure PRIMAIRE scellee le 04/08 au soir, reglage n 2)
 #   "folds etanches, hyperparametres a l'interieur des folds, 30 paires au denominateur"
 # ---------------------------------------------------------------------------------------------
 def pair_folds(cidxs, n_folds=6, seed=C.SPLIT_SEED):
@@ -552,8 +551,8 @@ def pair_folds(cidxs, n_folds=6, seed=C.SPLIT_SEED):
 
 
 def set_fold(ds, test_cidx, val_cidx):
-    """Reecrit le split du jeu (par PAIRE) et invalide TOUS les caches derives : le
-    blanchiment et la base ACP sont donc re-ajustes sur le train de CE pli -- c'est la
+    """Reecrit le split du jeu (par PAIRE) et invalide tous les caches derives : le
+    blanchiment et la base ACP sont donc re-ajustes sur le train de ce pli, c'est la
     definition meme d'un pli etanche."""
     test_cidx, val_cidx = set(map(int, test_cidx)), set(map(int, val_cidx))
     assert not (test_cidx & val_cidx), "pli casse : val et test se recouvrent"
@@ -566,7 +565,7 @@ def set_fold(ds, test_cidx, val_cidx):
 
 
 def _agg_rows(rows_per_fold):
-    """Concatene les `per_row` des plis et rend (acc par LIGNE, acc par PAIRE, marges par
+    """Concatene les `per_row` des plis et rend (acc par ligne, acc par PAIRE, marges par
     paire indexees par corpus_idx). Le denominateur est bien les 30 paires."""
     per_row = [r for fold in rows_per_fold for r in fold]
     by_pair = {}
@@ -589,7 +588,7 @@ def subset_report(per_row, pair_marg, keep):
     except Exception:
         p = float("nan")
     k = int(sum(1 for m in marg if m > 0))
-    # p BINOMIAL unilateral P(X >= k | p = 0.5) : c'est LUI que les seuils du registre citent
+    # p binomial unilateral P(X >= k | p = 0.5) : c'est lui que les seuils du registre citent
     # pour les corpus a paires (>= 12/15 -> 0.0176). Additif : aucune cle existante ne bouge.
     try:
         from scipy.stats import binomtest
@@ -604,7 +603,7 @@ def subset_report(per_row, pair_marg, keep):
 
 
 # ---------------------------------------------------------------------------------------------
-# MODE INTER-CORPUS (chaine C2, 07/08) : entraine sur UN corpus, teste sur un AUTRE.
+# mode inter-corpus (chaine C2, 07/08) : entraine sur un corpus, teste sur un AUTRE.
 #   "entrainement sur les 30 paires v2 (toutes, y compris faibles/invalides : c'est de
 #    l'ENTRAINEMENT, pas du test), selection d'hyperparametres par validation INTERNE a v2
 #    (jamais sur v3), puis UNE SEULE evaluation sur v3."
@@ -629,7 +628,7 @@ def cross_run(ds_tr, ds_te, device="cpu", seeds=(0, 1, 2), grid=None, verbose=Tr
         print(f"[cross] hyperparametres choisis sur le val INTERNE du corpus "
               f"{ds_tr['corpus']} : val_acc={best['val_acc']:.3f} {best['cfg']}", flush=True)
 
-    # 2) re-entrainement sur TOUTES les paires du corpus d'entrainement (le val a fini son
+    # 2) re-entrainement sur toutes les paires du corpus d'entrainement (le val a fini son
     #    office ; le corpus de test, lui, n'a toujours rien vu).
     set_fold(ds_tr, [], [])
     n_tr = len({int(v["corpus_idx"]) for v in ds_tr["videos"] if v["split"] == "train"})
@@ -643,8 +642,8 @@ def cross_run(ds_tr, ds_te, device="cpu", seeds=(0, 1, 2), grid=None, verbose=Tr
            "subsets_corpus_idx": {k: sorted(v) for k, v in subsets.items()}, "per_seed": []}
     for s in seeds:
         model, pre = train_one(ds_tr, best["cfg"], seed=s, device=device)
-        # 3) L'UNIQUE evaluation sur le corpus de test (toutes ses paires), avec le
-        #    blanchiment/ACP du corpus d'ENTRAINEMENT (pre_ext) -- jamais re-ajustes ici.
+        # 3) L'unique evaluation sur le corpus de test (toutes ses paires), avec le
+        #    blanchiment/ACP du corpus d'ENTRAINEMENT (pre_ext), jamais re-ajustes ici.
         r = evaluate(ds_te, model, pre, ALL_ROWS, device=device, pre_ext=pre)
         rp = evaluate(ds_te, model, pre, ALL_ROWS, device=device, permute=True, pre_ext=pre)
         per_row, pair_marg = _agg_rows([r["per_row"]])
@@ -691,7 +690,7 @@ def cv_run(ds, device="cpu", seeds=(0, 1, 2), n_folds=6, grid=None, verbose=True
     """Un tour complet de validation croisee par paires. Dans CHAQUE pli :
         test  = les 5 paires du pli (jamais vues, ni par le blanchiment, ni par l'ACP, ni par
                 la recherche d'hyperparametres, ni par le pre-entrainement) ;
-        val   = les 5 paires du pli suivant -> c'est LA que les hyperparametres sont choisis ;
+        val   = les 5 paires du pli suivant -> c'est la que les hyperparametres sont choisis ;
         train = les 20 restantes, puis les 25 (train + val) pour le re-entrainement final avec
                 les hyperparametres retenus (le val a fini son office ; le test n'a rien vu).
     Rend les 30 paires au denominateur, plus le controle d'etats permutes, pli par pli."""
@@ -758,7 +757,7 @@ def cv_run(ds, device="cpu", seeds=(0, 1, 2), n_folds=6, grid=None, verbose=True
         "acc_pair": float(np.mean([v["acc_pair"] for v in pv])),
         # la quantite de la regle 2 telle que l'audit l'a corrigee : moyennee sur 25
         # derangements par pli (les `per_row` ci-dessus ne portent que le premier tirage).
-        # `acc_pair_25perm` est la MEME correction dans la lecture PAR PAIRE, celle que
+        # `acc_pair_25perm` est la MEME correction dans la lecture par PAIRE, celle que
         # gates.py applique (les 5 paires de chaque pli pesent pareil : moyenner par pli
         # revient a moyenner sur les 30 paires).
         "acc_row_25perm": float(np.mean([a for f in out["per_fold"]
@@ -774,15 +773,15 @@ def main():
     ap.add_argument("--stage", required=True, choices=("hpsearch", "final", "cv", "cross"))
     ap.add_argument("--source", default="state",
                     choices=("state", "h", "hdirect", "hdirect_masked",
-                             # ORACLE D'ECRITURE MASQUEE (06/08) : memes signatures d'ETAT
+                             # oracle D'ECRITURE MASQUEE (06/08) : memes signatures d'ETAT
                              # (lecture swiglu_apply), seules les ECRITURES rejouees changent ;
                              # la "source" n'est ici que le sous-repertoire de sig/ (sig-tag).
                              "state_mw_subject", "state_mw_bg_matched",
-                             # ORACLE REGLE LINEAIRE (06/08 soir) : etat W (d x d) accumule
+                             # oracle regle LINEAIRE (06/08 soir) : etat W (d x d) accumule
                              # par produits exterieurs, lu par W @ sondes ; L1..L4 du registre.
                              "lin_mean_subject", "lin_mean_all",
                              "lin_delta_subject", "lin_delta_all",
-                             # BRAS MLP (07/08) : MEME etat SwiGLU, MEME lecture (swiglu_apply)
+                             # bras MLP (07/08) : MEME etat SwiGLU, MEME lecture (swiglu_apply)
                              # que `state` ; seule l'ECRITURE rejouee change (objectif residu,
                              # calendrier sequentiel, pas brut : plan factoriel A1..A4).
                              "mlp_delta_all", "mlp_delta_subject",
@@ -903,7 +902,7 @@ def main():
            "features": args.features, "corpus": args.corpus, "pretrain": bool(args.pretrain)}
     got = {"test": [], "test_permuted": []}
     for s in seeds:
-        # UN SEUL modele par graine : le bras et son controle permute sont evalues sur
+        # un SEUL modele par graine : le bras et son controle permute sont evalues sur
         # EXACTEMENT le meme sondeur, sinon le controle mesurerait aussi la variance d'init.
         m, pre = train_one(ds, cfg, seed=s, device=args.device)
         got["test"].append(evaluate(ds, m, pre, "test", device=args.device))
@@ -911,8 +910,8 @@ def main():
             evaluate(ds, m, pre, "test", device=args.device, permute=True))
     for name, ps in got.items():
         accs = [p["acc"] for p in ps]
-        # AUDIT 2026-08-04 : `per_row` est CONSERVE (il portait la seule trace permettant de
-        # recalculer une precision sur un SOUS-ENSEMBLE de paires). Sans lui, l'ANALYSE
+        # audit 2026-08-04 : `per_row` est conserve (il portait la seule trace permettant de
+        # recalculer une precision sur un sous-ensemble de paires). Sans lui, l'analyse
         # SECONDAIRE pre-enregistree a l'addendum (le sous-ensemble "le masque porte bien le
         # protagoniste") etait litteralement incalculable a partir du JSON de verdict.
         res[name] = {"acc_mean": float(np.mean(accs)), "acc_sd": float(np.std(accs)),

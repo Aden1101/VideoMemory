@@ -102,7 +102,7 @@ class EMA_FSDP:
         with FSDP.summon_full_params(fsdp_module, writeback=False):
             for n, p in fsdp_module.module.named_parameters():
                 # trainable-only shadow: in full-finetune every param requires grad (no-op skip),
-                # in LoRA mode this keeps ONLY the LoRA adapters + (FSDP-ignored) memory params,
+                # in LoRA mode this keeps only the LoRA adapters + (FSDP-ignored) memory params,
                 # so the shadow is tiny and the frozen base is never mirrored (5GB CPU saved).
                 if not p.requires_grad:
                     continue

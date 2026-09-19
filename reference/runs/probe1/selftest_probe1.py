@@ -1,50 +1,49 @@
 #!/usr/bin/env python
-# ============================================================================================
-# ETAPE 1 -- SELFTESTS (le contrat exige par la commande, un test par ligne du contrat).
-#
-#   T1  py_compile de tous les fichiers probe1
-#   T2  split : 18/5/7 par PAIRE, aucun chevauchement train/val/test (assert par ids), jumeau
-#       toujours du meme cote, deterministe (2 appels identiques)
-#   T3  segments / ages : `end_subject` et `end_seq` presents, ages valides, le segment-sujet
-#       est bien anterieur au switch
-#   T4  batterie de sondes : forme, RMS unitaire, finitude, ZERO video val/test dans le k-means
-#   T5  UN SEUL CHEMIN : borne superieure et etats passent par le meme `signature()`, seul un
-#       flag d'entree change (verification du code source + des formes)
-#   T6  signature DETERMINISTE : 2 appels = bitwise, pour les DEUX sources
-#   T7  masques : IoU > 0 sur 100 % des frames echantillonnees, sinon la video est SIGNALEE
-#   T8  le blanchiment/ACP ne fuit PAS du test (perturber le test ne bouge aucune statistique)
-#   T9  le sondeur, bout en bout sur donnees SYNTHETIQUES a reponse connue : signal -> haute
-#       precision, bruit pur -> hasard, controle permute -> hasard
-#   T10 le run de VERDICT est verrouille : `--stage final` ET `--stage cv` refusent sans
-#       `--audited`
-#   T11 (GPU, optionnel) contrat de rejeu : delta_l1 == 0 et rejeu bit a bit reproductible
-#
-# --- v2 (2026-08-05), les trois defauts du verdict "PROTOCOLE INVALIDE" + les materiaux neufs :
-#   T12 COMPRESSION : 1536 nombres (2 par sonde et par bloc), deterministe, sans parametre,
-#       ligne a ligne (donc sans fuite possible), et INVERSIBLE sur la source hdirect
-#   T13 BORNE SANS ECRITURE : le lecteur hdirect n'appelle ni swiglu_apply ni aucun rejeu et
-#       n'utilise meme pas les sondes ; c'est bien (moyenne, max) sur TOUS les tokens de TOUS
-#       les chunks jusqu'a l'age
-#   T14 GATES : PRIMARY == 'pair' partout, aucun seuil applique a une precision par ligne,
-#       regle 1 re-ancree a 5/6 sur les "clairement differents", 4 sous-ensembles rapportes
-#   T15 PLIS : 6 x 5 paires, partition exacte, deterministe, blanchiment re-ajuste par pli et
-#       aveugle a son test
-#   T16 PRE-ENTRAINEMENT : 0 video de paire dans le pool des 105 switch
-#   T17 PROMPTS v2 : 30 prompts sans aucun attribut d'apparence, sujets reconnus, held-out
-#   T18 NUMEROTATION de planche = celle des listes d'oeil scellees (10 paires nommees verifiees)
-#   T19 (GPU) --stream == disque, bit a bit
-#   T20 VALIDATION CROISEE bout en bout sur donnees a reponse connue
-#   T21 le collecteur reste ADDITIF : sans --prompts-file, la selection v3 est inchangee
-#
-# --- v3 (2026-08-05 nuit), CORRECTIF DE BORNE (pooling sous le masque-sujet) :
-#   T22 BORNE MASQUEE : (a) masque plein => `hdirect_masked` == `hdirect` BITWISE ;
-#       (b) masque vide => repli top-3 % declenche et logge (jamais un pooling vide) ;
-#       (c) deterministe (egalites tranchees par l'index) ; (d) alignement pixel -> grille
-#       30 x 52 verifie sur un damier CONNU + controle sur les vrais masques du disque
-#
-# Usage :  python reference/runs/probe1/selftest_probe1.py            # tout ce qui ne coute rien
-#          CUDA_VISIBLE_DEVICES=7 python .../selftest_probe1.py --gpu # + T6 reel, T11 et T19
-# ============================================================================================
+"""ETAPE 1, selftests (le contrat exige par la commande, un test par ligne du contrat).
+
+  T1  py_compile de tous les fichiers probe1
+  T2  split : 18/5/7 par PAIRE, aucun chevauchement train/val/test (assert par ids), jumeau
+      toujours du meme cote, deterministe (2 appels identiques)
+  T3  segments / ages : `end_subject` et `end_seq` presents, ages valides, le segment-sujet
+      est bien anterieur au switch
+  T4  batterie de sondes : forme, RMS unitaire, finitude, zero video val/test dans le k-means
+  T5  un SEUL CHEMIN : borne superieure et etats passent par le meme `signature()`, seul un
+      flag d'entree change (verification du code source + des formes)
+  T6  signature DETERMINISTE : 2 appels = bitwise, pour les DEUX sources
+  T7  masques : IoU > 0 sur 100 % des frames echantillonnees, sinon la video est signalee
+  T8  le blanchiment/ACP ne fuit pas du test (perturber le test ne bouge aucune statistique)
+  T9  le sondeur, bout en bout sur donnees SYNTHETIQUES a reponse connue : signal -> haute
+      precision, bruit pur -> hasard, controle permute -> hasard
+  T10 le run de verdict est verrouille : `--stage final` ET `--stage cv` refusent sans
+      `--audited`
+  T11 (GPU, optionnel) contrat de rejeu : delta_l1 == 0 et rejeu bit a bit reproductible
+
+--- v2 (2026-08-05), les trois defauts du verdict "PROTOCOLE INVALIDE" + les materiaux neufs :
+  T12 compression : 1536 nombres (2 par sonde et par bloc), deterministe, sans parametre,
+      ligne a ligne (donc sans fuite possible), et INVERSIBLE sur la source hdirect
+  T13 borne sans ECRITURE : le lecteur hdirect n'appelle ni swiglu_apply ni aucun rejeu et
+      n'utilise meme pas les sondes ; c'est bien (moyenne, max) sur tous les tokens de tous
+      les chunks jusqu'a l'age
+  T14 gates : PRIMARY == 'pair' partout, aucun seuil applique a une precision par ligne,
+      regle 1 re-ancree a 5/6 sur les "clairement differents", 4 sous-ensembles rapportes
+  T15 plis : 6 x 5 paires, partition exacte, deterministe, blanchiment re-ajuste par pli et
+      aveugle a son test
+  T16 PRE-ENTRAINEMENT : 0 video de paire dans le pool des 105 switch
+  T17 PROMPTS v2 : 30 prompts sans aucun attribut d'apparence, sujets reconnus, held-out
+  T18 NUMEROTATION de planche = celle des listes d'oeil scellees (10 paires nommees verifiees)
+  T19 (GPU) --stream == disque, bit a bit
+  T20 validation CROISEE bout en bout sur donnees a reponse connue
+  T21 le collecteur reste ADDITIF : sans --prompts-file, la selection v3 est inchangee
+
+--- v3 (2026-08-05 nuit), CORRECTIF de borne (pooling sous le masque-sujet) :
+  T22 borne MASQUEE : (a) masque plein => `hdirect_masked` == `hdirect` bitwise ;
+      (b) masque vide => repli top-3 % declenche et logge (jamais un pooling vide) ;
+      (c) deterministe (egalites tranchees par l'index) ; (d) alignement pixel -> grille
+      30 x 52 verifie sur un damier CONNU + controle sur les vrais masques du disque
+
+Usage :  python reference/runs/probe1/selftest_probe1.py            # tout ce qui ne coute rien
+         CUDA_VISIBLE_DEVICES=7 python .../selftest_probe1.py --gpu # + T6 reel, T11 et T19
+"""
 import argparse
 import glob
 import os
@@ -65,7 +64,7 @@ RESULTS = []
 
 def check(name, cond, detail=""):
     RESULTS.append((bool(cond), name, detail))
-    print(f"  [{'OK ' if cond else 'ECHEC'}] {name}" + (f"  -- {detail}" if detail else ""),
+    print(f"  [{'OK ' if cond else 'ECHEC'}] {name}" + (f": {detail}" if detail else ""),
           flush=True)
     return bool(cond)
 
@@ -165,7 +164,7 @@ def t5_single_path():
     src = inspect.getsource(B.signature)
     check("`signature` ne branche pas sur la source (pas de if/elif source)",
           "if source" not in src and "elif" not in src and "READERS[source]" in src)
-    # L'invariant est "UN SEUL registre" : toute source declaree a un lecteur, et aucun lecteur
+    # L'invariant est "un SEUL registre" : toute source declaree a un lecteur, et aucun lecteur
     # n'existe hors des sources. Le litteral fige a 4 noms datait d'avant les bras d'oracle
     # d'ecriture (lin_* 06/08, mlp_delta_* 07/08), qui AJOUTENT des sources sans ajouter de
     # chemin : il testait la liste du jour, pas la propriete. Le socle historique reste
@@ -261,9 +260,9 @@ def t13_bound_no_write():
 
 
 def t22_masked_bound():
-    """CORRECTIF DE BORNE (registre, 05/08 nuit) : `hdirect_masked` = le MEME pooling que
+    """CORRECTIF de borne (registre, 05/08 nuit) : `hdirect_masked` = le MEME pooling que
     `hdirect`, restreint aux tokens sous le masque-sujet. Les quatre contrats exiges :
-    (a) masque PLEIN => identique BITWISE a `hdirect` ; (b) masque vide => repli declenche
+    (a) masque PLEIN => identique bitwise a `hdirect` ; (b) masque vide => repli declenche
     (jamais un pooling vide) ; (c) deterministe ; (d) l'alignement pixel -> grille de tokens
     est le bon, verifie sur un damier CONNU."""
     print("T22 borne masquee : masque-sujet -> tokens h")
@@ -276,7 +275,7 @@ def t22_masked_bound():
           f"{cell_h}x{cell_w}")
     rows = np.arange(H) // cell_h
     cols = np.arange(W) // cell_w
-    damier = ((rows[:, None] + cols[None, :]) % 2 == 0)      # damier CELLULE par CELLULE
+    damier = ((rows[:, None] + cols[None, :]) % 2 == 0)      # damier cellule par cellule
     sal = C.mask_salience_grid(damier)
     att = np.zeros((C.GRID_H, C.GRID_W), dtype=np.float32)
     att[::2, ::2] = 1.0
@@ -293,7 +292,7 @@ def t22_masked_bound():
     want = {r * C.GRID_W + c for r in range(r0, r1) for c in range(c0, c1)}
     check("un carre pixel -> EXACTEMENT les tokens de son rectangle (index = ligne*52+colonne)",
           idx == want and not fb, f"{len(idx)} tokens, attendus {len(want)}")
-    # decalage SOUS-PATCH : la regle de MAJORITE conserve l'aire (ni dilatation ni erosion).
+    # decalage sous-patch : la regle de MAJORITE conserve l'aire (ni dilatation ni erosion).
     # Le rectangle glisse de 6 pixels : sa premiere ligne de cellules est couverte a 10/16
     # (retenue), sa derniere a 6/16 (rejetee) -> autant de tokens qu'avant le glissement.
     decale = np.zeros((H, W), dtype=bool)
@@ -301,7 +300,7 @@ def t22_masked_bound():
     sel2, _ = C.frame_token_mask(C.mask_salience_grid(decale))
     check("la regle de MAJORITE conserve l'aire (decalage sous-patch : ni dilatation ni erosion)",
           int(sel2.sum()) == len(want), f"{int(sel2.sum())} vs {len(want)}")
-    # a l'egalite EXACTE (decalage d'un demi-patch), le seuil >= tranche vers l'INCLUSION :
+    # a l'egalite EXACTE (decalage d'un demi-patch), le seuil >= tranche vers l'inclusion :
     # une ligne de cellules de plus, jamais un pooling ampute. C'est declare, pas subi.
     demi = np.zeros((H, W), dtype=bool)
     demi[r0 * cell_h + 8:r1 * cell_h + 8, c0 * cell_w:c1 * cell_w] = True
@@ -309,7 +308,7 @@ def t22_masked_bound():
     check("a l'egalite exacte (demi-patch), le seuil >= inclut les deux bords",
           int(sel2b.sum()) == len(want) + (c1 - c0), f"{int(sel2b.sum())} vs {len(want)}")
 
-    # --- (a) masque PLEIN == hdirect, BITWISE -----------------------------------------------
+    # --- (a) masque PLEIN == hdirect, bitwise -----------------------------------------------
     dim, nb, nch = 24, 2, 4
     blocks = [5, 16]
     probes = torch.randn(nb, 3, dim)
@@ -565,7 +564,7 @@ def t9_prober_synthetic():
 
 
 def t9b_real_refs():
-    """AUDIT 2026-08-04 -- LE CONTROLE POSITIF A DIFFICULTE REELLE.
+    """Audit 2026-08-04, LE CONTROLE POSITIF A DIFFICULTE REELLE.
 
     T9 valide la plomberie, mais sur des references DINO tirees au hasard : deux jumeaux y sont
     orthogonaux (cos ~ 0), alors que les VRAIS jumeaux (meme prompt) ont un cos median de 0,82.
@@ -880,7 +879,7 @@ def t20_cv_end_to_end():
 
 def t19_stream_equals_disk(gpu=False):
     """Le mode --stream (rejeu a la volee, aucun etat ecrit sur disque : 41 GB economises par
-    corpus) doit rendre EXACTEMENT la signature du chemin par disque -- sinon les videos de
+    corpus) doit rendre EXACTEMENT la signature du chemin par disque, sinon les videos de
     pre-entrainement et les paires v2 ne seraient pas dans le meme espace que les paires v1."""
     print("T19 --stream == disque, bit a bit (GPU)")
     if not (gpu and torch.cuda.is_available()):
@@ -949,7 +948,7 @@ def main():
     print(f"\n==== SELFTEST probe1 : {ok}/{len(RESULTS)} verts ====")
     for r, n, d in RESULTS:
         if not r:
-            print(f"  ECHEC: {n} -- {d}")
+            print(f"  ECHEC: {n}, {d}")
     sys.exit(0 if ok == len(RESULTS) else 1)
 
 

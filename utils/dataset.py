@@ -4,9 +4,9 @@ from torch.utils.data import Dataset
 import torch
 import datasets
 import json, os, random
-# 2026-09-09: `decord` was imported HERE, at module load. But it is only used by
+# 2026-09-09: `decord` was imported here, at module load. But it is only used by
 # TwoTextVideoPairDataset (reading real videos, training), not by TextDataset, which the
-# INFERENCE path imports. And decord has no wheel for macOS arm64: a module-level import
+# inference path imports. And decord has no wheel for macOS arm64: a module-level import
 # therefore blocked all of inference for a dependency it never uses. Lazy import, with a message
 # that says what to do if it really is needed.
 def _decord():

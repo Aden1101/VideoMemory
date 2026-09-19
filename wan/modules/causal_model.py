@@ -107,14 +107,14 @@ class CausalWanSelfAttention(nn.Module):
 
 
     # =========================================================================================
-    # MEM_ADDITIVE_KV (arm oracle1add, gate 1 of 2026-08-02) -- the ADDITIVE recall channel.
+    # MEM_ADDITIVE_KV (arm oracle1add, gate 1 of 2026-08-02), the ADDITIVE recall channel.
     #
-    # THE IDEA. Every recall mechanism measured so far (oracle1, memdec20, framebank) SPLICES:
+    # the idea. Every recall mechanism measured so far (oracle1, memdec20, framebank) splices:
     # the recalled frame takes a slot of the 12-frame local window, so one true frame of the
-    # current context is EVICTED and the model's "immediate declared past" is partly a foreign
+    # current context is evicted and the model's "immediate declared past" is partly a foreign
     # world (hence bg_cont 0.46 vs 0.90 and cut2 20.0 vs 7.7 on the same-scene tier). Here the
-    # anchor is instead injected as 1560 EXTRA k/v tokens, concatenated AT ATTENTION TIME
-    # (template: the existing prompt_cache path right above), living in the FREE RoPE band
+    # anchor is instead injected as 1560 extra k/v tokens, concatenated at attention time
+    # (template: the existing prompt_cache path right above), living in the free RoPE band
     # between the sink and the local window. Nothing is evicted, the 12 true frames stay intact.
     #
     # The tokens are installed by the pipeline (see SwitchCausalInferencePipeline._install_add_kv)
@@ -122,17 +122,17 @@ class CausalWanSelfAttention(nn.Module):
     # before the window), `self._add_gain` (attention-mass gain g). `_add_kv` absent/None =>
     # nothing below runs and the legacy path is bitwise.
     #
-    # The gain is an EXACT softmax reweighting, not a heuristic: writing Z for the softmax
+    # The gain is an exact softmax reweighting, not a heuristic: writing Z for the softmax
     # denominators, the merged output is
     #     out = (Z_ctx * out_ctx + g * Z_anc * out_anc) / (Z_ctx + g * Z_anc)
     # which is the attention over [context ; anchor] with the anchor logits shifted by log g
     # (g = 1 => plain concatenation, exactly). Implemented with the two log-sum-exps returned by
-    # the flash kernel, so alpha = g*Z_anc/(Z_ctx + g*Z_anc) is also the anchor's ATTENTION MASS
+    # the flash kernel, so alpha = g*Z_anc/(Z_ctx + g*Z_anc) is also the anchor's attention MASS
     # -> the tripwire of the design plan comes out for free (self._add_mass).
     @staticmethod
     def _sdpa_lse(q, k, v):
         """(B,H,L,D) half tensors -> (out, logsumexp) from the flash kernel (LSE natural log,
-        fp32, shape (B,H,L)). PyTorch >= 2.2 returns the true LSE of the SCALED scores."""
+        fp32, shape (B,H,L)). PyTorch >= 2.2 returns the true LSE of the scaled scores."""
         out, lse = torch.ops.aten._scaled_dot_product_flash_attention(
             q.contiguous(), k.contiguous(), v.contiguous(), 0.0, False, False)[:2]
         return out, lse
@@ -155,8 +155,8 @@ class CausalWanSelfAttention(nn.Module):
                + alpha.unsqueeze(-1) * out_add.float())
         self._add_mass = float(alpha.mean())
         self._add_last_pos = pos
-        # MEM_ADD_MASS_SRC (T1, lot offensif 2026-08-04): la masse d'attention par SOURCE
-        # [sink | fenetre | ancre]. EXACT, pas une approximation: le log-sum-exp d'une
+        # MEM_ADD_MASS_SRC (T1, lot offensif 2026-08-04): la masse d'attention par source
+        # [sink | fenetre | ancre]. Exact, pas une approximation: le log-sum-exp d'une
         # concatenation est le logaddexp des deux, donc Z_ctx = Z_sink + Z_win et les trois
         # fractions somment a 1. Deux flash-attn de plus, uniquement quand le drapeau est mis
         # (defaut OFF -> aucun cout, sortie inchangee dans tous les cas).
@@ -208,7 +208,7 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        # MEM_ADDITIVE_KV phantom pass (arm oracle1add): store the RAW (pre-RoPE) k/v this block
+        # MEM_ADDITIVE_KV phantom pass (arm oracle1add): store the raw (pre-RoPE) k/v this block
         # produces for the anchor frame. Attribute absent by default => zero cost, zero change.
         if getattr(self, "_add_capture", False):
             self._add_captured = (k.detach().clone(), v.detach().clone())
@@ -510,10 +510,10 @@ class CausalWanSelfAttention(nn.Module):
                         v_cat
                     )
                 else:
-                    # MEM_ADDITIVE_KV: the anchor tokens live in the free RoPE band just BEFORE
+                    # MEM_ADDITIVE_KV: the anchor tokens live in the free RoPE band just before
                     # the local window (sink = [0, sink_runtime), window = [rope_start_f_k_local,
                     # 21) under rope_enhance), so the default "auto" position is one frame before
-                    # the window and NOTHING in the cache moves.
+                    # the window and nothing in the cache moves.
                     _auto = (max(0, rope_start_f_k_local - 1) if (rope_enhance and local_budget > 0)
                              else max(0, current_start_frame - max(self.local_attn_size, 1) - 1))
                     x = self._additive_attention(roped_query, k_cat, v_cat, grid_sizes, freqs,
@@ -595,7 +595,7 @@ class CausalWanAttentionBlock(nn.Module):
         self.mem_stream_scale = mem_stream_scale
         # e4 anti-flicker: causal temporal EMA on the injection (0.0 = OFF, byte-identical baseline).
         self.ema_alpha = float(ema_alpha or 0.0)
-        # c2 eviction-feed: memory writes the EVICTED chunk instead of the current one
+        # c2 eviction-feed: memory writes the evicted chunk instead of the current one
         # (False = byte-identical baseline).
         self.eviction_feed = bool(eviction_feed)
         self.ffn_dim = ffn_dim
@@ -627,7 +627,7 @@ class CausalWanAttentionBlock(nn.Module):
         # parallel memory branch (None = unchanged baseline block)
         # mem_state_type/mem_linear_beta (P0, ADDITIVE): "swiglu" (default) = the historical
         # cell, strictly unchanged; "linear_delta" = matrix-state W with the sealed delta
-        # rule (plan 2026-08-07 bras M2), read/write core swapped INSIDE the cell only.
+        # rule (plan 2026-08-07 bras M2), read/write core swapped inside the cell only.
         self.memory = VideoMemoryLayer(dim=dim, num_heads=1, inter_multi=4,
                                        g_init=gate_init, checkpoint_write=ckpt_write,
                                        gate_extra=gate_extra, use_decay=use_decay,
@@ -722,13 +722,13 @@ class CausalWanAttentionBlock(nn.Module):
                                           gf - switch_global_frame, gf).float()  # resets to 0 at switch
                     mem_fss = fss[None, :].expand(B, num_frames).repeat_interleave(frame_seqlen, dim=1)
             if self.eviction_feed and ttt_update:
-                # c2 eviction-feed: the memory WRITES the chunk that just fell out of the
+                # c2 eviction-feed: the memory writes the chunk that just fell out of the
                 # attention window (mem_x_write, popped at model level so it is an explicit
-                # checkpoint input like ttt_state), NOT the current chunk whose k/v the KV
-                # cache still holds. The READ query stays the current chunk's h. Until
+                # checkpoint input like ttt_state), not the current chunk whose k/v the KV
+                # cache still holds. The read query stays the current chunk's h. Until
                 # something has actually been evicted (fifo warm-up, or the popped chunk is
                 # still inside the pinned sink) the write is skipped entirely, so the memory
-                # accumulates ONLY cache-complement content. The append below is the only
+                # accumulates only cache-complement content. The append below is the only
                 # fifo mutation inside the (possibly checkpointed) block; backward recompute
                 # re-appends, which the trainer's ttt snapshot/restore undoes (same
                 # mechanism that already protects ttt_cache.state and .ema).
@@ -749,13 +749,13 @@ class CausalWanAttentionBlock(nn.Module):
             _mz_all = int(os.environ.get("MEM_ZERO_ALL", "0"))
             if _mz_all != 0:                    # any nonzero value zeroes the injection on every frame
                 if not globals().get("_MZ_ANNOUNCED"):   # print once/process so mem-OFF arms are auditable
-                    print(f"[MEM_ZERO_ALL={_mz_all}] memory injection ZEROED -- mem-OFF ablation arm", flush=True)
+                    print(f"[MEM_ZERO_ALL={_mz_all}] memory injection ZEROED, mem-OFF ablation arm", flush=True)
                     globals()["_MZ_ANNOUNCED"] = True
                 mem_out = mem_out * 0.0
-            # stream-RMS envelope: bound the injection to a fraction of the LOCAL residual stream so an
+            # stream-RMS envelope: bound the injection to a fraction of the local residual stream so an
             # active injection cannot accumulate into an artifact over a long OOD rollout (h=norm1(x) is
             # magnitude-normalized, so x here is the only informative local scale). detach = a bound, not
-            # a magnitude the memory can game. env MEM_STREAM_SCALE or config mem_stream_scale; 0 = off.
+            # a magnitude the memory can game. Env MEM_STREAM_SCALE or config mem_stream_scale; 0 = off.
             _ss = os.environ.get("MEM_STREAM_SCALE", "")
             _ss = float(_ss) if _ss != "" else float(getattr(self, "mem_stream_scale", 0.0) or 0.0)
             if _ss > 0.0:
@@ -764,13 +764,13 @@ class CausalWanAttentionBlock(nn.Module):
                     (mem_out.detach().float().pow(2).mean(-1, keepdim=True).sqrt() * _ss).mean()
                     / _srms.mean().clamp_min(1e-8))
                 mem_out = mem_out * (_ss * _srms).to(mem_out.dtype)
-            # e4 anti-flicker: causal temporal EMA on the READ injection (config ema_alpha; 0=OFF,
-            # byte-identical). mem_ema_prev is READ OUTSIDE the gradient-checkpoint region and passed
-            # in as an explicit input (like ttt_state) so backward recompute reuses the SAME historical
+            # e4 anti-flicker: causal temporal EMA on the read injection (config ema_alpha; 0=OFF,
+            # byte-identical). mem_ema_prev is read outside the gradient-checkpoint region and passed
+            # in as an explicit input (like ttt_state) so backward recompute reuses the same historical
             # buffer value -> the injection is bit-reproducible under checkpointing. The buffer is
             # updated only on read passes (the injection that appears in the output); the write pass
             # (ttt_update) feeds only the detached clean cache and is left untouched. Under the mem-OFF
-            # twin (MEM_ZERO_ALL) the injection must stay EXACTLY zero, so EMA is skipped there.
+            # twin (MEM_ZERO_ALL) the injection must stay exactly zero, so EMA is skipped there.
             _alpha = float(getattr(self, "ema_alpha", 0.0) or 0.0)
             if (_alpha > 0.0 and not ttt_update and _mz_all == 0
                     and mem_ema_key is not None and ttt_cache is not None):
@@ -781,9 +781,9 @@ class CausalWanAttentionBlock(nn.Module):
                 # bf16 CPU<->GPU round-trip is bit-identical (twin selftest re-validated).
                 ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
             # R1 probe (env MEM_REJECT_STREAM, default off = byte-identical): per-token vector rejection
-            # of the component of the injection PARALLEL to the current residual stream x. The parallel
+            # of the component of the injection parallel to the current residual stream x. The parallel
             # part is exactly "inject more of what is already there" (self-similar -> damps motion); we
-            # keep only the orthogonal (novel/corrective) remainder. RULE: no renorm after subtracting
+            # keep only the orthogonal (novel/corrective) remainder. Rule: no renorm after subtracting
             # (renorm would re-create the e2 fixed-dose dissolution). Self-similar read -> ~0 remainder
             # -> graceful abstain. Applied to the read injection about to be added.
             if int(os.environ.get("MEM_REJECT_STREAM", "0")) != 0:
@@ -793,7 +793,7 @@ class CausalWanAttentionBlock(nn.Module):
                 mem_out = (_m - (_m * _xh).sum(-1, keepdim=True) * _xh).to(mem_out.dtype)
             x = x + (mem_out.detach() if ttt_update else mem_out)
             if ttt_update:
-                # attribute write on a TTTBlockCache OBJECT (not a dict key!):this mutation survives the call stack.
+                # attribute write on a TTTBlockCache object (not a dict key!):this mutation survives the call stack.
                 ttt_cache.state = new_state
         # ===================================================================================
 
@@ -988,7 +988,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # whether the injection low-pass is actually active, so the default path stays cost-free.
         self._mem_ema_on = float(ema_alpha or 0.0) > 0.0
         # c2 eviction-feed (False = byte-identical): the model-level side pops the evicted
-        # chunk from the fifo OUTSIDE the checkpointed block. Requires local attention
+        # chunk from the fifo outside the checkpointed block. Requires local attention
         # (something must actually evict); enforced lazily in _forward_inference.
         self.eviction_feed = bool(eviction_feed)
 
@@ -1011,7 +1011,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
-        # init_weights() xavier-inits EVERY nn.Linear, which breaks the memory branch's inert
+        # init_weights() xavier-inits every nn.Linear, which breaks the memory branch's inert
         # gate init (proj=0).
         for block in self.blocks:
             if getattr(block, "memory", None) is not None:
@@ -1429,7 +1429,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_update_infos = []  # Collect cache update info for all blocks
         # e4 anti-flicker: key the per-block injection EMA buffers by the denoising timestep so
         # consecutive updates at a matched buffer are consecutive sub-blocks (a clean temporal axis).
-        # Read the previous buffer OUTSIDE the checkpoint and pass it in as an explicit input so the
+        # Read the previous buffer outside the checkpoint and pass it in as an explicit input so the
         # backward recompute is bit-reproducible (mirrors the ttt_state mechanism). Only pay the host
         # sync when the low-pass is actually active.
         _mem_ema_key = None
@@ -1440,7 +1440,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return None
             return ttt_cache[bi].ema.get(_mem_ema_key)
         # ---- c2 eviction-feed (default off = byte-identical) --------------------------------
-        # On the write pass, pop the just-evicted chunk from each memory block's fifo HERE,
+        # On the write pass, pop the just-evicted chunk from each memory block's fifo here,
         # outside the gradient-checkpointed block, and hand it to the block as an explicit
         # kwarg (mem_x_write): checkpoint saves it as an input, so backward recompute reuses
         # the same tensor (mirrors the ttt_state mechanism). Simple robust FIFO-delay, not

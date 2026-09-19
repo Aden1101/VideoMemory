@@ -1,10 +1,9 @@
 #!/usr/bin/env python
-# ============================================================================================
-# SELFTESTS for decoder_v2.py -- pure CPU, no GPU, no shard, no checkpoint. Runs in ~2 s.
-# House rule: the fixes are audited BEFORE any GPU is spent, and each test states the failure
-# it is there to catch.
-#   python reference/runs/frame_dec/selftest_v2.py
-# ============================================================================================
+"""Selftests for decoder_v2.py, pure CPU, no GPU, no shard, no checkpoint. Runs in ~2 s.
+House rule: the fixes are audited before any GPU is spent, and each test states the failure
+it is there to catch.
+  python reference/runs/frame_dec/selftest_v2.py
+"""
 import os
 import sys
 
@@ -36,8 +35,8 @@ check("T1 grad_match == 1.0 on a constant output",
       abs(float(grad_match_loss(flat, tgt)) - 1.0) < 1e-5,
       f"got {float(grad_match_loss(flat, tgt))}")
 
-# --- T2: it is a MATCHER, not a maximizer ----------------------------------------------------
-# Catches the e2_amp degeneracy: a term that rewards gradient ENERGY is satisfied by noise.
+# --- T2: it is a matcher, not a maximizer ----------------------------------------------------
+# Catches the e2_amp degeneracy: a term that rewards gradient energy is satisfied by noise.
 noisy = tgt + 3.0 * torch.randn_like(tgt)
 check("T2 noise scores worse than the exact target",
       float(grad_match_loss(noisy, tgt)) > float(grad_match_loss(tgt, tgt)),
@@ -49,7 +48,7 @@ check("T2b exact target scores 0", float(grad_match_loss(tgt, tgt)) < 1e-6)
 shifted = tgt + 7.0
 check("T3 DC shift is free", abs(float(grad_match_loss(shifted, tgt))) < 1e-6)
 
-# --- T4: a blurred output scores WORSE than a sharp one --------------------------------------
+# --- T4: a blurred output scores worse than a sharp one --------------------------------------
 # This is the whole point of cause 3: the v1 loss was happy with the low-pass output.
 blur = torch.nn.functional.avg_pool2d(tgt.view(B, C, H, W), 5, 1, 2).view(B, 1, C, H, W)
 check("T4 blur is penalized",

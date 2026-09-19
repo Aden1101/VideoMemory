@@ -1,10 +1,9 @@
 #!/usr/bin/env python
-# ============================================================================================
-# BOARD SELFTESTS -- pure CPU, no real media, ~1 s. Run BEFORE generating a campaign: a wrong
-# board costs an evening of generation and, worse, an eye judgment that cannot be asked for
-# again identically.
-#   python reference/runs/eyeboards/selftest_boards.py
-# ============================================================================================
+"""Board SELFTESTS, pure CPU, no real media, ~1 s. Run before generating a campaign: a wrong
+board costs an evening of generation and, worse, an eye judgment that cannot be asked for
+again identically.
+  python reference/runs/eyeboards/selftest_boards.py
+"""
 import json
 import os
 import shutil
@@ -47,12 +46,12 @@ try:
     check("B1c perm is a real permutation",
           all(sorted(perm("b", f"s{i}", 3)) == [0, 1, 2] for i in range(50)))
     counts = {}
-    for i in range(400):                       # it must also be BALANCED: a shuffle that
+    for i in range(400):                       # it must also be balanced: a shuffle that
         counts[perm("b", f"s{i}", 2)[0]] = counts.get(perm("b", f"s{i}", 2)[0], 0) + 1
     check("B1d perm balanced over 2 slots", 150 < counts.get(0, 0) < 250, f"{counts}")
 
-    # --- B2: the key NEVER leaks into the page --------------------------------------------------
-    # THE test that matters. A board containing the arm name or the file path is not a blind
+    # --- B2: the key never leaks into the page --------------------------------------------------
+    # the test that matters. A board containing the arm name or the file path is not a blind
     # judgment, it is a lost measurement.
     for r, forbidden in ((r_duel, ["memon", "memoff"]),
                          (r_rank, ["v1_ancien", "v2_mixer", "v2_mixer_sharp"])):
@@ -63,7 +62,7 @@ try:
         h = page(r["html"])
         check(f"B2b no file path in {os.path.basename(r['html'])}",
               "/media/" not in h and ".png\"" not in h and TMP not in h)
-        # 'true' on its own legitimately appears in aria-pressed="true": we look for the KEY's
+        # 'true' on its own legitimately appears in aria-pressed="true": we look for the key's
         # field names, which must never cross over.
         check(f"B2c no key field in {os.path.basename(r['html'])}",
               "true_side" not in h and "twin" not in h and "variant" not in h
@@ -73,7 +72,7 @@ try:
     sides = [it["true_side"] for it in k_pair["items"]]
     check("B3 the answer key is not constant", len(set(sides)) == 2 or len(sides) < 4, f"{sides}")
 
-    # --- B4: round trip code -> score, with a PERFECT judge ------------------------------------
+    # --- B4: round trip code -> score, with a perfect judge ------------------------------------
     perfect = "".join(it["true_side"] for it in sorted(k_pair["items"], key=lambda x: x["slot"]))
     code = f"{k_pair['board_id']}~{CODE_VERSION}~{perfect}~{k_pair['checksum']}"
     res = score(k_pair, code)
@@ -106,7 +105,7 @@ try:
             pass
     check("B6 the 5 invalid codes are refused", True)
 
-    # --- B7: duel2 counts wins per ARM, not per side --------------------------------------------
+    # --- B7: duel2 counts wins per arm, not per side --------------------------------------------
     # Catches: the bug that would make the permutation pointless (counting L/R instead of arm).
     always_g = "g" * k_duel["n_slots"]
     rd = score(k_duel, f"{k_duel['board_id']}~{CODE_VERSION}~{always_g}~{k_duel['checksum']}")
@@ -118,8 +117,8 @@ try:
     check("B7c total wins == decided cells",
           sum(rd["wins"].values()) == rd["n_decided"])
 
-    # --- B8: rank3 -- rank 1 = best, duels consistent -------------------------------------------
-    # We build a judge who ALWAYS puts the 'v2_mixer_sharp' variant first.
+    # --- B8: rank3, rank 1 = best, duels consistent -------------------------------------------
+    # We build a judge who always puts the 'v2_mixer_sharp' variant first.
     payload = ["."] * k_rank["n_slots"]
     for it in k_rank["items"]:
         order = sorted(it["letters"].items(),
