@@ -106,29 +106,16 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
 
-    # =========================================================================================
-    # MEM_ADDITIVE_KV (arm oracle1add, gate 1 of 2026-08-02), the ADDITIVE recall channel.
+    # Recall an anchor frame by ADDING key/value tokens rather than evicting a true frame for
+    # it: they sit in the free RoPE band between the sink and the window. Installed by the
+    # pipeline as `self._add_kv`; absent, nothing below runs.
     #
-    # the idea. Every recall mechanism measured so far (oracle1, memdec20, framebank) splices:
-    # the recalled frame takes a slot of the 12-frame local window, so one true frame of the
-    # current context is evicted and the model's "immediate declared past" is partly a foreign
-    # world (hence bg_cont 0.46 vs 0.90 and cut2 20.0 vs 7.7 on the same-scene tier). Here the
-    # anchor is instead injected as 1560 extra k/v tokens, concatenated at attention time
-    # (template: the existing prompt_cache path right above), living in the free RoPE band
-    # between the sink and the local window. Nothing is evicted, the 12 true frames stay intact.
-    #
-    # The tokens are installed by the pipeline (see SwitchCausalInferencePipeline._install_add_kv)
-    # as `self._add_kv = (k_raw, v)`, `self._add_pos` (RoPE band start, -1 = auto = one frame
-    # before the window), `self._add_gain` (attention-mass gain g). `_add_kv` absent/None =>
-    # nothing below runs and the legacy path is bitwise.
-    #
-    # The gain is an exact softmax reweighting, not a heuristic: writing Z for the softmax
+    # The gain g is an exact softmax reweighting, not an interpolation. With Z the softmax
     # denominators, the merged output is
     #     out = (Z_ctx * out_ctx + g * Z_anc * out_anc) / (Z_ctx + g * Z_anc)
-    # which is the attention over [context ; anchor] with the anchor logits shifted by log g
-    # (g = 1 => plain concatenation, exactly). Implemented with the two log-sum-exps returned by
-    # the flash kernel, so alpha = g*Z_anc/(Z_ctx + g*Z_anc) is also the anchor's attention MASS
-    # -> the tripwire of the design plan comes out for free (self._add_mass).
+    # which is attention over [context ; anchor] with the anchor logits shifted by log g, so
+    # g = 1 is plain concatenation. alpha = g*Z_anc/(Z_ctx + g*Z_anc) is also the attention mass
+    # the anchor actually takes, so the check comes out of the same computation.
     @staticmethod
     def _sdpa_lse(q, k, v):
         """(B,H,L,D) half tensors -> (out, logsumexp) from the flash kernel (LSE natural log,
@@ -155,11 +142,9 @@ class CausalWanSelfAttention(nn.Module):
                + alpha.unsqueeze(-1) * out_add.float())
         self._add_mass = float(alpha.mean())
         self._add_last_pos = pos
-        # MEM_ADD_MASS_SRC (T1, lot offensif 2026-08-04): la masse d'attention par source
-        # [sink | fenetre | ancre]. Exact, pas une approximation: le log-sum-exp d'une
-        # concatenation est le logaddexp des deux, donc Z_ctx = Z_sink + Z_win et les trois
-        # fractions somment a 1. Deux flash-attn de plus, uniquement quand le drapeau est mis
-        # (defaut OFF -> aucun cout, sortie inchangee dans tous les cas).
+        # attention mass per source [sink | window | anchor], exact rather than approximate:
+        # the log-sum-exp of a concatenation is the logaddexp of the parts, so the three
+        # fractions sum to 1. Costs two more attention calls, only when the flag is set.
         if int(os.environ.get("MEM_ADD_MASS_SRC", "0") or 0) and 0 < n_sink < k_ctx.shape[1]:
             ks, vs = k_ctx[:, :n_sink], v_ctx[:, :n_sink]
             kw, vw = k_ctx[:, n_sink:], v_ctx[:, n_sink:]
@@ -637,6 +622,99 @@ class CausalWanAttentionBlock(nn.Module):
                                        state_type=mem_state_type,
                                        linear_beta=mem_linear_beta) if use_memory else None
 
+    def _memory_inject(self, x, h, *, ttt_cache, ttt_state, ttt_update, mem_x_write,
+                       mem_ema_key, mem_ema_prev, context, denoising_step,
+                       switch_global_frame, current_start, num_frames, frame_seqlen):
+        """Read the memory, guard the result, add it to the residual stream, store the new
+        state. Returns x unchanged when this block has no memory branch."""
+        if self.memory is None or ttt_cache is None:
+            return x
+        # ttt_state = state snapshot taken outside the gradient-checkpoint region:
+        # checkpoint saves these tensors, so the backward recompute reads the same state
+        state_in = ttt_state if ttt_state is not None else ttt_cache.state
+        # build the optional per-token gate_extra signals: denoising_step from the timestep t,
+        # frames_since_switch from the global frame index vs the switch.
+        mem_ds, mem_fss = None, None
+        gx = getattr(self.memory, "gate_extra", None)
+        if gx:
+            B = x.shape[0]
+            if "denoising_step" in gx and denoising_step is not None:
+                ds = denoising_step.float()
+                if ds.dim() == 1:                       # [B] -> [B, F]
+                    ds = ds[:, None].expand(B, num_frames)
+                elif ds.shape[1] != num_frames:
+                    ds = ds[:, :1].expand(B, num_frames)
+                mem_ds = ds.repeat_interleave(frame_seqlen, dim=1)          # (B, L)
+            if "frames_since_switch" in gx:
+                csf = current_start // frame_seqlen                          # chunk start frame
+                gf = csf + torch.arange(num_frames, device=x.device)         # global frame idx
+                if switch_global_frame is None:
+                    fss = gf.float()                                         # no switch -> since start
+                else:
+                    fss = torch.where(gf >= switch_global_frame,
+                                      gf - switch_global_frame, gf).float()  # resets to 0 at switch
+                mem_fss = fss[None, :].expand(B, num_frames).repeat_interleave(frame_seqlen, dim=1)
+        if self.eviction_feed and ttt_update:
+            # the memory writes the chunk that just left the attention window, not the current
+            # one whose k/v the cache still holds. Nothing evicted yet means no write at all.
+            # The append here is re-done by backward recompute, which the trainer's snapshot
+            # and restore undoes.
+            _cur_chunk = int(current_start) // (frame_seqlen * num_frames)
+            ttt_cache.fifo.append((_cur_chunk, h.detach()))
+            _mem_do_update, _mem_xw = mem_x_write is not None, mem_x_write
+        else:
+            _mem_do_update, _mem_xw = ttt_update, None
+        mem_out, new_state = self.memory.step(
+            h, state=state_in, do_update=_mem_do_update, x_write=_mem_xw,  # h = norm1(x_in)
+            prompt_emb=context,
+            denoising_step=mem_ds, frames_since_switch=mem_fss,
+            num_frames=num_frames)
+        # on the write pass the injection only feeds the detached clean cache, so detach it:
+        # otherwise every frozen block downstream builds a ~15 GB backward graph for nothing.
+        # The write gradient reaches the memory through new_state, not through x.
+        _mz_all = int(os.environ.get("MEM_ZERO_ALL", "0"))
+        if _mz_all != 0:                    # any nonzero value zeroes the injection on every frame
+            if not globals().get("_MZ_ANNOUNCED"):   # print once/process so mem-OFF arms are auditable
+                print(f"[MEM_ZERO_ALL={_mz_all}] memory injection ZEROED, mem-OFF ablation arm", flush=True)
+                globals()["_MZ_ANNOUNCED"] = True
+            mem_out = mem_out * 0.0
+        # bound the injection to a fraction of the local residual stream, so it cannot pile up
+        # into an artifact over a long rollout. Measured on x, not h, since h is normalised;
+        # and detached, so the memory cannot inflate the stream to earn a bigger injection.
+        _ss = os.environ.get("MEM_STREAM_SCALE", "")
+        _ss = float(_ss) if _ss != "" else float(getattr(self, "mem_stream_scale", 0.0) or 0.0)
+        if _ss > 0.0:
+            _srms = x.detach().float().pow(2).mean(dim=-1, keepdim=True).add(1e-8).sqrt()
+            self.memory.dbg_inj_stream = (
+                (mem_out.detach().float().pow(2).mean(-1, keepdim=True).sqrt() * _ss).mean()
+                / _srms.mean().clamp_min(1e-8))
+            mem_out = mem_out * (_ss * _srms).to(mem_out.dtype)
+        # smooth the injection over time to damp flicker. The previous buffer is read outside
+        # the checkpointed region and passed in, so backward recompute reuses the same value.
+        # Skipped on write passes, and under the mem-OFF twin, where zero must stay zero.
+        _alpha = float(getattr(self, "ema_alpha", 0.0) or 0.0)
+        if (_alpha > 0.0 and not ttt_update and _mz_all == 0
+                and mem_ema_key is not None and ttt_cache is not None):
+            if mem_ema_prev is not None and mem_ema_prev.shape == mem_out.shape:
+                mem_out = _alpha * mem_out + (1.0 - _alpha) * mem_ema_prev.to(device=mem_out.device, dtype=mem_out.dtype)
+            # first observation at this key: mem_out passes through unchanged (EMA seed)
+            # CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
+            # bf16 CPU<->GPU round-trip is bit-identical (twin selftest re-validated).
+            ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
+        # drop the part of the injection parallel to the residual stream: it is "more of what
+        # is already there", which damps motion. Only the orthogonal remainder is kept, and it
+        # is deliberately not renormalised afterwards.
+        if int(os.environ.get("MEM_REJECT_STREAM", "0")) != 0:
+            _xh = x.detach().float()
+            _xh = _xh / _xh.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            _m = mem_out.float()
+            mem_out = (_m - (_m * _xh).sum(-1, keepdim=True) * _xh).to(mem_out.dtype)
+        x = x + (mem_out.detach() if ttt_update else mem_out)
+        if ttt_update:
+            # attribute write on a TTTBlockCache object (not a dict key!):this mutation survives the call stack.
+            ttt_cache.state = new_state
+        return x
+
     def forward(
         self,
         x,
@@ -694,108 +772,13 @@ class CausalWanAttentionBlock(nn.Module):
         # with amp.autocast(dtype=torch.float32):
         x = x_in + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
-        # parallel memory branch
-        if self.memory is not None and ttt_cache is not None:
-            # ttt_state = state snapshot taken outside the gradient-checkpoint region:
-            # checkpoint saves these tensors, so the backward recompute reads the same state
-            state_in = ttt_state if ttt_state is not None else ttt_cache.state
-            # build the optional per-token gate_extra signals: denoising_step from the timestep t,
-            # frames_since_switch from the global frame index vs the switch.
-            mem_ds, mem_fss = None, None
-            gx = getattr(self.memory, "gate_extra", None)
-            if gx:
-                B = x.shape[0]
-                if "denoising_step" in gx and denoising_step is not None:
-                    ds = denoising_step.float()
-                    if ds.dim() == 1:                       # [B] -> [B, F]
-                        ds = ds[:, None].expand(B, num_frames)
-                    elif ds.shape[1] != num_frames:
-                        ds = ds[:, :1].expand(B, num_frames)
-                    mem_ds = ds.repeat_interleave(frame_seqlen, dim=1)          # (B, L)
-                if "frames_since_switch" in gx:
-                    csf = current_start // frame_seqlen                          # chunk start frame
-                    gf = csf + torch.arange(num_frames, device=x.device)         # global frame idx
-                    if switch_global_frame is None:
-                        fss = gf.float()                                         # no switch -> since start
-                    else:
-                        fss = torch.where(gf >= switch_global_frame,
-                                          gf - switch_global_frame, gf).float()  # resets to 0 at switch
-                    mem_fss = fss[None, :].expand(B, num_frames).repeat_interleave(frame_seqlen, dim=1)
-            if self.eviction_feed and ttt_update:
-                # eviction feed: the memory writes the chunk that just fell out of the
-                # attention window (mem_x_write, popped at model level so it is an explicit
-                # checkpoint input like ttt_state), not the current chunk whose k/v the KV
-                # cache still holds. The read query stays the current chunk's h. Until
-                # something has actually been evicted (fifo warm-up, or the popped chunk is
-                # still inside the pinned sink) the write is skipped entirely, so the memory
-                # accumulates only cache-complement content. The append below is the only
-                # fifo mutation inside the (possibly checkpointed) block; backward recompute
-                # re-appends, which the trainer's ttt snapshot/restore undoes (same
-                # mechanism that already protects ttt_cache.state and .ema).
-                _cur_chunk = int(current_start) // (frame_seqlen * num_frames)
-                ttt_cache.fifo.append((_cur_chunk, h.detach()))
-                _mem_do_update, _mem_xw = mem_x_write is not None, mem_x_write
-            else:
-                _mem_do_update, _mem_xw = ttt_update, None
-            mem_out, new_state = self.memory.step(
-                h, state=state_in, do_update=_mem_do_update, x_write=_mem_xw,  # h = norm1(x_in)
-                prompt_emb=context,
-                denoising_step=mem_ds, frames_since_switch=mem_fss,
-                num_frames=num_frames)
-            # on the write pass (ttt_update=True) mem_out only feeds the detached clean cache, not
-            # the loss -> detach it, else every frozen downstream block builds a wasted ~15GB backward
-            # graph; the write gradient reaches the memory via new_state, not x. On reads keep the graph.
-            # MEM_ZERO_ALL ablation (env-gated, default off): zero mem_out on both passes.
-            _mz_all = int(os.environ.get("MEM_ZERO_ALL", "0"))
-            if _mz_all != 0:                    # any nonzero value zeroes the injection on every frame
-                if not globals().get("_MZ_ANNOUNCED"):   # print once/process so mem-OFF arms are auditable
-                    print(f"[MEM_ZERO_ALL={_mz_all}] memory injection ZEROED, mem-OFF ablation arm", flush=True)
-                    globals()["_MZ_ANNOUNCED"] = True
-                mem_out = mem_out * 0.0
-            # stream-RMS envelope: bound the injection to a fraction of the local residual stream so an
-            # active injection cannot accumulate into an artifact over a long OOD rollout (h=norm1(x) is
-            # magnitude-normalized, so x here is the only informative local scale). detach = a bound, not
-            # a magnitude the memory can game. Env MEM_STREAM_SCALE or config mem_stream_scale; 0 = off.
-            _ss = os.environ.get("MEM_STREAM_SCALE", "")
-            _ss = float(_ss) if _ss != "" else float(getattr(self, "mem_stream_scale", 0.0) or 0.0)
-            if _ss > 0.0:
-                _srms = x.detach().float().pow(2).mean(dim=-1, keepdim=True).add(1e-8).sqrt()
-                self.memory.dbg_inj_stream = (
-                    (mem_out.detach().float().pow(2).mean(-1, keepdim=True).sqrt() * _ss).mean()
-                    / _srms.mean().clamp_min(1e-8))
-                mem_out = mem_out * (_ss * _srms).to(mem_out.dtype)
-            # anti-flicker: causal temporal EMA on the read injection (config ema_alpha; 0=off,
-            # byte-identical). mem_ema_prev is read outside the gradient-checkpoint region and passed
-            # in as an explicit input (like ttt_state) so backward recompute reuses the same historical
-            # buffer value -> the injection is bit-reproducible under checkpointing. The buffer is
-            # updated only on read passes (the injection that appears in the output); the write pass
-            # (ttt_update) feeds only the detached clean cache and is left untouched. Under the mem-OFF
-            # twin (MEM_ZERO_ALL) the injection must stay exactly zero, so EMA is skipped there.
-            _alpha = float(getattr(self, "ema_alpha", 0.0) or 0.0)
-            if (_alpha > 0.0 and not ttt_update and _mz_all == 0
-                    and mem_ema_key is not None and ttt_cache is not None):
-                if mem_ema_prev is not None and mem_ema_prev.shape == mem_out.shape:
-                    mem_out = _alpha * mem_out + (1.0 - _alpha) * mem_ema_prev.to(device=mem_out.device, dtype=mem_out.dtype)
-                # first observation at this key: mem_out passes through unchanged (EMA seed)
-                # CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
-                # bf16 CPU<->GPU round-trip is bit-identical (twin selftest re-validated).
-                ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
-            # MEM_REJECT_STREAM (off by default): per-token vector rejection
-            # of the component of the injection parallel to the current residual stream x. The parallel
-            # part is exactly "inject more of what is already there" (self-similar -> damps motion); we
-            # keep only the orthogonal (novel/corrective) remainder. Rule: no renorm after subtracting
-            # (renorm would re-create the fixed-dose dissolution). Self-similar read -> ~0 remainder
-            # -> graceful abstain. Applied to the read injection about to be added.
-            if int(os.environ.get("MEM_REJECT_STREAM", "0")) != 0:
-                _xh = x.detach().float()
-                _xh = _xh / _xh.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                _m = mem_out.float()
-                mem_out = (_m - (_m * _xh).sum(-1, keepdim=True) * _xh).to(mem_out.dtype)
-            x = x + (mem_out.detach() if ttt_update else mem_out)
-            if ttt_update:
-                # attribute write on a TTTBlockCache object (not a dict key!):this mutation survives the call stack.
-                ttt_cache.state = new_state
-        # ===================================================================================
+        # parallel memory branch (no-op when this block has none)
+        x = self._memory_inject(
+            x, h, ttt_cache=ttt_cache, ttt_state=ttt_state, ttt_update=ttt_update,
+            mem_x_write=mem_x_write, mem_ema_key=mem_ema_key, mem_ema_prev=mem_ema_prev,
+            context=context, denoising_step=denoising_step,
+            switch_global_frame=switch_global_frame, current_start=current_start,
+            num_frames=num_frames, frame_seqlen=frame_seqlen)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
@@ -1427,11 +1410,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         cache_update_info = None
         cache_update_infos = []  # Collect cache update info for all blocks
-        # anti-flicker: key the per-block injection EMA buffers by the denoising timestep so
-        # consecutive updates at a matched buffer are consecutive sub-blocks (a clean temporal axis).
-        # Read the previous buffer outside the checkpoint and pass it in as an explicit input so the
-        # backward recompute is bit-reproducible (mirrors the ttt_state mechanism). Only pay the host
-        # sync when the low-pass is actually active.
+        # key the smoothing buffers by denoising step, so consecutive updates of one buffer are
+        # consecutive chunks rather than four refinements of the same instant. The host sync below
+        # is only paid when the smoothing is on.
         _mem_ema_key = None
         if getattr(self, "_mem_ema_on", False) and ttt_cache is not None:
             _mem_ema_key = int(round(float(t.detach().flatten()[0].item())))
@@ -1439,14 +1420,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             if _mem_ema_key is None or ttt_cache is None or ttt_cache[bi] is None:
                 return None
             return ttt_cache[bi].ema.get(_mem_ema_key)
-        # ---- eviction feed (default off, path unchanged) ------------------------------------
-        # On the write pass, pop the just-evicted chunk from each memory block's fifo here,
-        # outside the gradient-checkpointed block, and hand it to the block as an explicit
-        # kwarg (mem_x_write): checkpoint saves it as an input, so backward recompute reuses
-        # the same tensor (mirrors the ttt_state mechanism). Simple robust FIFO-delay, not
-        # token-exact KV eviction: a chunk is "evicted" window_chunks = ceil(local_attn_size /
-        # num_frames) chunks after it was written; the first sink_chunks chunks are pinned in
-        # the KV sink forever and are therefore never fed to the memory.
+        # ---- eviction feed (off by default) --------------------------------------------------
+        # Pop the just-evicted chunk here, outside the checkpointed block, and hand it to the
+        # block as an argument so backward recompute reuses the same tensor. A simple FIFO delay,
+        # not token-exact eviction: a chunk counts as evicted window_chunks after it was written,
+        # and the sink chunks, pinned in the cache forever, are never fed to the memory.
         _mem_x_write = {}
         if self.eviction_feed and ttt_update and ttt_cache is not None:
             _F = int(grid_sizes[0][0].item())

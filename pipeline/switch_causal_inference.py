@@ -73,8 +73,8 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         recache_start_frame = current_start_frame - num_recache_frames
 
         if frames_override is not None:
-            # ORACLE_SPLICE: recache content from elsewhere in the rollout (e.g. the original
-            # A tail) at the current positions (current_start unchanged below), i.e. a KV splice.
+            # recache frames taken from elsewhere in the video, at the current positions:
+            # this is how a past frame is fed back into the attention context.
             assert frames_override.shape[1] == num_recache_frames, \
                 f"frames_override has {frames_override.shape[1]} frames, recache needs {num_recache_frames}"
             frames_to_recache = frames_override
@@ -275,8 +275,9 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 if int(os.environ.get("MEM_EPISODIC", "0")) and getattr(self, "_ttt_snap_A", None):
                     self._restore_ttt(self._ttt_snap_A)
                     print(f"[MEM_EPISODIC] restored A-era memory state at frame {current_start_frame}")
-                # ORACLE_SPLICE (off by default): recache the KV window from the original A tail
-                # (the model's own generated past) instead of the B tail = self-oracle upper bound.
+                # ORACLE_SPLICE rebuilds the attention window from the REAL frames of the
+                # subject's first appearance instead of the current ones. It is deliberate
+                # cheating: it gives the ceiling that a perfect memory could reach.
                 _splice = None
                 # dump the original-A anchor latent for the twin arm (free,
                 # no RNG draw, off by default) before any splice touches `output`.
@@ -287,13 +288,12 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                     _a_end = self._first_switch_frame
                     assert _a_end is not None and _a_end - _n >= 0, \
                         f"oracle splice needs {_n} frames of original A before frame {_a_end}"
-                    # ORACLE_SPLICE_FRAMES (how few frames still suffice, 0 = full window):
-                    # only the last nf slots of the recached window carry original-A content, the
-                    # rest keeps the true recent (B) tail -> measures how much A-KV is needed.
+                    # how few real frames still suffice: only the last nf slots carry the past,
+                    # the rest keeps the true recent tail. 0 = the whole window.
                     _nf = int(os.environ.get("ORACLE_SPLICE_FRAMES", "0") or 0)
-                    # ORACLE_SPLICE_SLOT=k (does the position matter): the single A anchor replaces
-                    # the window slot k frames before the most recent one (k=0 == oracle1's last
-                    # slot; k~3-6 = readable mid-window, "a few moments ago"). -1/unset = off.
+                    # does the position matter: the single past frame replaces the window slot
+                    # k frames before the most recent one. k=0 is the most recent slot, k of 3 to
+                    # 6 reads as "a few moments ago". -1 or unset = off.
                     _slot_k = int(os.environ.get("ORACLE_SPLICE_SLOT", "-1") or -1)
                     if _slot_k >= 0:
                         _splice = output[:, current_start_frame - _n:current_start_frame].clone()
@@ -335,8 +335,9 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                     _a_deg = ((1.0 - _dose ** 2) ** 0.5) * _a_part + _dose * _eps
                     _splice = torch.cat([_splice[:, :-_na], _a_deg], dim=1)
                     print(f"[ORACLE_SPLICE_NOISE] degraded last {_na} splice frame(s), sigma={_dose}")
-                # MEM_DECODE: the anchor is decoded from the live memory instead of being the
-                # real past frame, then spliced at the most recent slot, the only one that works.
+                # the frame fed back is decoded from the live memory instead of being the real
+                # past frame. Same mechanism as above, but nothing is read from the true past:
+                # this is the arm that actually tests the memory.
                 _dec_ckpt = os.environ.get("MEM_DECODE", "").strip()
                 if _dec_ckpt:
                     assert _splice is None, "MEM_DECODE and ORACLE_SPLICE are mutually exclusive"
@@ -497,7 +498,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                         cond_prev=None):
         """Cache surgery at one schedule boundary.
 
-        is_revisit=False -> plain switch: no ORACLE/MEM_DECODE hook fires and, with FRAMEBANK
+        is_revisit=False -> plain switch: no recall hook fires and, with FRAMEBANK
         off, the call is byte-identical to the legacy first switch.
         is_revisit=True  -> the entering prompt has been seen before: the recall hooks fire.
         `a_end` = end latent frame (exclusive) of the segment where the entering subject first
@@ -600,7 +601,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
             if _gt and not is_revisit:
                 _fb_frame = None
             if _fb_frame is not None:
-                # same placement as oracle1 (ORACLE_SPLICE_FRAMES=1): the recalled frame takes
+                # same placement as the real-frame arm: the recalled frame takes
                 # the most-recent window slot, the rest of the window stays the true recent tail.
                 _splice = torch.cat(
                     [output[:, current_start_frame - _n:current_start_frame - 1],
