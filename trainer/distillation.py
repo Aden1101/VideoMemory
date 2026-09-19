@@ -1253,18 +1253,18 @@ class Trainer:
                             (generator_loss / self.gradient_accumulation_steps).backward()
                         finally:
                             self._restore_ttt_state(_ttt_snap)
-                    # grad probe (first few steps): confirm read (qkv/proj) + write (lrs/decay) memory grads exist
+                    # first few steps: confirm the read (qkv/proj) and write (lrs/decay) memory params get gradients
                     if self.step in (0, 5, 10, 15, 20, 30) and (not dist.is_initialized() or dist.get_rank() == 0):
                         try:
                             gn = lambda p: (float(p.grad.detach().float().norm()) if (p is not None and getattr(p, "grad", None) is not None) else -1.0)
                             mems = [mm for mm in self.model.generator.modules() if type(mm).__name__ == "VideoMemoryLayer"]
                             for i, m in enumerate(mems):
-                                print(f"grad probe step={self.step} mem{i} "
+                                print(f"mem-grad step={self.step} mem{i} "
                                       f"WRITE lrs={gn(m.lrs.weight):.3e} decay={gn(getattr(m,'decay_logit',None)):.3e} "
                                       f"READ qkv={gn(m.qkv.weight):.3e} proj={gn(m.proj.weight):.3e} "
                                       f"SEED w0={gn(m.w0):.3e}")
                         except Exception as _e:
-                            print(f"grad probe failed: {_e}")
+                            print(f"mem-grad check failed: {_e}")
                 else:
                     generator_loss = torch.tensor(0.0, device=self.device)
                 generator_log_dict = merge_dict_list(_logs) if _logs else {}

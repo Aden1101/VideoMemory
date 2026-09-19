@@ -74,7 +74,7 @@ class StreamingTrainingPipeline:
                 for _, m in model.named_modules():
                     if isinstance(m, VideoMemoryLayer):
                         m.detach_state = False
-            print("[train_write] ENABLED")
+            print("[train_write] enabled")
 
         # cache dropout: with prob cache_dropout_prob, a whole rollout runs
         # with a starved runtime sink (cache_dropout_sink frames, default 0) and the memory
@@ -351,10 +351,8 @@ class StreamingTrainingPipeline:
             if DEBUG and block_index == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Pipeline] Updating cache with context_noise={self.context_noise}")
             
-            # The last sub-block's write is not read within the chunk, so by default it runs under
-            # no_grad (its graph would never be backpropped and would leak one write-forward per step).
-            # keep_last_write_grad overrides this when the outgoing state must carry grad into the next
-            # chunk (cross-chunk bptt window).
+            # the last sub-block's write is not read inside the chunk, so its graph is built only
+            # when the outgoing state must carry grad into the next one (cross-chunk bptt window)
             _write_grad = requires_grad and (block_index < len(all_num_frames) - 1 or keep_last_write_grad)
             with self._write_context(_write_grad):
                 self.generator(

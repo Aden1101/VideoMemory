@@ -98,11 +98,9 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         num_blocks = chunk_frames // self.num_frame_per_block
         all_num_frames = [self.num_frame_per_block] * num_blocks
 
-        # global frame index of the switch (for frames_since_switch). switch_frame_index is
-        # relative to this chunk start; current_start_frame is the chunk's global offset.
+        # absolute frame of the switch; switch_frame_index is relative to this chunk. Persisted,
+        # because later chunks take the parent's no-switch path and would count from frame 0.
         switch_global_frame = current_start_frame + switch_frame_index
-        # persist it so later chunks (which take the parent no-switch path) keep resetting
-        # frames_since_switch to the switch instead of to the video start
         self._switch_global_frame = switch_global_frame
 
         # fast-weight state threaded like the KV cache.
@@ -256,10 +254,8 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 context_timestep.flatten(0, 1),
             ).unflatten(0, denoised_pred.shape[:2])
             
-            # The last sub-block's write is not read within the chunk, so by default it runs under
-            # no_grad (its graph would never be backpropped and would leak one write-forward per step).
-            # keep_last_write_grad overrides this when the outgoing state must carry grad into the next
-            # chunk (cross-chunk bptt window).
+            # the last sub-block's write is not read inside the chunk, so its graph is built only
+            # when the outgoing state must carry grad into the next one (cross-chunk bptt window)
             _write_grad = requires_grad and (block_index < len(all_num_frames) - 1 or keep_last_write_grad)
             with self._write_context(_write_grad):
                 self.generator(

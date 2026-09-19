@@ -224,11 +224,11 @@ def linear_delta_chunk_update(x, W, beta):
     is updated in place and returned.
 
     P0 (plan_entrainement_video_2026-08-07, bras M2): this is the deployment twin of the
-    offline oracle `lin_chunk_update` (reference/runs/probe1/build_states.py, rule='delta',
+    offline oracle `lin_chunk_update` (rule='delta',
     arm lin_delta_all, 15.33/19). The body is arithmetic-identical to that function's delta
     branch, same ops, same order, same dtypes, same kernel shapes (2-D (T, d) fp32 input) --
     so the state produced in generation is bitwise the state of the offline replay
-    (asserted by reference/runs/probe1/selftest_lin_native.py). Any edit here must keep that
+    (asserted by its selftest). Any edit here must keep that
     parity or re-run the equivalence selftest. Zero learned parameter, training-free."""
     assert x.dim() == 2 and x.dtype == torch.float32, f"tokens {tuple(x.shape)} {x.dtype}"
     assert W.dim() == 2 and W.dtype == torch.float32, f"state {tuple(W.shape)} {W.dtype}"
@@ -289,8 +289,7 @@ class VideoMemoryLayer(nn.Module):
         #           v = h, no qkv projection, no learned parameter, training-free;
         #   read  : o = W @ q for the existing read-path queries q (qkv projection + q_norm),
         #           plugged exactly where swiglu_apply reads today, so the whole downstream
-        #           (o_norm/rel_norm, gate, modulation, injection, env probes, hooks) is
-        #           unchanged.
+        #           (o_norm/rel_norm, gate, modulation, injection, hooks) is unchanged.
         # GPU footprint (nh=1, d=1536, B=1): W fp32 = 1536*1536*4 = 9.44 MB per block
         # (28.3 MB for the 3 deployed blocks; fp16 snapshot 4.72 MB/block, ~14.2 MB/age),
         # vs the SwiGLU state (w0+w1+w2 bf16, inter_multi=4) = 56.6 MB per block (169.9 MB
@@ -498,7 +497,7 @@ class VideoMemoryLayer(nn.Module):
             tensor the oracle sees (bf16 -> fp32 cast is exact, like the oracle's stored
             fp16 -> fp32);
           - TF32 is forced OFF around the update (saved/restored): the offline replay runs
-            under probe1 set_determinism (TF32 off), and the state must be the same function
+            under the same determinism settings (TF32 off), and the state must be the same function
             of the data whatever the ambient backend flags of the calling pipeline are;
           - the state is functional: W is cloned, the clone is updated in place (bit-copy +
             identical in-place ops = the oracle's persistent-W trajectory), so snapshots of
@@ -550,8 +549,8 @@ class VideoMemoryLayer(nn.Module):
             # ---- P0 linear-delta core (additive; the else-branch below is the historical
             # path, untouched). read, apply-first, plugged exactly where swiglu_apply reads:
             # o_i = W @ q_i for the existing read-path queries q (fp32 matmul with the fp32
-            # state, cast back to the compute dtype so all downstream, gate, modulation,
-            # injection, env probes, is unchanged). write: delta rule on the raw tokens of
+            # state, cast back to the compute dtype so everything downstream, gate, modulation
+            # and injection, is unchanged). write: delta rule on the raw tokens of
             # the same chunk the historical write receives (x_write of the eviction feed,
             # else the current chunk). k/v/lr* of the qkv projection are unused by the rule.
             assert allreduce_fn is None, "linear_delta: context-parallel write not supported"
@@ -598,7 +597,7 @@ class VideoMemoryLayer(nn.Module):
         Exactly the do_update branch of step() with x_write given, factored out so the
         write-replay trainer (memory 2.0) can re-run the write chain offline on collected h
         sequences and get bitwise the same states as the in-situ rollout
-        (selftest: reference/runs/frame_dec/selftest_replay.py). Parity contract:
+        (covered by a selftest). Parity contract:
           - `_qkv_lr(x_write)` is reused as is: the qkv projection stays one fused matmul
             (1536 -> 4608) with q computed and thrown away, exactly like step(), re-doing
             it as separate k/v matmuls would change the rounding;

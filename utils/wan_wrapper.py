@@ -41,7 +41,7 @@ class WanTextEncoder(torch.nn.Module):
         self._lazy = os.environ.get("AF_LAZY_TEXT_ENCODER", "") == "1"
         self.text_encoder = None
         self._resident_device = af_device
-        # DTYPE probe. Inference.py does `pipeline = pipeline.to(dtype=torch.bfloat16)`, which
+        # dtype marker. Inference.py does `pipeline = pipeline.to(dtype=torch.bfloat16)`, which
         # casts this encoder too. In lazy mode it does not exist yet at that moment and would
         # escape the cast; this buffer does undergo it, and tells us which precision the pipeline
         # wants to work in. Without it the cache would hand float32 to a bfloat16 model (Metal

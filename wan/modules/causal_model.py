@@ -780,7 +780,7 @@ class CausalWanAttentionBlock(nn.Module):
                 # CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
                 # bf16 CPU<->GPU round-trip is bit-identical (twin selftest re-validated).
                 ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
-            # R1 probe (env MEM_REJECT_STREAM, default off = byte-identical): per-token vector rejection
+            # MEM_REJECT_STREAM (off by default): per-token vector rejection
             # of the component of the injection parallel to the current residual stream x. The parallel
             # part is exactly "inject more of what is already there" (self-similar -> damps motion); we
             # keep only the orthogonal (novel/corrective) remainder. Rule: no renorm after subtracting
