@@ -6,7 +6,7 @@ import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
-from utils.video_io import write_video  # torchvision si dispo, sinon imageio
+from utils.video_io import write_video  # torchvision when available, else imageio
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
@@ -61,9 +61,7 @@ else:
         print("[inference] LOCAL_RANK is set but CUDA is absent: taking the single-device path.")
     local_rank = 0
     rank = 0
-    # 2026-09-09: was a hardcoded torch.device("cuda"). utils/device returns the same thing on
-    # an NVIDIA machine, and the right device elsewhere. The distributed branch above stays
-    # CUDA + NCCL: multi-GPU only exists there anyway.
+    # 2026-09-09: was a hardcoded torch.device("cuda").
     device = af_device
     set_seed(config.seed)
     config.distributed = False  # Mark as non-distributed
@@ -83,9 +81,9 @@ pipeline = CausalInferencePipeline(config, device=device)
 # Load generator checkpoint
 if config.generator_ckpt:
     state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-    # c3: use_ema loads the EMA shadow. In the MAG eval recipe the trained weights (incl. the
-    # shadow) live in lora_ckpt, while generator_ckpt is the plain base.pt (no shadow) -> fall
-    # back to "generator" here and apply the EMA overlay in the lora_ckpt block below.
+    # The EMA shadow lives in lora_ckpt together with the trained weights, while generator_ckpt
+    # is the plain base.pt and has none. Fall back to "generator" here and apply the overlay
+    # in the lora_ckpt block below.
     _use_ema_here = bool(getattr(config, "use_ema", False)) and ("generator_ema" in state_dict)
     if "generator" in state_dict or "generator_ema" in state_dict:
         raw_gen_state_dict = state_dict["generator_ema" if _use_ema_here else "generator"]
@@ -117,11 +115,56 @@ if config.generator_ckpt:
         assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
         assert not unexpected, f"Unexpected keys: {list(unexpected)[:5]}"
         if local_rank == 0 and len(missing) > 0:
-            print(f"[MAG] {len(missing)} memory keys kept at init (not in checkpoint)")
+            print(f"[memory] {len(missing)} keys kept at init (not in checkpoint)")
 
 # --------------------------- LoRA support (optional) ---------------------------
 from utils.lora_utils import configure_lora_for_model
 import peft
+
+def load_trained_memory(generator, checkpoint, verbose=False):
+    """Restore the trained memory weights, which are full-rank and so travel beside the LoRA state
+    dict. Fails loudly if the key is there but nothing matched: a memory left at its random init
+    still produces plausible video, so the run would not be the arm it claims to be."""
+    if not (isinstance(checkpoint, dict) and "generator_memory" in checkpoint):
+        return
+    state = checkpoint["generator_memory"]
+    result = generator.load_state_dict(state, strict=False)
+    assert not result.unexpected_keys, f"unexpected memory keys: {list(result.unexpected_keys)[:5]}"
+    missing = [k for k in result.missing_keys if "memory" in k]
+    assert not missing, f"memory would stay at init: {missing[:5]}"
+    if verbose:
+        print(f"[memory] {len(state)} trained keys loaded")
+
+
+def overlay_ema_shadow(generator, checkpoint, from_config, verbose=False):
+    """Replace the trainable weights with their smoothed EMA copy.
+
+    The shadow holds only what was trained, so it is overlaid on the already-loaded weights and the
+    frozen base keeps its base.pt values. A config asking for EMA may never fall back to the raw
+    weights, since the result would be reported as an EMA measurement; USE_EMA_WEIGHTS may.
+    """
+    if not (isinstance(checkpoint, dict) and "generator_ema" in checkpoint):
+        if from_config:
+            raise ValueError("use_ema is set but this checkpoint has no 'generator_ema' shadow; "
+                             "set use_ema:false to evaluate the raw weights instead")
+        if verbose:
+            print("[EMA] no shadow in the checkpoint, using the raw trained weights")
+        return
+
+    def strip(name):
+        for prefix in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "_orig_mod."):
+            name = name.replace(prefix, "")
+        return name
+
+    shadow = {strip(k): v for k, v in checkpoint["generator_ema"].items()}
+    result = generator.load_state_dict(shadow, strict=False)
+    # the frozen base is legitimately missing, but a shadow matching nothing would leave the raw
+    # weights in place and still be reported as an EMA evaluation
+    assert not result.unexpected_keys, f"[EMA] unexpected shadow keys: {list(result.unexpected_keys)[:5]}"
+    assert shadow, "[EMA] the shadow is empty"
+    if verbose:
+        print(f"[EMA] overlaid {len(shadow)} trainable keys")
+
 
 pipeline.is_lora_enabled = False
 if getattr(config, "adapter", None) and configure_lora_for_model is not None:
@@ -150,54 +193,13 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
         if local_rank == 0:
             print("LoRA weights loaded for generator")
 
-        # MAG memory (full-rank), restore the trained weights.
-        if isinstance(lora_checkpoint, dict) and "generator_memory" in lora_checkpoint:
-            mem_sd = lora_checkpoint["generator_memory"]
-            model_mem_keys = {k for k in pipeline.generator.state_dict() if "memory" in k}
-            result = pipeline.generator.load_state_dict(mem_sd, strict=False)
-            assert not result.unexpected_keys, f"Unexpected memory keys: {list(result.unexpected_keys)[:5]}"
-            still_missing_mem = [k for k in result.missing_keys if "memory" in k]
-            assert not still_missing_mem, f"Memory NOT loaded (would stay at init!): {still_missing_mem[:5]}"
-            if local_rank == 0:
-                print(f"[MAG] {len(mem_sd)} trained memory keys loaded "
-                      f"(model has {len(model_mem_keys)} memory keys)")
+        load_trained_memory(pipeline.generator, lora_checkpoint, verbose=(local_rank == 0))
 
-        # c3 EMA overlay: with use_ema (config or env USE_EMA_WEIGHTS), replace the trainable subset
-        # (LoRA adapters + memory) with the smoothed EMA shadow saved in the trained checkpoint. The
-        # shadow is trainable-only, so it is overlaid on top of the already-loaded raw weights after
-        # LoRA is applied: frozen base keeps its base.pt values, trainable params get the EMA values.
-        _use_ema_cfg = bool(getattr(config, "use_ema", False))
-        _use_ema_env = os.environ.get("USE_EMA_WEIGHTS", "0") not in ("0", "", "false", "False")
-        _use_ema = _use_ema_cfg or _use_ema_env
-        if _use_ema and isinstance(lora_checkpoint, dict) and "generator_ema" in lora_checkpoint:
-            def _clean_ema_key(name: str) -> str:
-                for pfx in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "_orig_mod."):
-                    name = name.replace(pfx, "")
-                return name
-            shadow = {_clean_ema_key(k): v for k, v in lora_checkpoint["generator_ema"].items()}
-            ema_res = pipeline.generator.load_state_dict(shadow, strict=False)
-            # trainable-only shadow -> the frozen base is legitimately "missing"; nothing may be
-            # unexpected, and a nonzero number of (LoRA/memory) keys must have matched, else the
-            # EMA silently did nothing (naming mismatch) and we'd wrongly report an EMA eval.
-            n_matched = len(shadow) - len(ema_res.unexpected_keys)
-            assert not ema_res.unexpected_keys, \
-                f"[EMA] unexpected shadow keys (naming mismatch): {list(ema_res.unexpected_keys)[:5]}"
-            assert n_matched > 0, \
-                "[EMA] use_ema requested but ZERO shadow keys matched the model (naming mismatch); refusing silent raw-weight eval"
-            if local_rank == 0:
-                print(f"[EMA] overlaid {n_matched}/{len(shadow)} trainable EMA-shadow keys "
-                      f"(smoothed LoRA+memory); frozen base kept from base.pt")
-        elif _use_ema:
-            # metric-integrity: a CONFIG use_ema:true must never silently eval raw weights. Only the
-            # env-var convenience path (USE_EMA_WEIGHTS) is allowed to soft-fall-back to raw.
-            _m = "[EMA] use_ema requested but no 'generator_ema' shadow in the checkpoint"
-            if _use_ema_cfg:
-                raise ValueError(
-                    _m + ", refusing to silently evaluate RAW weights (metric-integrity trap). "
-                    "Set use_ema:false to eval raw, or point lora_ckpt at a checkpoint that has an "
-                    "EMA shadow (saved from step >= ema_start_step).")
-            elif local_rank == 0:
-                print(_m + " -> (env USE_EMA_WEIGHTS) falling back to RAW trained weights")
+        use_ema_cfg = bool(getattr(config, "use_ema", False))
+        use_ema_env = os.environ.get("USE_EMA_WEIGHTS", "0") not in ("0", "", "false", "False")
+        if use_ema_cfg or use_ema_env:
+            overlay_ema_shadow(pipeline.generator, lora_checkpoint,
+                               from_config=use_ema_cfg, verbose=(local_rank == 0))
     else:
         if local_rank == 0:
             print("No LoRA checkpoint specified; using base weights with LoRA adapters initialized")

@@ -23,7 +23,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import torch.nn.functional as F
-from utils.video_io import write_video  # torchvision si dispo, sinon imageio
+from utils.video_io import write_video  # torchvision when available, else imageio
 from einops import rearrange
 
 

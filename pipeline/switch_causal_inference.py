@@ -139,7 +139,7 @@ def _memwriter_load(ckpt_path):
 
 def _memwriter_restore(cm):
     """Put the stock (checkpoint) write parameters back: an overlay must never leak into the
-    next arm of the same process (run_reid_probe builds one pipeline for all MAG arms)."""
+    next arm of the same process (run_reid_probe builds one pipeline for every arm)."""
     backup = getattr(cm, "_memwriter_backup", None)
     if not backup:
         return
@@ -210,7 +210,7 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
 
     # Internal helpers
     def _snapshot_ttt(self):
-        """MEM_EPISODIC probe: freeze the full memory state (fast weights + eviction fifo + e4 ema)
+        """MEM_EPISODIC probe: freeze the full memory state (fast weights + eviction fifo + injection ema)
         as it stands right now. Entries are replaced, never mutated in place, so shallow copies of
         the containers suffice (same invariant as the trainer/twin snapshots)."""
         return [

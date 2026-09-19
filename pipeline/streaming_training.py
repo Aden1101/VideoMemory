@@ -76,16 +76,16 @@ class StreamingTrainingPipeline:
                         m.detach_state = False
             print("[train_write] ENABLED")
 
-        # c2 cache-dropout co-training: with prob cache_dropout_prob, a whole rollout runs
+        # cache dropout: with prob cache_dropout_prob, a whole rollout runs
         # with a starved runtime sink (cache_dropout_sink frames, default 0) and the memory
         # ON, so the memory is the only carrier of the early-video anchor. 0.0 = off
         # (default, byte-identical: the sink attribute is never touched).
         self.cache_dropout_prob = float(kwargs.get("cache_dropout_prob", 0.0) or 0.0)
         self.cache_dropout_sink = int(kwargs.get("cache_dropout_sink", 0) or 0)
         self._cache_dropout_active = False
-        # c3: linear anneal of the dropout prob from cache_dropout_prob (start) to
+        # linear anneal of the dropout prob from cache_dropout_prob (start) to
         # cache_dropout_prob_end over cache_dropout_anneal_steps. When end is None or the anneal
-        # window is <= 0, the prob is constant at the start value = byte-identical to c2.
+        # window is <= 0, the prob stays at the start value, which is the un-annealed behaviour.
         _cd_end = kwargs.get("cache_dropout_prob_end", None)
         self.cache_dropout_prob_end = (float(_cd_end) if _cd_end is not None
                                        else self.cache_dropout_prob)
@@ -99,12 +99,12 @@ class StreamingTrainingPipeline:
             print(_msg)
 
     def set_train_step(self, step):
-        """c3: the trainer pushes its global step so _maybe_cache_dropout can anneal the prob."""
+        """The trainer pushes its global step so _maybe_cache_dropout can anneal the prob."""
         self._train_step = int(step)
 
     def _effective_cache_dropout_prob(self):
-        """c3: linearly interpolated dropout prob at the current train step. Constant (== start)
-        when the anneal window is <= 0 or end == start => byte-identical to c2."""
+        """Linearly interpolated dropout prob at the current train step. Constant (== start)
+        when the anneal window is <= 0 or end == start."""
         p0, p1, Ta = self.cache_dropout_prob, self.cache_dropout_prob_end, self.cache_dropout_anneal_steps
         if Ta <= 0 or p1 == p0:
             return p0
@@ -112,7 +112,7 @@ class StreamingTrainingPipeline:
         return p0 + (p1 - p0) * frac
 
     def _set_runtime_sink(self, sink_size=None):
-        """c2: set the runtime attention sink on every self-attn module (None = config value)."""
+        """Set the runtime attention sink on every self-attn module (None = config value)."""
         model = self.generator.model
         setter = getattr(model, "set_runtime_sink_size", None)
         if callable(setter):
@@ -123,13 +123,13 @@ class StreamingTrainingPipeline:
                 m._sink_runtime = int(m.sink_size if sink_size is None else sink_size)
 
     def _maybe_cache_dropout(self):
-        """c2: roll the per-rollout cache-dropout coin (rank-synced) and set the runtime sink.
+        """Roll the per-rollout cache-dropout coin (rank-synced) and set the runtime sink.
         The override stays in place for the whole rollout (all chunks and their backwards:
         gradient-checkpoint recompute must see the same sink the forward saw); the next
         rollout re-decides, restoring the full sink on a no-drop draw."""
         if self.cache_dropout_prob <= 0.0:
             return  # default: never touches the sink -> byte-identical
-        _p = self._effective_cache_dropout_prob()   # c3: annealed (== cache_dropout_prob when no anneal)
+        _p = self._effective_cache_dropout_prob()   # annealed (== cache_dropout_prob when no anneal)
         if dist.is_initialized():
             flag = torch.zeros(1, device="cuda")
             if dist.get_rank() == 0:
@@ -498,7 +498,7 @@ class StreamingTrainingPipeline:
                 blk["v"].zero_()
                 blk["is_init"] = False
 
-        # c2 cache-dropout: decide for the upcoming rollout (no-op when prob == 0.0)
+        # cache dropout: decide for the upcoming rollout (no-op when prob == 0.0)
         self._maybe_cache_dropout()
 
     def _set_all_modules_max_attention_size(self, local_attn_size_value: int):

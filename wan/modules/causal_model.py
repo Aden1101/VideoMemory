@@ -83,7 +83,7 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
-        # c2 cache-dropout: all sink reads in forward() go through this runtime-overridable
+        # cache dropout: all sink reads in forward() go through this runtime-overridable
         # attribute (CausalWanModel.set_runtime_sink_size). Defaults to the config sink_size
         # => byte-identical unless a dropout rollout overrides it.
         self._sink_runtime = int(sink_size)
@@ -523,7 +523,7 @@ class CausalWanSelfAttention(nn.Module):
                 k_win = temp_k[:, window_start:local_end_index]
                 v_win = temp_v[:, window_start:local_end_index]
                 if rope_enhance:
-                    # c2 cache-dropout: sink_tokens == 0 never ran with rope_enhance before
+                    # cache dropout: sink_tokens == 0 never ran with rope_enhance before
                     # (config sink was always > 0; this path crashed on an unbound
                     # roped_query). Mirror the sink>0 windowed rope with a zero-length sink:
                     # temp_k holds UNroped keys under rope_enhance, so rope the window here.
@@ -593,9 +593,9 @@ class CausalWanAttentionBlock(nn.Module):
         super().__init__()
         self.dim = dim
         self.mem_stream_scale = mem_stream_scale
-        # e4 anti-flicker: causal temporal EMA on the injection (0.0 = OFF, byte-identical baseline).
+        # anti-flicker: causal temporal EMA on the injection (0.0 = off, unchanged baseline).
         self.ema_alpha = float(ema_alpha or 0.0)
-        # c2 eviction-feed: memory writes the evicted chunk instead of the current one
+        # eviction feed: memory writes the evicted chunk instead of the current one
         # (False = byte-identical baseline).
         self.eviction_feed = bool(eviction_feed)
         self.ffn_dim = ffn_dim
@@ -722,7 +722,7 @@ class CausalWanAttentionBlock(nn.Module):
                                           gf - switch_global_frame, gf).float()  # resets to 0 at switch
                     mem_fss = fss[None, :].expand(B, num_frames).repeat_interleave(frame_seqlen, dim=1)
             if self.eviction_feed and ttt_update:
-                # c2 eviction-feed: the memory writes the chunk that just fell out of the
+                # eviction feed: the memory writes the chunk that just fell out of the
                 # attention window (mem_x_write, popped at model level so it is an explicit
                 # checkpoint input like ttt_state), not the current chunk whose k/v the KV
                 # cache still holds. The read query stays the current chunk's h. Until
@@ -764,7 +764,7 @@ class CausalWanAttentionBlock(nn.Module):
                     (mem_out.detach().float().pow(2).mean(-1, keepdim=True).sqrt() * _ss).mean()
                     / _srms.mean().clamp_min(1e-8))
                 mem_out = mem_out * (_ss * _srms).to(mem_out.dtype)
-            # e4 anti-flicker: causal temporal EMA on the read injection (config ema_alpha; 0=OFF,
+            # anti-flicker: causal temporal EMA on the read injection (config ema_alpha; 0=off,
             # byte-identical). mem_ema_prev is read outside the gradient-checkpoint region and passed
             # in as an explicit input (like ttt_state) so backward recompute reuses the same historical
             # buffer value -> the injection is bit-reproducible under checkpointing. The buffer is
@@ -777,14 +777,14 @@ class CausalWanAttentionBlock(nn.Module):
                 if mem_ema_prev is not None and mem_ema_prev.shape == mem_out.shape:
                     mem_out = _alpha * mem_out + (1.0 - _alpha) * mem_ema_prev.to(device=mem_out.device, dtype=mem_out.dtype)
                 # first observation at this key: mem_out passes through unchanged (EMA seed)
-                # e4: CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
+                # CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
                 # bf16 CPU<->GPU round-trip is bit-identical (twin selftest re-validated).
                 ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
             # R1 probe (env MEM_REJECT_STREAM, default off = byte-identical): per-token vector rejection
             # of the component of the injection parallel to the current residual stream x. The parallel
             # part is exactly "inject more of what is already there" (self-similar -> damps motion); we
             # keep only the orthogonal (novel/corrective) remainder. Rule: no renorm after subtracting
-            # (renorm would re-create the e2 fixed-dose dissolution). Self-similar read -> ~0 remainder
+            # (renorm would re-create the fixed-dose dissolution). Self-similar read -> ~0 remainder
             # -> graceful abstain. Applied to the read injection about to be added.
             if int(os.environ.get("MEM_REJECT_STREAM", "0")) != 0:
                 _xh = x.detach().float()
@@ -984,10 +984,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                                     mem_linear_beta=mem_linear_beta)
             for i in range(num_layers)
         ])
-        # e4 anti-flicker: gate the (host-syncing) EMA-key computation in _forward_inference on
+        # anti-flicker: gate the (host-syncing) EMA-key computation in _forward_inference on
         # whether the injection low-pass is actually active, so the default path stays cost-free.
         self._mem_ema_on = float(ema_alpha or 0.0) > 0.0
-        # c2 eviction-feed (False = byte-identical): the model-level side pops the evicted
+        # eviction feed (False leaves the path unchanged): the model-level side pops the evicted
         # chunk from the fifo outside the checkpointed block. Requires local attention
         # (something must actually evict); enforced lazily in _forward_inference.
         self.eviction_feed = bool(eviction_feed)
@@ -1028,7 +1028,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = value
 
     def set_runtime_sink_size(self, sink_size=None):
-        """c2 cache-dropout: override the attention sink at runtime on every self-attn
+        """Cache dropout: override the attention sink at runtime on every self-attn
         module. None restores the config sink_size (byte-identical default). Walks
         self.modules() so FSDP-wrapped children are reached too."""
         for m in self.modules():
@@ -1427,7 +1427,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         cache_update_info = None
         cache_update_infos = []  # Collect cache update info for all blocks
-        # e4 anti-flicker: key the per-block injection EMA buffers by the denoising timestep so
+        # anti-flicker: key the per-block injection EMA buffers by the denoising timestep so
         # consecutive updates at a matched buffer are consecutive sub-blocks (a clean temporal axis).
         # Read the previous buffer outside the checkpoint and pass it in as an explicit input so the
         # backward recompute is bit-reproducible (mirrors the ttt_state mechanism). Only pay the host
@@ -1439,7 +1439,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             if _mem_ema_key is None or ttt_cache is None or ttt_cache[bi] is None:
                 return None
             return ttt_cache[bi].ema.get(_mem_ema_key)
-        # ---- c2 eviction-feed (default off = byte-identical) --------------------------------
+        # ---- eviction feed (default off, path unchanged) ------------------------------------
         # On the write pass, pop the just-evicted chunk from each memory block's fifo here,
         # outside the gradient-checkpointed block, and hand it to the block as an explicit
         # kwarg (mem_x_write): checkpoint saves it as an input, so backward recompute reuses

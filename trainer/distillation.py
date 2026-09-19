@@ -131,7 +131,7 @@ class Trainer:
                 if "generator" in base_checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {base_checkpoint_path}")
-                    # strict=False: the base checkpoint predates the MAG memory branch; only acceptable missing keys are memory params
+                    # strict=False: the base checkpoint predates the memory branch; only acceptable missing keys are memory params
                     result = self.model.generator.load_state_dict(base_checkpoint["generator"], strict=False)
                     non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
                     assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
@@ -269,7 +269,7 @@ class Trainer:
                     still_missing_mem = [k for k in result.missing_keys if "memory" in k]
                     assert not still_missing_mem, f"Memory NOT loaded (would stay at init!): {still_missing_mem[:5]}"
 
-                # c3: stash the EMA shadow (crash-resume must keep the accumulated smoothing, not
+                # stash the EMA shadow (crash-resume must keep the accumulated smoothing, not
                 # re-snapshot the raw resumed weights). Applied after the EMA is (re)created below.
                 if "generator_ema" in lora_checkpoint:
                     self._resumed_ema_shadow = lora_checkpoint["generator_ema"]
@@ -390,15 +390,15 @@ class Trainer:
         ema_weight = config.ema_weight
         self.generator_ema = None
         if (ema_weight is not None) and (ema_weight > 0.0):
-            # c3: EMA now runs in LoRA mode too, as a trainable-only shadow (EMA_FSDP skips
+            # EMA runs in LoRA mode too, as a trainable-only shadow (EMA_FSDP skips
             # non-requires_grad params). It damps the late-training slow-mem-param ramp that
-            # drives the c2 flicker. It does not alter the training trajectory (a read-only CPU
+            # drives the flicker. It does not alter the training trajectory (a read-only CPU
             # shadow updated after optimizer.step); eval must set use_ema:true to load it.
             if self.is_main_process:
                 _mode = "trainable-only (LoRA)" if self.is_lora_enabled else "full"
                 print(f"Setting up {_mode} EMA with weight {ema_weight}")
             self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
-            # c3: restore a stashed shadow from a resume checkpoint (keeps accumulated smoothing
+            # restore a stashed shadow from a resume checkpoint (keeps accumulated smoothing
             # instead of the raw resumed weights EMA_FSDP just snapshotted).
             _stashed = getattr(self, "_resumed_ema_shadow", None)
             if _stashed is not None:
@@ -425,9 +425,9 @@ class Trainer:
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
-        # c3: handles for (C) explicit mem-grad clip and (B) cosine lr schedule.
+        # handles for (C) explicit mem-grad clip and (B) cosine lr schedule.
         # mem params are FSDP-ignored, so generator.clip_grad_norm_() (an FSDP method) skips them
-        # -> they were unclipped in c1/c2. Default max_grad_norm_mem is effectively-off (1e9).
+        # -> they were unclipped before this. Default max_grad_norm_mem is effectively-off (1e9).
         self.mem_params = mem_params
         self.max_grad_norm_mem = float(getattr(config, "max_grad_norm_mem", 1e9))
         # per-group base lrs [LoRA, (mem)]; the cosine multiplier is applied to these each step.
@@ -546,7 +546,7 @@ class Trainer:
                 if "generator" in checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {checkpoint_path}")
-                    # tolerate checkpoints that predate the MAG memory branch
+                    # tolerate checkpoints that predate the memory branch
                     result = self.model.generator.load_state_dict(checkpoint["generator"], strict=False)
                     non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
                     assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
@@ -817,7 +817,7 @@ class Trainer:
             }
             if gen_memory_sd:
                 state_dict["generator_memory"] = gen_memory_sd
-            # c3: persist the trainable-only EMA shadow so eval (use_ema) and crash-resume can
+            # persist the trainable-only EMA shadow so eval (use_ema) and crash-resume can
             # recover it. Without this the LoRA-EMA mechanism leaves nothing on disk.
             if self.generator_ema is not None:
                 state_dict["generator_ema"] = self.generator_ema.state_dict()
@@ -1131,7 +1131,7 @@ class Trainer:
             gt_pairs=gt_pairs,
             mismatch_pairs=mismatch_pairs
         )
-        # e3: the model needs the prompt text to key the per-prompt stock-AF motion-target curve
+        # the model needs the prompt text to key the per-prompt stock motion-target curve
         self.streaming_model.state["current_prompt"] = text_prompts[0] if text_prompts else None
 
         self.streaming_active = True
@@ -1179,7 +1179,7 @@ class Trainer:
             # only at the window start, sum the per-chunk losses, one backward over the window (trains
             # the write across chunk boundaries; graph alive for one backward, freed after = no leak).
             K_bptt = int(getattr(self.config, "bptt_window", 1))
-            # e3: per-step random horizon K ~ U{bptt_window_min .. bptt_window} so the single grad
+            # per-step random horizon K ~ U{bptt_window_min .. bptt_window} so the single grad
             # chunk (W=1) supervises many horizons up to the freeze horizon, at proven W=1 VRAM.
             # Rank-synced: FSDP collectives require every rank to run the same number of forwards.
             K_min = int(getattr(self.config, "bptt_window_min", K_bptt))
@@ -1221,7 +1221,7 @@ class Trainer:
                         break
                     _used += 1
                     rg = (_k >= K_bptt - W) or (seed_step and _k == 0)   # +chunk 0 on seed steps
-                    # e3: build the mem-OFF counterfactual twin only for the last (grad-tail) chunk
+                    # build the mem-OFF counterfactual twin only for the last (grad-tail) chunk
                     _mk_twin = (rg and _k == K_bptt - 1 and _e3_on)
                     _gc, _ci = self.streaming_model.generate_next_chunk(
                         requires_grad=rg, detach_state=(_k == K_bptt - W),
@@ -1232,7 +1232,7 @@ class Trainer:
                         _logs.append(_ld)
                         if seed_step:   # per-chunk backward; sever the KV-cache grad link between chunks
                             _snap = self._snapshot_ttt_state()
-                            torch.cuda.empty_cache()   # e4: reclaim the ~800MB reserved-but-unallocated cache
+                            torch.cuda.empty_cache()   # reclaim the ~800MB reserved-but-unallocated cache
                                                        # at the post-forward low-water mark, before chunk-0's
                                                        # backward peak (seed step only ~1/20). Fits the 4-GPU budget.
                             try:
@@ -1429,7 +1429,7 @@ class Trainer:
                     print(f"[Debug] Step {self.step}: switch_mode={getattr(self.config,'switch_mode','fixed')}")
 
                 if self.streaming_training:
-                    # c3 (D): push the global step to the rollout pipeline so it can anneal
+                    # (D) push the global step to the rollout pipeline so it can anneal
                     # cache_dropout_prob (no-op when the anneal window is off). The pipeline is the
                     # StreamingSwitchTrainingPipeline reached via streaming_model.inference_pipeline;
                     # its clear_kv_cache() -> _maybe_cache_dropout() reads this step.
@@ -1482,9 +1482,9 @@ class Trainer:
                         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                             print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={generator_grad_norm.item()}")
 
-                        self._clip_mem_grads()                 # c3 (C): clip FSDP-ignored mem grads
+                        self._clip_mem_grads()                 # (C) clip FSDP-ignored mem grads
                         self.generator_optimizer.step()
-                        self._lr_sched_step()                  # c3 (B): cosine lr decay (no-op pre-decay_start)
+                        self._lr_sched_step()                  # (B) cosine lr decay (no-op pre-decay_start)
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                         self._log_memory_stats()
@@ -1547,9 +1547,9 @@ class Trainer:
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
                         generator_log_dict["generator_grad_norm"] = generator_grad_norm
 
-                        self._clip_mem_grads()                 # c3 (C): clip FSDP-ignored mem grads
+                        self._clip_mem_grads()                 # (C) clip FSDP-ignored mem grads
                         self.generator_optimizer.step()
-                        self._lr_sched_step()                  # c3 (B): cosine lr decay (no-op pre-decay_start)
+                        self._lr_sched_step()                  # (B) cosine lr decay (no-op pre-decay_start)
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -1564,7 +1564,7 @@ class Trainer:
                     # Increment the step since we finished gradient update
                     self.step += 1
 
-                # Create EMA params (if not already created). c3: also in LoRA mode (trainable-only).
+                # Create EMA params (if not already created). Also in LoRA mode (trainable-only).
                 if (self.step >= self.config.ema_start_step) and \
                         (self.generator_ema is None) and (self.config.ema_weight > 0):
                     self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
@@ -1599,7 +1599,7 @@ class Trainer:
                                     self.writer.add_scalar(f"generator/{_k}", generator_log_dict[_k].mean().item(), self.step)
                                 except Exception:
                                     pass
-                        # e3 counterfactual-objective terms (dose/dnh/motion-match), logged every
+                        # counterfactual-objective terms (dose/dnh/motion-match), logged every
                         # generator step so act_floor is calibratable and mm_ext/motion is observable
                         for _k, _v in generator_log_dict.items():
                             if _k.startswith("e3_"):
@@ -1869,7 +1869,7 @@ class Trainer:
     def _snapshot_ttt_state(self):
         # the fast-weight state is mutated inside the gradient-checkpointed block, so backward-time
         # recompute re-runs the write and leaves the cache holding an earlier chunk's state. Snapshot
-        # the post-generation state before backward, restore it after. The e4 injection EMA buffer is
+        # the post-generation state before backward, restore it after. The injection EMA buffer is
         # mutated the same way (recompute rewrites ttt_cache.ema[key]), so snapshot/restore it too --
         # else the per-chunk (seed-step) backward corrupts the EMA going into the next chunk's forward.
         pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
@@ -1881,7 +1881,7 @@ class Trainer:
                 "state": (None if getattr(c, "state", None) is None
                           else tuple(t.detach().to("cpu") for t in c.state)),
                 "ema": {k: v.detach().to("cpu") for k, v in (getattr(c, "ema", {}) or {}).items()},
-                # c2 eviction-feed fifo: backward recompute re-appends inside the checkpointed
+                # eviction-feed fifo: backward recompute re-appends inside the checkpointed
                 # block, so restore the pre-backward list. Entries are (idx, tensor) tuples
                 # replaced per write (tensors never mutated in place) -> a shallow list copy
                 # of refs suffices, no device round-trip needed.
@@ -1900,7 +1900,7 @@ class Trainer:
         for c, s in zip(cache, snap):
             c.state = None if s["state"] is None else tuple(t.to(self.device) for t in s["state"])
             c.ema = {k: v.to(self.device) for k, v in s["ema"].items()}
-            c.fifo = list(s.get("fifo", []))  # c2: undo recompute-time appends
+            c.fifo = list(s.get("fifo", []))  # undo recompute-time appends
 
     def _gather_memory_state_dict(self, fsdp_model):
         "gather the full state dict on rank 0 and keep only the memory params (full-rank, not lora)"
@@ -1951,7 +1951,7 @@ class Trainer:
             print("[Warning] No fixed validation batch available for visualization.")
             return
 
-        # c2 cache-dropout: the vis pipeline shares the generator modules, so force the full
+        # cache dropout: the vis pipeline shares the generator modules, so force the full
         # config sink for visualization and re-assert the training rollout's runtime sink
         # afterwards (a dropout rollout may be mid-sequence). No-op when the flag is off.
         _cd_pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
@@ -2013,6 +2013,6 @@ class Trainer:
         import gc
         gc.collect()
 
-        # c2 cache-dropout: put the training rollout's runtime sink back (see above)
+        # cache dropout: put the training rollout's runtime sink back (see above)
         if _cd_on and getattr(_cd_pipe, "_cache_dropout_active", False):
             _cd_pipe._set_runtime_sink(_cd_pipe.cache_dropout_sink)

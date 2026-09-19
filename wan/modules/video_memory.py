@@ -55,11 +55,11 @@ class TTTBlockCache:
 
     def __init__(self):
         self.state = None
-        # e4 anti-flicker: causal temporal-EMA buffers for the injection low-pass, keyed by
+        # anti-flicker: causal temporal-EMA buffers for the injection low-pass, keyed by
         # denoising-step (timestep value). Entries are replaced (never mutated in place) so a
         # shallow dict() copy suffices for the twin snapshot, exactly like the state tuples.
         self.ema = {}
-        # c2 eviction-feed: FIFO of (chunk_idx, detached h) for the last window_chunks write
+        # eviction feed: FIFO of (chunk_idx, detached h) for the last window_chunks write
         # chunks; the popped (= just-evicted) entry becomes the memory's x_write. Entries are
         # appended/popped (tuples never mutated in place), so a shallow list() copy suffices
         # for the twin/BPTT snapshots. Empty and untouched unless eviction_feed is on.
@@ -464,7 +464,7 @@ class VideoMemoryLayer(nn.Module):
         self.dbg_dc_frac = _o.mean(dim=1, keepdim=True).pow(2).mean() / _o.pow(2).mean().clamp_min(1e-12)
         _tok = _o.pow(2).mean(dim=-1).sqrt()                          # (b, l) per-token injection RMS
         self.dbg_amp_disp = _tok.std() / _tok.mean().clamp_min(1e-12) # 0 = flat = amplitude still decoupled
-        # e4: split the joint dispersion into the wanted spatial axis (relevance coupling across
+        # split the joint dispersion into the wanted spatial axis (relevance coupling across
         # sites) vs the unwanted temporal axis (per-site frame-to-frame std = the flicker). Needs the
         # frame count to reshape l=(F*S). Health target: temporal small while spatial stays > 0.
         if num_frames is not None and int(num_frames) > 0 and _tok.shape[1] % int(num_frames) == 0:
@@ -538,11 +538,11 @@ class VideoMemoryLayer(nn.Module):
         """x:(B,L,dim) for the current chunk. Returns (mem_out:(B,L,dim), new_state).
         prompt_emb/frames_since_switch/denoising_step feed the optional gate_extra inputs.
         num_frames (latent frames in this call) only feeds the spatial/temporal dispersion split.
-        x_write (B,Lw,dim): EVICTION-FEED (c2). When given, the READ query is still taken from the
+        x_write (B,Lw,dim): the eviction feed. When given, the read query is still taken from the
         current chunk `x` (what we are generating), but the WRITE stores the k->v association of
         `x_write` = the EVICTED tokens (what fell out of the KV window), so the memory holds the
         cache-complement (VideoSSM/AHN-style) instead of the redundant current chunk. x_write=None
-        (default) => write the current chunk = byte-identical to the pre-c2 behavior."""
+        (default) => write the current chunk, which is the behaviour before the eviction feed."""
         q, k, v, lr0, lr1, lr2, B = self._qkv_lr(x)
         if state is None:
             state = self.init_state(B, x.device, q.dtype)

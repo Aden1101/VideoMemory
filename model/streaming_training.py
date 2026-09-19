@@ -89,7 +89,7 @@ class StreamingTrainingModel:
         # Differentiable temporal-variance floor (anti-freeze): hinge on adjacent-latent motion.
         self.tv_loss_weight = getattr(config, "tv_loss_weight", 0.0)
         self.tv_motion_floor = getattr(config, "tv_motion_floor", 0.0)   # latent-diff floor; 0 => inactive
-        # e3 counterfactual-advantage objective (all defaults 0/off => byte-identical baseline).
+        # counterfactual-advantage objective (all defaults 0/off leave the baseline unchanged).
         # Rewards the memory only for beating its own motion-valid mem-OFF twin on identity:
         #   L = -w_adv * g * clamp(cos_ON - cos_CF, -neg, +pos) + w_rel*(log m_ON - log m_CF)^2
         #       + w_ext * relu(log(frac*m_stock) - log m_ON)^2
@@ -108,7 +108,7 @@ class StreamingTrainingModel:
         # relu => zero gradient once satisfied: a floor, never a maximizer.
         self.act_weight = getattr(config, "act_weight", 0.0)
         self.act_floor = getattr(config, "act_floor", 0.05)              # relative AC-dose target (calibrate)
-        # e4 anti-flicker (all defaults reproduce e3 exactly):
+        # anti-flicker (all defaults reproduce the previous objective exactly):
         #  - motion_lag2: use the flicker-blind lag-2 motion statistic in mm_rel/mm_ext + the dose,
         #    so frame-rate shimmer no longer counterfeits motion credit (removes the flicker payer).
         #  - dose_tmean_remove: also subtract the per-site temporal mean in the AC-dose, so a static
@@ -129,7 +129,7 @@ class StreamingTrainingModel:
             with open(_mt_path) as _f:
                 self._motion_targets = _json.load(_f)
             if (not dist.is_initialized() or dist.get_rank() == 0):
-                print(f"[StreamingTrain-Model] e3 objective ON: w_adv={self.adv_loss_weight} "
+                print(f"[StreamingTrain-Model] twin objective on: w_adv={self.adv_loss_weight} "
                       f"w_dnh={self.dnh_weight} (deadband {self.dnh_deadband}) "
                       f"w_act={self.act_weight} (floor {self.act_floor}) "
                       f"w_rel={self.mm_rel_weight} w_ext={self.mm_ext_weight} floor_frac={self.adv_floor_frac} "
@@ -555,7 +555,7 @@ class StreamingTrainingModel:
 
         return can_generate
 
-    # ---- counterfactual-twin machinery (e3): snapshot/restore everything one chunk mutates ----
+    # ---- counterfactual-twin machinery: snapshot/restore everything one chunk mutates ----
     def _twin_snapshot(self):
         """Clone every piece of state a chunk generation mutates (KV / cross-attn / flow / prompt
         caches, fast-weight state, RNG streams, switch flag) so a mem-OFF twin of the same chunk can
@@ -586,11 +586,11 @@ class StreamingTrainingModel:
         if getattr(p, "ttt_cache", None):
             # state tuples are replaced per write (never mutated in place) -> keeping refs suffices
             ttt = [None if getattr(c, "state", None) is None else tuple(c.state) for c in p.ttt_cache]
-            # e4: the EMA buffers are new mutable state a chunk mutates -> snapshot them too, else the
+            # the EMA buffers are mutable state a chunk mutates -> snapshot them too, else the
             # mem-OFF twin's buffer writes leak into the real rollout (breaks the counterfactual). Dict
             # entries are replaced per update (never mutated in place), so a shallow dict() copy suffices.
             ttt_ema = [dict(getattr(c, "ema", {}) or {}) for c in p.ttt_cache]
-            # c2 eviction-feed: the fifo is appended/popped per write chunk ((idx, tensor) tuples,
+            # eviction feed: the fifo is appended/popped per write chunk ((idx, tensor) tuples,
             # tensors never mutated in place) -> a shallow list() copy suffices, like the EMA dicts.
             ttt_fifo = [list(getattr(c, "fifo", []) or []) for c in p.ttt_cache]
         return {
@@ -703,7 +703,7 @@ class StreamingTrainingModel:
             dtype=self.dtype
         )
 
-        # ---- counterfactual mem-OFF twin (e3 advantage objective) ----
+        # ---- counterfactual mem-OFF twin (advantage objective) ----
         # Same pre-chunk state, same noise, same RNG stream, injection zeroed -> the only difference
         # vs the real chunk is the memory's injection during this chunk. Generated first, then every
         # mutated state is restored, so the real rollout below is bit-identical to a no-twin run.
@@ -826,7 +826,7 @@ class StreamingTrainingModel:
             "current_length": self.state["current_length"],
             "gradient_mask": gradient_mask,  # Mask frames that do not require gradients for loss computation
             "overlap_frames_used": overlap_frames_to_use,
-            "twin_new_frames": twin_new_frames,  # mem-OFF counterfactual of the new frames (e3), or None
+            "twin_new_frames": twin_new_frames,  # mem-OFF counterfactual of the new frames, or None
         }
         if (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] current_training_chunk: ({self.state['current_length'] - new_frames_to_generate} -> {self.state['current_length']})/{self.state['temp_max_length']}")
@@ -872,17 +872,17 @@ class StreamingTrainingModel:
     # active" term is always satisfied by the cheapest route, which is noise or a constant bias.
     #
     #   id, tv            identity to the chunk-0 anchor, and a floor on latent motion. Used by
-    #                     the e1 and e2 runs, then dropped: the identity term is a freeze ally,
-    #                     since the cheapest way to keep a face is to stop moving, and the motion
-    #                     floor is subsumed by the mm terms below.
+    #                     the first generation of runs, then dropped: the identity term is a
+    #                     freeze ally, since the cheapest way to keep a face is to stop moving,
+    #                     and the motion floor is subsumed by the mm terms below.
     #   dnh, act,         do-no-harm on identity; a floor on how much the injection changes the
     #   mm_rel, mm_ext    frame; a two-sided motion match to the twin; and an absolute floor
     #                     against the unmodified model's own motion curve, which is what catches
-    #                     a twin that froze too. Used by e3_antifreeze and e4_antiflicker.
-    #   flick,            a second-temporal-difference hinge against the twin, plus two switches.
-    #   motion_lag2,      Added in e4, after the model learned to counterfeit motion with
-    #   dose_tmean_remove frame-rate shimmer and to satisfy the activity floor with a static
-    #                     overlay. Each switch closes one of those two routes.
+    #                     a twin that froze too. Used by the second generation of runs.
+    #   flick,            a second-temporal-difference hinge against the twin, plus two switches,
+    #   motion_lag2,      added after the model learned to counterfeit motion with frame-rate
+    #   dose_tmean_remove shimmer and to satisfy the activity floor with a static overlay. Each
+    #                     switch closes one of those two routes.
     #   adv               a clamped reward for beating the twin on identity. Written, bounded,
     #                     gated on motion validity, and never enabled in any run of this project:
     #                     it was judged a freeze risk. adv_floor_frac is still used, by mm_ext.
@@ -941,7 +941,7 @@ class StreamingTrainingModel:
             log["e1_id_loss"] = id_loss.detach()
         return id_loss, tv_loss, log
 
-    # ---- e3: counterfactual, motion-gated, clamped identity advantage over the mem-OFF twin ----
+    # ---- counterfactual, motion-gated, clamped identity advantage over the mem-OFF twin ----
     def _motion_target_index(self, chunk_start_frame):
         """chunk_start (0, 21, 39, 57, ...) -> index (0, 1, 2, 3, ...) into the motion-target curve."""
         if chunk_start_frame <= 0:
@@ -965,7 +965,7 @@ class StreamingTrainingModel:
         return torch.tensor(float(curve[i]), device=self.device)
 
     def _compute_advantage_loss(self, chunk, chunk_info):
-        """e3 objective: clean + active + do-no-harm + dynamic, via the mem-OFF counterfactual twin.
+        """Twin objective: clean + active + do-no-harm + dynamic, via the mem-OFF counterfactual twin.
             L = w_dnh * relu(cos_CF - cos_ON - deadband)            (do-no-harm identity hinge)
               + w_act * relu(act_floor - D_ac)                      (activity floor: not inert)
               + w_rel * (log m_ON - log m_CF)^2                     (motion two-sided vs twin)
@@ -1008,9 +1008,9 @@ class StreamingTrainingModel:
         ov = int(chunk_info.get("overlap_frames_used", 0))
         new_real = chunk[:, ov:]                        # newly generated frames only (grad); twin spans
         # the same global frames and is decode-comparable (no first-frame re-encode contamination)
-        # e4: lag-2 (frame-rate-blind) motion statistic, frame-rate alternation contributes ~0 to a
+        # lag-2 (frame-rate-blind) motion statistic: frame-rate alternation contributes ~0 to a
         # lag-2 delta while smooth motion contributes fully, so the memory can no longer counterfeit
-        # motion credit with shimmer. Falls back to the e3 first-difference when the flag is off or the
+        # motion credit with shimmer. Falls back to the first difference when the flag is off or the
         # chunk is too short for a lag-2 window. (motion_targets.json must be regenerated to match.)
         if getattr(self, "motion_lag2", False) and new_real.shape[1] >= 3:
             m_on = (new_real[:, 2:] - new_real[:, :-2]).abs().mean() * 0.5
@@ -1036,13 +1036,13 @@ class StreamingTrainingModel:
             if getattr(self, "dose_tmean_remove", False):
                 cf_ac = cf_ac - cf_ac.mean(dim=1, keepdim=True)         # match the per-site temporal removal
             cf_rms = cf_ac.float().pow(2).mean().sqrt().clamp_min(eps)
-        # e4: also remove the per-site temporal mean so a static overlay (wallpaper) earns zero dose;
+        # also remove the per-site temporal mean so a static overlay (wallpaper) earns zero dose;
         # only a slow, state-evolving, spatially-structured change can satisfy the floor.
         if getattr(self, "dose_tmean_remove", False):
             d_ac = d_ac - d_ac.mean(dim=1, keepdim=True)                # per (B,C,H,W) site temporal mean
         dose = d_ac.float().pow(2).mean().sqrt() / cf_rms
         act = F.relu(self.act_floor - dose)
-        # (3b) e4 anti-flicker tripwire: penalize the per-site second-temporal-difference roughness the
+        # (3b) anti-flicker tripwire: penalize the per-site second-temporal-difference roughness the
         # injection adds beyond the mem-OFF twin. One-sided hinge, paired (real acceleration in the twin
         # is priced in), relative to the twin's own roughness. D2 (not D1) maximizes on frame-rate
         # alternation while smooth constant-velocity motion contributes ~0. Latent-space (covers all new
@@ -1175,7 +1175,7 @@ class StreamingTrainingModel:
                 if (not dist.is_initialized() or dist.get_rank() == 0):
                     print("[StreamingTrain-Model] identity/tv loss OOM, skipped this step")
 
-        ###### e3 counterfactual objective (do-no-harm + activity floor + motion match) ######
+        ###### counterfactual objective (do-no-harm + activity floor + motion match) ######
         if self._e3_on:
             try:
                 adv_loss, e3_log = self._compute_advantage_loss(chunk, chunk_info)
@@ -1184,7 +1184,7 @@ class StreamingTrainingModel:
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 # keep the log keys present so merge_dict_list (keyed off chunk 0) does not raise;
-                # e3_oom_skip=1 makes silent skipping visible in wandb (e1 lesson)
+                # e3_oom_skip=1 makes silent skipping visible in wandb
                 dmd_log_dict.update({
                     "e3_adv_loss": torch.zeros((), device=self.device),
                     "e3_adv_raw": torch.zeros((), device=self.device),
@@ -1204,7 +1204,7 @@ class StreamingTrainingModel:
                     "e3_oom_skip": torch.ones((), device=self.device),
                 })
                 if (not dist.is_initialized() or dist.get_rank() == 0):
-                    print("[StreamingTrain-Model] e3 advantage loss OOM, skipped this chunk")
+                    print("[StreamingTrain-Model] advantage loss OOM, skipped this chunk")
 
         ###### gan process #####
         if self.use_gan:

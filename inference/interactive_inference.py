@@ -19,7 +19,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
-from utils.video_io import write_video  # torchvision si dispo, sinon imageio
+from utils.video_io import write_video  # torchvision when available, else imageio
 from torchvision import transforms  # noqa: F401
 from einops import rearrange
 
