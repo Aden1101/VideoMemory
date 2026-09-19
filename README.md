@@ -62,16 +62,19 @@ must be measurably non-zero.
 
 ![motion vs identity](assets/motion_identity.png)
 
-One panel per training run, each traced across its checkpoints against its own baseline. The
-four share everything except what their titles name: same frozen backbone, same LoRA
-co-training, and the same objective, plain DMD distillation with every extra loss term in the
-codebase weighted zero. Panel 4 differs from panel 3 by one line of config, the fine-tune it
-starts from, which is why its baseline sits elsewhere. Six prompts per point, one seed; EMA and
-480-frame evaluations are left out so each line is one comparable series.
+One column per training run, identity on top, motion below, against the training step. The
+dashed line is that run's own unmodified model. The four share everything except what their
+titles name: same frozen backbone, same LoRA co-training, and the same objective, plain DMD
+distillation with every extra loss term in the codebase weighted zero. Run 4 differs from run 3
+by one line of config, the fine-tune it starts from, which is why its reference sits lower. Six
+prompts per point, one seed; EMA and 480-frame evaluations are left out so each line is one
+comparable series.
 
-The memory does not beat attention plus sink. Worse, the training itself costs motion: every
-trained arm sits left of the unmodified model, and switching the memory on does not buy identity
-back. The one point that looks like a win, top centre, is a checkpoint with a third less motion.
+The memory does not beat attention plus sink. Training costs motion: in runs 1 to 3 both arms
+fall under the motion reference, and turning the memory on does not buy identity back. Where
+motion does come back, run 2 at step 1250, identity has collapsed to 0.36. Run 1 ends above its
+identity reference with a third less motion, which is what a near-frozen video scores. Run 4
+keeps more motion than its own reference and still loses identity.
 
 The reason generalises. The training objective (chunk-local DMD) and the usual metrics reward
 the same thing, temporal self-similarity, so a learnable memory converges to a freeze or to a
