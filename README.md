@@ -115,7 +115,7 @@ python tests/test_inference_smoke.py   # real model, streaming, no weights neede
 
 ## Credit
 
-The base import (`392b3f8`) is byte-identical to upstream `vivoCameraResearch/Anchor-Forcing`.
+The base import (`392b3f8`) is an unmodified copy of upstream `vivoCameraResearch/Anchor-Forcing`.
 The backbone, the DMD distillation and the streaming pipeline are theirs. Everything after that
 commit is this work: the memory cell, its write rules, the training objectives and the
 evaluation code. License CC BY-NC-SA 4.0, inherited from upstream.

@@ -864,6 +864,34 @@ class StreamingTrainingModel:
         f = dino(x)                                           # [B*T, D] CLS embedding
         return F.normalize(f, dim=-1)
 
+    # -----------------------------------------------------------------------------------------
+    # The extra loss terms, and why the runs this repo presents have all of them off.
+    #
+    # Eight were built, in three generations, each closing the channel the previous one left
+    # open. Every one is a hinge with a deadband rather than a maximiser: an unbounded "be more
+    # active" term is always satisfied by the cheapest route, which is noise or a constant bias.
+    #
+    #   id, tv            identity to the chunk-0 anchor, and a floor on latent motion. Used by
+    #                     the e1 and e2 runs, then dropped: the identity term is a freeze ally,
+    #                     since the cheapest way to keep a face is to stop moving, and the motion
+    #                     floor is subsumed by the mm terms below.
+    #   dnh, act,         do-no-harm on identity; a floor on how much the injection changes the
+    #   mm_rel, mm_ext    frame; a two-sided motion match to the twin; and an absolute floor
+    #                     against the unmodified model's own motion curve, which is what catches
+    #                     a twin that froze too. Used by e3_antifreeze and e4_antiflicker.
+    #   flick,            a second-temporal-difference hinge against the twin, plus two switches.
+    #   motion_lag2,      Added in e4, after the model learned to counterfeit motion with
+    #   dose_tmean_remove frame-rate shimmer and to satisfy the activity floor with a static
+    #                     overlay. Each switch closes one of those two routes.
+    #   adv               a clamped reward for beating the twin on identity. Written, bounded,
+    #                     gated on motion validity, and never enabled in any run of this project:
+    #                     it was judged a freeze risk. adv_floor_frac is still used, by mm_ext.
+    #
+    # The four runs behind the README figure turn all of this off and keep DMD alone, because the
+    # stack fought the distillation and swept the model between freezing and flickering. With
+    # adv, dnh, act and flick at 0, _e3_on is false and the trainer never even builds the twin
+    # (make_twin in trainer/distillation.py), so none of the code below runs.
+    # -----------------------------------------------------------------------------------------
     def _set_id_anchor(self, chunk):
         """Cache the chunk-0 subject identity anchor (no grad), called from the rollout on the first
         chunk. Uses the head frames (highest prompt fidelity, last to degrade under collapse) so the

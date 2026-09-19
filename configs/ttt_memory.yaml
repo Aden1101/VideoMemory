@@ -10,7 +10,7 @@ load_raw_video: false
 gradient_accumulation_steps: 1
 max_checkpoints: 3
 auto_resume: False
-logdir: /shared/ssd_14T_project/adenelmi/ttt_memory_train
+logdir: ckpt/ttt_memory
 
 use_wandb: true
 wandb_project: anchor-forcing-memory
