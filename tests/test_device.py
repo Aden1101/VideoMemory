@@ -1,14 +1,6 @@
 #!/usr/bin/env python
-"""The device-agnostic pass, verified.
-
-The promise to keep, and the only one that matters: on CUDA and on CPU the code must behave
-exactly as before. This project has already lost campaigns to comparisons where one arm was
-not what it was believed to be, and the 07/08 device control measured that merely changing
-machine shifts the result by two pairs out of nineteen. A portability patch that moved any
-value on the original hardware would be worse than no patch.
-
-D3 is therefore the central test: it reimplements the pre-patch RoPE and demands bitwise
-equality with the current version on a device that supports float64.
+"""The device layer. D3 is the one that matters: it reimplements the pre-patch RoPE and
+demands bitwise equality with the current version, so no number measured on CUDA can move.
 
     python tests/test_device.py
 """

@@ -701,14 +701,6 @@ class CausalWanAttentionBlock(nn.Module):
             # CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
             # bf16 CPU<->GPU round-trip is bit-identical (twin selftest re-validated).
             ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
-        # drop the part of the injection parallel to the residual stream: it is "more of what
-        # is already there", which damps motion. Only the orthogonal remainder is kept, and it
-        # is deliberately not renormalised afterwards.
-        if int(os.environ.get("MEM_REJECT_STREAM", "0")) != 0:
-            _xh = x.detach().float()
-            _xh = _xh / _xh.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            _m = mem_out.float()
-            mem_out = (_m - (_m * _xh).sum(-1, keepdim=True) * _xh).to(mem_out.dtype)
         x = x + (mem_out.detach() if ttt_update else mem_out)
         if ttt_update:
             # attribute write on a TTTBlockCache object (not a dict key!):this mutation survives the call stack.

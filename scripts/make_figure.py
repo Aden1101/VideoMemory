@@ -14,10 +14,10 @@ Each run was also evaluated with an EMA checkpoint and at 480 frames. Those are 
 evaluation settings of the same step, not different steps, so mixing them into one line makes
 it meaningless. Only the plain eval<step>[_sink1] series is drawn.
 
-Reads reference/runs/*/eval*/metrics_c1_step*.txt directly, so the figure comes from the
+Reads results/*/eval*/metrics_c1_step*.txt directly, so the figure comes from the
 measured numbers and never from a hand-copied table.
 
-    python reference/runs/make_figure.py        # writes assets/motion_identity.png
+    python scripts/make_figure.py               # writes assets/motion_identity.png
 """
 import os
 import re
@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 # Panels are numbered and titled by what changed between runs. The directory names on the
-# left are internal run codes, kept only so each panel can be traced back to reference/runs/.
+# left are internal run codes, kept only so each panel can be traced back to results/.
 #
 # All four share the same backbone (Wan2.1-1.3B, frozen), the same LoRA co-training (rank
 # 256, unfrozen on every block) and the same objective: plain DMD distillation. Every extra
@@ -47,7 +47,7 @@ INK, INK2, MUTED, LINE = "#0b0b0b", "#52514e", "#8a8880", "#dedad3"
 
 def load(run):
     out = {}
-    base = os.path.join("reference/runs", run)
+    base = os.path.join("results", run)
     for d in sorted(os.listdir(base)):
         m = KEEP.match(d)
         if not m:

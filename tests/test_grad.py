@@ -1,3 +1,9 @@
+"""The memory's write gradient, which is derived by hand rather than by autograd.
+
+Checks it against autograd, and that a future chunk never leaks into a past one.
+
+    python -m pytest tests/test_grad.py
+"""
 import math
 import os
 import sys

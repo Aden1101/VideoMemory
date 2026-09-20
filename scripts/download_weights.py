@@ -5,8 +5,8 @@ The README gives the two huggingface-cli commands, but the exact paths (and the 
 tokenizer lives in a `google/umt5-xxl/` subdirectory) can only be guessed by reading
 utils/wan_wrapper.py. This script pins them down.
 
-    python download_weights.py            # both repos, resumes automatically
-    python download_weights.py --only af  # only the Anchor-Forcing checkpoints
+    python scripts/download_weights.py            # both repos, resumes automatically
+    python scripts/download_weights.py --only af  # only the Anchor-Forcing checkpoints
 
 huggingface_hub picks an interrupted file back up, so re-running is free and safe. Nothing is
 overwritten if the file is already complete and its hash matches.

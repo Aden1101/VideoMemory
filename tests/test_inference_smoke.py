@@ -1,15 +1,7 @@
 #!/usr/bin/env python
-"""Smoke test of the inference path, on the local device, with no weights and no data.
-
-A real miniature CausalWanModel (random weights, real head geometry 12 x 128 because the
-pipeline's KV cache requires it), rolled out in streaming mode over three chunks. No image is
-judged: this checks that the chain executes and that the cache advances, through RoPE,
-attention, the rolling KV cache, the sink and the TTT memory cell.
-
-The test exists because the device-agnostic pass hit four successive walls that no import
-test would have caught: float64 in RoPE, float64 in the timestep embedding, five attention
-calls bypassing the dispatcher, and video writing. Each only shows up at run time, one step
-further than the last.
+"""A real miniature CausalWanModel with a memory branch, rolled out over three chunks. No
+image is judged: this checks that the chain executes and the caches advance. Catches what an
+import test cannot, which is everything that only fails at run time.
 
     python tests/test_inference_smoke.py            # detected device
     AF_DEVICE=cpu python tests/test_inference_smoke.py

@@ -6,9 +6,9 @@ shared pool of a unified-memory machine; only the end of the process returns the
 Pass 2 (inference/inference.py with AF_LAZY_TEXT_ENCODER=1) then never constructs the
 encoder and keeps the memory for the generator.
 
-    python encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
-    python encode_prompts.py --file inference/interactive_case.jsonl        # switch scenarios
-    python encode_prompts.py --stats                                        # cache state
+    python scripts/encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
+    python scripts/encode_prompts.py --file inference/interactive_case.jsonl        # switch scenarios
+    python scripts/encode_prompts.py --stats                                        # cache state
 
 Then:
     AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path ...
@@ -22,7 +22,7 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def read_prompts(path):

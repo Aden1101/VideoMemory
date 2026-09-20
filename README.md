@@ -4,7 +4,7 @@ A research fork of [Anchor-Forcing](https://github.com/vivoCameraResearch/Anchor
 (Wan2.1-T2V-1.3B, causal streaming, DMD distillation) that adds a fast-weight memory to the
 backbone, to fight identity drift over minutes of generated video.
 
-Upstream's README is kept at [`reference/UPSTREAM_README.md`](reference/UPSTREAM_README.md).
+Upstream's README is kept at [`UPSTREAM_README.md`](UPSTREAM_README.md).
 
 ## The problem
 
@@ -91,13 +91,13 @@ control at chance.
 ## Running it
 
 ```bash
-python download_weights.py                    # Wan2.1-T2V-1.3B + Anchor-Forcing checkpoints, ~26 GB
-python encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
+python scripts/download_weights.py                    # Wan2.1-T2V-1.3B + Anchor-Forcing checkpoints, ~26 GB
+python scripts/encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
 AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path configs/inference.yaml
 ```
 
 That config runs the unmodified model. The memory arms carry their own configs under
-`reference/runs/`. Always declare `memory_layers` explicitly, because the model default is a
+`results/`. Always declare `memory_layers` explicitly, because the model default is a
 memory branch whose weights are in no checkpoint.
 
 Two passes because the text encoder (11.4 GB) and the generator do not fit in memory together on

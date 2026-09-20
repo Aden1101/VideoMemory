@@ -1,10 +1,6 @@
 #!/usr/bin/env python
-"""The prompt-embedding cache, verified on CPU, with no real encoder, in about a second.
-
-P3 is the test that matters: a prompt read back from the cache must return the tensor bit for
-bit. This project compares effects the size of its own chain noise (plus or minus 2 pairs out
-of 19, measured 07/08), so a rounding error introduced by the cache would be invisible and
-would falsify everything. No quantization is permitted here, not even a harmless-looking one.
+"""The prompt cache, on CPU, without the real encoder. P3 is the one that matters: a prompt
+read back must be the same tensor bit for bit, and P1d that the dtype is part of the key.
 
     python tests/test_prompt_cache.py
 """
