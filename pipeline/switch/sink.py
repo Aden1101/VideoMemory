@@ -4,7 +4,7 @@ import os
 import torch
 
 from pipeline.switch.memory_state import _find_causal_model
-
+from utils.env import env_int, env_str
 
 
 class SinkMixin:
@@ -28,13 +28,13 @@ class SinkMixin:
                            getattr(cm.blocks[0].self_attn, "sink_size", 0)))
 
     def _maybe_sinkpurge(self, output, current_start_frame, cond_new, is_revisit):
-        mode = int(os.environ.get("MEM_SINKPURGE", "0") or 0)
+        mode = env_int("MEM_SINKPURGE")
         if not mode or not (is_revisit or mode >= 2):
             return
         assert os.environ.get("REPLAY_PAST_POS", "") != "sink0", \
             "MEM_SINKPURGE and REPLAY_PAST_POS=sink0 both rewrite the sink: not a stack"
-        assert not os.environ.get("MEM_DECODE", "").strip() \
-            and not int(os.environ.get("REPLAY_PAST", "0") or 0) and not self._fb_mode(), \
+        assert not env_str("MEM_DECODE") \
+            and not env_int("REPLAY_PAST") and not self._fb_mode(), \
             "MEM_SINKPURGE is the control with neither a splice nor a memory: do not combine " \
             "it with a recall arm (MEM_DECODE / REPLAY_PAST / FRAMEBANK)"
         assert getattr(self, "global_sink", False), \

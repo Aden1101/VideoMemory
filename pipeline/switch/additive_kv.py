@@ -4,7 +4,7 @@ import os
 import torch
 
 from pipeline.switch.memory_state import _find_causal_model
-
+from utils.env import env_float
 
 
 class AdditiveKVMixin:
@@ -73,7 +73,7 @@ class AdditiveKVMixin:
                 ttt_update=False,
             )
         del _tmp
-        gain = float(os.environ.get("MEM_ADD_GAIN", "1") or 1)
+        gain = env_float("MEM_ADD_GAIN", 1)
         _p = (os.environ.get("MEM_ADD_POS", "") or "").strip().lower()
         pos = -1 if _p in ("", "auto") else int(_p)
         n_tok = nf * self.frame_seq_length

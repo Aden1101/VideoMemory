@@ -3,11 +3,10 @@ import os
 
 import torch
 
-
+from utils.env import env_float, env_int, env_str
 
 
 class CompositeMixin:
-
     # ---- bringing back the subject without the old scene -------------------------------------
     # The splice replaces a whole latent frame, so the return re-renders the entire scene from
     # the past: a shop awning flips colour at the return, while the frame-bank baseline brings
@@ -44,7 +43,7 @@ class CompositeMixin:
 
     @staticmethod
     def _energy_centroid(lat):
-        """Crude subject localizer on a latent frame, used by the UNION mask (gate 4): the
+        """Crude subject localizer on a latent frame, used by the UNION mask: the
         centroid of the spatial energy that deviates from the frame's own spatial mean, i.e.
         'where does this frame stop looking like a flat backdrop'. No cross-attention, no
         detector: a 5-line saliency whose only job is to be better than 'always the center'.
@@ -71,17 +70,17 @@ class CompositeMixin:
                                     left: same decor asked twice (high cosine) => composite, so
                                     the world must keep rolling; unrelated scene (low cosine) =>
                                     alpha -> 0, the plain full-frame splice, because there a cut
-                                    is legitimate montage grammar (design v1 §2, per-tier rule).
+                                    is legitimate montage grammar.
           MEM_COMP_GATE_LO/HI       the ramp bounds (defaults 0.50 / 0.80)"""
-        a = float(os.environ.get("MEM_COMP_ALPHA", "1") or 1)
-        if int(os.environ.get("MEM_COMP_PROMPT_GATE", "0") or 0):
+        a = env_float("MEM_COMP_ALPHA", 1)
+        if env_int("MEM_COMP_PROMPT_GATE"):
             a *= float(getattr(self, "_comp_gate_now", 1.0))
         return max(0.0, min(1.0, a))
 
     def _comp_gate_from_prompts(self, cond_new, cond_prev):
         """Prompt-cosine ramp, computed once per revisit switch (no RNG draw, CPU only)."""
-        lo = float(os.environ.get("MEM_COMP_GATE_LO", "0.50") or 0.50)
-        hi = float(os.environ.get("MEM_COMP_GATE_HI", "0.80") or 0.80)
+        lo = env_float("MEM_COMP_GATE_LO", 0.50)
+        hi = env_float("MEM_COMP_GATE_HI", 0.80)
         if cond_prev is None:
             self._comp_gate_now = 1.0
             return
@@ -94,7 +93,7 @@ class CompositeMixin:
         """Blend the recalled anchor (the subject) onto the last true latent frame of the current
         context (background). Returns `anchor` itself (same object) when the hook is off, so the
         caller's path is byte-identical without it."""
-        if not int(os.environ.get("MEM_DECODE_COMPOSITE", "0") or 0):
+        if not env_int("MEM_DECODE_COMPOSITE"):
             return anchor
         assert os.environ.get("REPLAY_PAST_POS", "") not in ("head", "sink0"), \
             "MEM_DECODE_COMPOSITE is defined for the RECENCY placement only (the background it " \
@@ -104,8 +103,8 @@ class CompositeMixin:
             device=anchor.device, dtype=anchor.dtype)
         assert bg.shape[0] == anchor.shape[0] and bg.shape[2:] == anchor.shape[2:], \
             f"composite shape mismatch: bg {tuple(bg.shape)} vs anchor {tuple(anchor.shape)}"
-        crop = float(os.environ.get("MEM_COMP_CROP", "0.6") or 0.6)
-        feather = float(os.environ.get("MEM_COMP_FEATHER", "0.3") or 0.3)
+        crop = env_float("MEM_COMP_CROP", 0.6)
+        feather = env_float("MEM_COMP_FEATHER", 0.3)
         H, W = anchor.shape[-2], anchor.shape[-1]
         # ---- controls: is it the mask's geometry that helps, or the anchor's content? --------
         #   MEM_COMP_SHIFT=f       ellipse center moved by f * W horizontally (wrong place)
@@ -114,10 +113,10 @@ class CompositeMixin:
         #                          (dose-matched: same average subject weight, no shape)
         #   MEM_COMP_ANCHOR_NOISE  RMS-preserving noise mix on the anchor before the blend
         #                          (mask kept, content destroyed)
-        shift = float(os.environ.get("MEM_COMP_SHIFT", "0") or 0)
-        invert = int(os.environ.get("MEM_COMP_INVERT", "0") or 0)
-        uniform = int(os.environ.get("MEM_COMP_UNIFORM", "0") or 0)
-        union = int(os.environ.get("MEM_COMP_UNION", "0") or 0)
+        shift = env_float("MEM_COMP_SHIFT")
+        invert = env_int("MEM_COMP_INVERT")
+        uniform = env_int("MEM_COMP_UNIFORM")
+        union = env_int("MEM_COMP_UNION")
         cy = cx = None
         w_noise = w_anchor = None   # MEM_COMP_FILL: weights of the current-subject region and
                                     # of the anchor region
@@ -153,12 +152,12 @@ class CompositeMixin:
                 # two subjects overlap. Keep at least a fraction f of the anchor everywhere:
                 #     w_a = max(m_a - m_b, f * m_a),  w_n = m_union - w_a,  w_bg = 1 - m_union
                 # f = 0 is exactly 'priority', f = 1 is exactly 'noise'.
-                _ff = float(os.environ.get("MEM_COMP_FILL_FLOOR", "0.4") or 0.4)
+                _ff = env_float("MEM_COMP_FILL_FLOOR", 0.4)
                 w_anchor = torch.maximum(m_a - m_b, _ff * m_a).clamp_min(0.0)
                 w_noise = m - w_anchor
             elif _fill:
                 raise AssertionError(
-                    f"MEM_COMP_FILL={_fill!r} (attendu ''|'noise'|'priority'|'floor')")
+                    f"MEM_COMP_FILL={_fill!r} (expected ''|'noise'|'priority'|'floor')")
         if invert:
             m = 1.0 - m
         if uniform:
@@ -170,7 +169,7 @@ class CompositeMixin:
             # the MEM_COMP_FILL path applies alpha itself, on its three weights
             m = 1.0 - alpha * (1.0 - m)
         a_use = anchor
-        sig = float(os.environ.get("MEM_COMP_ANCHOR_NOISE", "0") or 0)
+        sig = env_float("MEM_COMP_ANCHOR_NOISE")
         if sig > 0:
             _g = torch.Generator(device=anchor.device)
             _g.manual_seed(192837465 + current_start_frame)
@@ -190,7 +189,7 @@ class CompositeMixin:
             assert not (invert or uniform), \
                 "MEM_COMP_FILL=noise is defined for the plain union mask, not with invert or uniform"
             assert w_anchor is not None
-            _fs = min(float(os.environ.get("MEM_COMP_FILL_SIGMA", "1.0") or 1.0), 1.0)
+            _fs = min(env_float("MEM_COMP_FILL_SIGMA", 1.0), 1.0)
             _gf = torch.Generator(device=anchor.device)
             _gf.manual_seed(192837465 + current_start_frame)      # same seed as the noise above
             _eps_fill = torch.randn(anchor.shape, generator=_gf, device=anchor.device,
@@ -202,11 +201,11 @@ class CompositeMixin:
                 w_a = 1.0 - alpha * (1.0 - w_a)
             comp = (w_a * a_use.float() + w_n * _eps_fill.float()
                     + w_bg * bg.float()).to(anchor.dtype)
-            print(f"[MEM_COMP_FILL={_fill}] region 'sujet courant' (poids moyen {float(w_n.mean()):.3f}) "
-                  f"remplie de BRUIT sigma={_fs} au lieu du contenu d'ancre ; ancre {float(w_a.mean()):.3f}, "
-                  f"fond {float(w_bg.mean()):.3f}", flush=True)
+            print(f"[MEM_COMP_FILL={_fill}] current-subject region (mean weight {float(w_n.mean()):.3f}) "
+                  f"filled with noise sigma={_fs} instead of anchor content; anchor "
+                  f"{float(w_a.mean()):.3f}, background {float(w_bg.mean()):.3f}", flush=True)
         self._comp_applied = getattr(self, "_comp_applied", 0) + 1
-        _dump = os.environ.get("MEM_COMP_DUMP", "").strip()
+        _dump = env_str("MEM_COMP_DUMP")
         if _dump:
             os.makedirs(os.path.dirname(_dump) or ".", exist_ok=True)
             torch.save({"bg": bg.detach().cpu(), "anchor": anchor.detach().cpu(),

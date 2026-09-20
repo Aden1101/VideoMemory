@@ -4,6 +4,8 @@ import os
 
 import torch
 
+from utils.env import env_int, env_str
+
 
 
 # MEM_DECODE: when a subject comes back, the frame fed into the attention context is decoded
@@ -96,7 +98,7 @@ class AnchorDecodeMixin:
         channel at age 1' from 'the state's forgetting between the write and the revisit'.
         Eviction arithmetic = causal_model.py's FIFO rule: chunk c is written window_chunks =
         ceil(local_attn_size / num_frame_per_block) chunks after it was produced."""
-        if not int(os.environ.get("MEM_DECODE_THRU", "0") or 0):
+        if not env_int("MEM_DECODE_THRU"):
             return
         if self._thru_frame is not None or self._first_switch_frame is None:
             return
@@ -109,7 +111,7 @@ class AnchorDecodeMixin:
         _cur_chunk = current_start_frame // _F
         if _cur_chunk != _anchor_chunk + _wc:
             return
-        _ck = os.environ.get("MEM_DECODE", "").strip()
+        _ck = env_str("MEM_DECODE")
         assert _ck, "MEM_DECODE_THRU=1 requires MEM_DECODE=<AnchorFrameDecoder ckpt>"
         self._thru_frame, _cond_on = self._memdec_frame(_ck, cond_third, out_dtype, out_device)
         self._thru_info = {"anchor_frame": int(_anchor_frame), "anchor_chunk": int(_anchor_chunk),

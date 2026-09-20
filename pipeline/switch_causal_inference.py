@@ -14,6 +14,7 @@ import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
+from utils.env import env_float, env_int, env_str
 from pipeline.causal_inference import CausalInferencePipeline  # reuse init utilities
 from wan.modules.video_memory import TTTBlockCache
 from pipeline.switch.memory_state import MemoryStateMixin, _memwriter_sync
@@ -45,6 +46,13 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
+
+    def _window_frames(self, current_start_frame):
+        """How many past frames the attention context holds when generation reaches
+        `current_start_frame`: all of them under global attention, else the local window."""
+        if self.local_attn_size == -1:
+            return current_start_frame
+        return min(self.local_attn_size, current_start_frame)
 
     def _begin_rollout(self, noise, low_memory, first_switch_frame=None):
         """Everything both drivers do before the first chunk: free the text encoder, allocate
@@ -210,8 +218,8 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
             # With uniform_timestep, the wrapper reduces the per-frame timestep to slot 0's,
             # which would silently drop the declaration and turn this into plain noising.
             assert not getattr(self.generator, "uniform_timestep", False), \
-                "MEM_ANCHOR_T exige un generateur CAUSAL (uniform_timestep=False) : sinon le " \
-                "timestep par frame est reduit a celui du slot 0 et la declaration est perdue"
+                "MEM_ANCHOR_T needs a causal generator (uniform_timestep=False): otherwise the " \
+                "per-frame timestep is reduced to slot 0's and the declaration is lost"
             assert timestep_override.shape[-1] == num_recache_frames, \
                 f"timestep_override has {timestep_override.shape[-1]} entries, recache needs " \
                 f"{num_recache_frames}"
@@ -274,22 +282,22 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
-        assert not int(os.environ.get("MEM_DECODE_COMPOSITE", "0") or 0), \
+        assert not env_int("MEM_DECODE_COMPOSITE"), \
             "MEM_DECODE_COMPOSITE is implemented in the N-switch driver only, " \
             "run it through inference_schedule()"
-        assert not int(os.environ.get("MEM_ADDITIVE_KV", "0") or 0), \
+        assert not env_int("MEM_ADDITIVE_KV"), \
             "MEM_ADDITIVE_KV is implemented in the N-switch driver only, " \
             "run it through inference_schedule()"
-        assert int(os.environ.get("MEM_DECODE_SLOT_OFFSET", "-1") or -1) < 0, \
-            "MEM_DECODE_SLOT_OFFSET (gate 2) is implemented in the N-switch driver only"
-        assert float(os.environ.get("MEM_ANCHOR_T", "0") or 0) <= 0.0, \
+        assert env_int("MEM_DECODE_SLOT_OFFSET", -1) < 0, \
+            "MEM_DECODE_SLOT_OFFSET is implemented in the N-switch driver only"
+        assert env_float("MEM_ANCHOR_T") <= 0.0, \
             "MEM_ANCHOR_T is implemented in the N-switch driver only, " \
             "run it through inference_schedule()"
-        assert float(os.environ.get("MEM_SDEDIT", "0") or 0) <= 0.0 \
-            and not int(os.environ.get("MEM_SINKPURGE", "0") or 0), \
+        assert env_float("MEM_SDEDIT") <= 0.0 \
+            and not env_int("MEM_SINKPURGE"), \
             "MEM_SDEDIT / MEM_SINKPURGE are implemented in the N-switch driver only"
-        assert float(os.environ.get("MEM_DECODE_NOISE", "0") or 0) <= 0.0 \
-            and not os.environ.get("MEM_DECODE_SRC", "").strip(), \
+        assert env_float("MEM_DECODE_NOISE") <= 0.0 \
+            and not env_str("MEM_DECODE_SRC"), \
             "MEM_DECODE_NOISE / MEM_DECODE_SRC are implemented in the N-switch driver only"
 
         # Encode both prompts upfront
@@ -319,7 +327,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 # MEM_EPISODIC (off by default): restore the memory state
                 # snapshotted at the A->B switch, before the recache, so the return-of-A rollout
                 # (recache reads included) runs on the A-era state instead of B's recency.
-                if int(os.environ.get("MEM_EPISODIC", "0")) and getattr(self, "_ttt_snap_A", None):
+                if env_int("MEM_EPISODIC") and getattr(self, "_ttt_snap_A", None):
                     self._restore_ttt(self._ttt_snap_A)
                     print(f"[MEM_EPISODIC] restored A-era memory state at frame {current_start_frame}")
                 # Replaying the past: rebuild the attention window from the real frames of
@@ -333,12 +341,11 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 # the frame fed back is decoded from the live memory instead of being the real
                 # past frame. Same mechanism as above, but nothing is read from the true past:
                 # this is the arm that actually tests the memory.
-                _dec_ckpt = os.environ.get("MEM_DECODE", "").strip()
+                _dec_ckpt = env_str("MEM_DECODE")
                 if _dec_ckpt:
                     assert _splice is None, "MEM_DECODE and REPLAY_PAST are mutually exclusive"
-                    _n = current_start_frame if self.local_attn_size == -1 \
-                        else min(self.local_attn_size, current_start_frame)
-                    if int(os.environ.get("MEM_DECODE_THRU", "0") or 0):
+                    _n = self._window_frames(current_start_frame)
+                    if env_int("MEM_DECODE_THRU"):
                         # the frame was already decoded at the eviction of the anchor
                         # chunk (write age 1); nothing is decoded here.
                         assert self._thru_frame is not None, \
@@ -354,10 +361,10 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                     # MEM_DECODE_SLOTS (default 1): repeat the decoded anchor over the last k
                     # window slots, evicts B from the readable context k times faster (window-
                     # mixing fix; multi-slot anchors keep the same re-identification score).
-                    _kslots = max(1, int(os.environ.get("MEM_DECODE_SLOTS", "1") or 1))
+                    _kslots = max(1, env_int("MEM_DECODE_SLOTS", 1))
                     # MEM_DECODE_DUMP (debug/eye-check): save the decoded anchor latent so it
                     # can be VAE-decoded and inspected (is the anchor clean-A or an A/B fusion?)
-                    _dump = os.environ.get("MEM_DECODE_DUMP", "").strip()
+                    _dump = env_str("MEM_DECODE_DUMP")
                     if _dump:
                         torch.save(_frame.detach().to("cpu", torch.float16),
                                    f"{_dump}.f{current_start_frame}.pt")
@@ -376,7 +383,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 print("current_start_frame", current_start_frame)
             elif (not using_second) and (current_start_frame >= switch_frame_index):
                 # MEM_EPISODIC: freeze the memory of the opening scene before the next one overwrites it.
-                if int(os.environ.get("MEM_EPISODIC", "0")):
+                if env_int("MEM_EPISODIC"):
                     self._ttt_snap_A = self._snapshot_ttt()
                     print(f"[MEM_EPISODIC] snapshotted A-era memory state at frame {current_start_frame}")
                 self._first_switch_frame = current_start_frame
@@ -425,7 +432,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         is never told which switch is a revisit, so a false recall on a fresh scene
         is a real failure mode of the baseline and must be measurable, not hidden.
         """
-        assert not int(os.environ.get("MEM_DECODE_THRU", "0") or 0), \
+        assert not env_int("MEM_DECODE_THRU"), \
             "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
             "eviction arithmetic assumes the single anchor of the A->B->A rollout, run it through inference()"
         _splice = None
@@ -436,20 +443,20 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
             # MEM_EPISODIC: restore the state snapshotted when this subject was last left.
             _snaps = getattr(self, "_ttt_snap_by_prompt", None) or {}
             _sk = prompt_idx if subject is None else subject
-            if int(os.environ.get("MEM_EPISODIC", "0")) and _snaps.get(_sk):
+            if env_int("MEM_EPISODIC") and _snaps.get(_sk):
                 self._restore_ttt(_snaps[_sk])
                 print(f"[MEM_EPISODIC] restored the memory state of subject {_sk} at frame "
                       f"{current_start_frame}")
             self._dump_anchor(output, a_end)
-            if int(os.environ.get("MEM_COMP_PROMPT_GATE", "0") or 0):
+            if env_int("MEM_COMP_PROMPT_GATE"):
                 self._comp_gate_from_prompts(cond_new, cond_prev)
-        # ---- MEM_ADDITIVE_KV (gate 1): the anchor enters as extra k/v tokens, no splice ------
-        _addk = bool(is_revisit and int(os.environ.get("MEM_ADDITIVE_KV", "0") or 0))
+        # ---- MEM_ADDITIVE_KV: the anchor enters as extra k/v tokens, no splice ----------------
+        _addk = bool(is_revisit and env_int("MEM_ADDITIVE_KV"))
         if _addk:
-            assert not int(os.environ.get("REPLAY_PAST", "0") or 0) and not self._fb_mode(), \
+            assert not env_int("REPLAY_PAST") and not self._fb_mode(), \
                 "MEM_ADDITIVE_KV is the channel that evicts nothing: do not combine it with a " \
                 "splice arm (REPLAY_PAST / FRAMEBANK)"
-            _ck = os.environ.get("MEM_DECODE", "").strip()
+            _ck = env_str("MEM_DECODE")
             if _ck:                       # the decoded anchor, additive
                 _content, _ = self._memdec_frame(_ck, cond_new, output.dtype, output.device)
             else:                         # the true anchor frame, additive
@@ -461,14 +468,13 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         _splice = self._degrade_replay_window(_splice, current_start_frame)
         # ---- FRAMEBANK (Echo-Forcing-style real-content recall), routes at every switch ------
         if self._fb_mode():
-            assert _splice is None and not os.environ.get("MEM_DECODE", "").strip(), \
+            assert _splice is None and not env_str("MEM_DECODE"), \
                 "FRAMEBANK, REPLAY_PAST and MEM_DECODE are mutually exclusive"
-            _n = current_start_frame if self.local_attn_size == -1 \
-                else min(self.local_attn_size, current_start_frame)
+            _n = self._window_frames(current_start_frame)
             # FRAMEBANK_GT: take the moment of the recall from the schedule rather than from
             # the router, so every arm brings its frame back at exactly the same instant and
             # only the content differs. The router still runs and its decision is logged.
-            _gt = bool(int(os.environ.get("FRAMEBANK_GT", "0") or 0))
+            _gt = bool(env_int("FRAMEBANK_GT"))
             _fb_frame, _ = self._fb_select(seg_idx, prompt_idx, cond_new, subject=subject,
                                            force=(bool(is_revisit) if _gt else None))
             if _gt and not is_revisit:
@@ -485,7 +491,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         # signal the frame-bank baseline does not get. MEM_DECODE_ROUTED=1 uses that baseline's
         # own router instead, so the two arms differ only by what they bring back.
         _fires = is_revisit
-        if int(os.environ.get("MEM_DECODE_ROUTED", "0") or 0):
+        if env_int("MEM_DECODE_ROUTED"):
             assert not self._fb_mode(), \
                 "MEM_DECODE_ROUTED and FRAMEBANK are mutually exclusive (one router, one arm)"
             _, _rev = self._fb_select(seg_idx, prompt_idx, cond_new, subject=subject, mode="key")
@@ -493,15 +499,14 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
             print(f"[MEM_DECODE_ROUTED] segment {seg_idx}: router says "
                   f"{'REVISIT -> splice' if _fires else 'fresh scene -> no splice'} "
                   f"(ground truth was {'revisit' if is_revisit else 'fresh'})", flush=True)
-        _dec_ckpt = os.environ.get("MEM_DECODE", "").strip() if (_fires and not _addk) else ""
+        _dec_ckpt = env_str("MEM_DECODE") if (_fires and not _addk) else ""
         if _dec_ckpt:
             assert _splice is None, "MEM_DECODE and REPLAY_PAST are mutually exclusive"
-            _n = current_start_frame if self.local_attn_size == -1 \
-                else min(self.local_attn_size, current_start_frame)
+            _n = self._window_frames(current_start_frame)
             _frame, _cond_on = self._memdec_frame(_dec_ckpt, cond_new, output.dtype, output.device)
             _cond = _cond_on
-            _kslots = max(1, int(os.environ.get("MEM_DECODE_SLOTS", "1") or 1))
-            _dump = os.environ.get("MEM_DECODE_DUMP", "").strip()
+            _kslots = max(1, env_int("MEM_DECODE_SLOTS", 1))
+            _dump = env_str("MEM_DECODE_DUMP")
             if _dump:
                 # another run may be reading this file at the same moment, so write to .tmp and
                 # rename: torch.save alone leaves a window where the file is truncated.
@@ -518,7 +523,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
             _frame = self._maybe_sdedit(_frame, cond_new, current_start_frame)
             # keep only the subject region of the anchor, take the border from the current scene
             _frame = self._maybe_composite(_frame, output, current_start_frame)
-            _soff = int(os.environ.get("MEM_DECODE_SLOT_OFFSET", "-1") or -1)
+            _soff = env_int("MEM_DECODE_SLOT_OFFSET", -1)
             _splice = self._memdec_window(output, current_start_frame, _n, _frame, _kslots, _soff)
             # MEM_ANCHOR_T: stop lying about the anchor's noise level. Off by default, and it
             # returns the window object itself then, so every arm on disk is unchanged.
@@ -527,7 +532,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
             print(f"[MEM_DECODE] decoded anchor spliced ({_kslots}/{_n} slots, window convention "
                   f"{'recency duplicated' if _soff < 0 else f'slot_offset={_soff}'}"
                   f"), cond={'thru' if _cond is None else ('ON' if _cond else 'off')}", flush=True)
-        if int(os.environ.get("MEM_DECODE_COMPOSITE", "0") or 0) and _splice is not None:
+        if env_int("MEM_DECODE_COMPOSITE") and _splice is not None:
             assert getattr(self, "_comp_applied", 0) > _comp_before, \
                 "MEM_DECODE_COMPOSITE=1 but the splice built at this switch carries no " \
                 "composited anchor, unsupported placement (SLOT / POS=head / full window / " \
@@ -570,7 +575,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
-        assert not int(os.environ.get("MEM_DECODE_THRU", "0") or 0), \
+        assert not env_int("MEM_DECODE_THRU"), \
             "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
             "eviction arithmetic assumes the single anchor of the A->B->A rollout, run it through inference()"
         schedule = [(int(f), int(p)) for f, p in schedule]
@@ -621,7 +626,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 self._fb_store(output, current_start_frame, prev_seg, seg_prompt[prev_seg],
                                conds[prev_seg], subject=seg_subj[prev_seg])
                 # MEM_EPISODIC: freeze the state of a first appearance that will be revisited.
-                if int(os.environ.get("MEM_EPISODIC", "0")) \
+                if env_int("MEM_EPISODIC") \
                         and first_app[seg_subj[prev_seg]] == prev_seg \
                         and seg_subj[prev_seg] in seg_subj[prev_seg + 1:]:
                     self._ttt_snap_by_prompt[seg_subj[prev_seg]] = self._snapshot_ttt()
@@ -676,7 +681,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                   f"anchor {_agg['anchor']:.4f}   (tokens {_ntok} = sink/window/anchor, "
                   f"uniform share of the anchor "
                   f"{_ntok[2] / max(1, sum(_ntok)):.4f})", flush=True)
-            _dump = os.environ.get("MEM_ADD_MASS_DUMP", "").strip()
+            _dump = env_str("MEM_ADD_MASS_DUMP")
             if _dump:
                 os.makedirs(os.path.dirname(_dump) or ".", exist_ok=True)
                 with open(_dump, "w") as _f:

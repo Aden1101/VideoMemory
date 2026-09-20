@@ -1,9 +1,8 @@
 """Re-noising the anchor and denoising it again, to sharpen what the decoder produced."""
-import os
 
 import torch
 
-
+from utils.env import env_float, env_int, env_str
 
 
 class SdeditMixin:
@@ -46,11 +45,11 @@ class SdeditMixin:
         dev = next(self.generator.parameters()).device
         assert frame.shape[1] == 1, \
             f"MEM_SDEDIT sharpens ONE latent frame, got {frame.shape[1]}"
-        nf = int(os.environ.get("MEM_SDEDIT_FRAMES", "0") or 0) or self.num_frame_per_block
+        nf = env_int("MEM_SDEDIT_FRAMES") or self.num_frame_per_block
         x0 = frame.to(device=dev, dtype=torch.bfloat16).repeat(1, nf, 1, 1, 1)
         B = x0.shape[0]
         _g = torch.Generator(device=dev)
-        _g.manual_seed(int(os.environ.get("MEM_SDEDIT_SEED", "5150241") or 5150241)
+        _g.manual_seed(env_int("MEM_SDEDIT_SEED", 5150241)
                        + int(current_start_frame))
         steps = self._sdedit_steps(sigma)
 
@@ -114,11 +113,11 @@ class SdeditMixin:
         return float(F.conv2d(v, k, padding=1).abs().mean())
 
     def _maybe_sdedit(self, frame, cond, current_start_frame):
-        s = float(os.environ.get("MEM_SDEDIT", "0") or 0)
+        s = env_float("MEM_SDEDIT")
         if s <= 0.0:
             return frame
         assert 0.0 < s <= 1.0, f"MEM_SDEDIT must be in (0, 1], got {s}"
-        assert os.environ.get("MEM_DECODE", "").strip(), \
+        assert env_str("MEM_DECODE"), \
             "MEM_SDEDIT sharpens the MEM_DECODE anchor: it needs MEM_DECODE=<decoder ckpt>"
         out = self._sdedit_frame(frame, cond, s, current_start_frame)
         a, b = out.float().flatten(), frame.float().flatten()

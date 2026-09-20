@@ -122,6 +122,12 @@ class StreamingTrainingModel:
         self._twin_on = (self._twin_anchor_on or self.act_weight > 0.0
                        or self.mm_rel_weight > 0.0 or self.mm_ext_weight > 0.0
                        or self.flick_weight > 0.0)
+        # every twin term is computed next to the identity anchor of chunk 0, which is only
+        # built when an identity term is on; without it the whole objective returns zero
+        if self._twin_on and not self._twin_anchor_on and self.id_loss_weight <= 0.0:
+            raise ValueError("act_weight, mm_rel_weight, mm_ext_weight and flick_weight need "
+                             "dnh_weight, adv_loss_weight or id_loss_weight > 0: the twin "
+                             "objective returns zero without the identity anchor those build")
         self._motion_targets = None                                      # {sha1(prompt)[:16]: [m_c0..], "_global": [..]}
         _mt_path = getattr(config, "motion_target_path", None)
         if _mt_path and self._twin_on:
@@ -580,21 +586,11 @@ class StreamingTrainingModel:
                   getattr(p, "flow_cache", None), getattr(p, "prompt_cache", None)):
             if c is not None:
                 _walk(c)
-        ttt = None
-        ttt_ema = None
-        ttt_fifo = None
-        if getattr(p, "ttt_cache", None):
-            # state tuples are replaced per write (never mutated in place) -> keeping refs suffices
-            ttt = [None if getattr(c, "state", None) is None else tuple(c.state) for c in p.ttt_cache]
-            # the EMA buffers are mutable state a chunk mutates -> snapshot them too, else the
-            # mem-OFF twin's buffer writes leak into the real rollout (breaks the counterfactual). Dict
-            # entries are replaced per update (never mutated in place), so a shallow dict() copy suffices.
-            ttt_ema = [dict(getattr(c, "ema", {}) or {}) for c in p.ttt_cache]
-            # eviction feed: the fifo is appended/popped per write chunk ((idx, tensor) tuples,
-            # tensors never mutated in place) -> a shallow list() copy suffices, like the EMA dicts.
-            ttt_fifo = [list(getattr(c, "fifo", []) or []) for c in p.ttt_cache]
+        # fast weights, injection EMA buffers and eviction FIFO: the twin's writes to any of
+        # them would leak into the real rollout and break the counterfactual
+        ttt = [c.snapshot() for c in p.ttt_cache] if getattr(p, "ttt_cache", None) else None
         return {
-            "tensors": tensors, "ttt": ttt, "ttt_ema": ttt_ema, "ttt_fifo": ttt_fifo,
+            "tensors": tensors, "ttt": ttt,
             "has_switched": self.state.get("has_switched", False),
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state(self.device),
@@ -609,13 +605,7 @@ class StreamingTrainingModel:
                 ref.copy_(saved.to(ref.device))
         if snap["ttt"] is not None and getattr(p, "ttt_cache", None):
             for c, s in zip(p.ttt_cache, snap["ttt"]):
-                c.state = s
-        if snap.get("ttt_ema") is not None and getattr(p, "ttt_cache", None):
-            for c, e in zip(p.ttt_cache, snap["ttt_ema"]):
-                c.ema = dict(e)   # fresh dict so later mutations do not touch the snapshot
-        if snap.get("ttt_fifo") is not None and getattr(p, "ttt_cache", None):
-            for c, f in zip(p.ttt_cache, snap["ttt_fifo"]):
-                c.fifo = list(f)  # fresh list so later appends/pops do not touch the snapshot
+                c.restore(s)
         self.state["has_switched"] = snap["has_switched"]
         torch.set_rng_state(snap["rng_cpu"])
         torch.cuda.set_rng_state(snap["rng_cuda"], self.device)
@@ -889,7 +879,7 @@ class StreamingTrainingModel:
     #
     # The four runs behind the README figure turn all of this off and keep DMD alone, because the
     # stack fought the distillation and swept the model between freezing and flickering. With
-    # adv, dnh, act and flick at 0, _twin_on is false and the trainer never even builds the twin
+    # every twin weight at 0, _twin_on is false and the trainer never even builds the twin
     # (make_twin in trainer/distillation.py), so none of the code below runs.
     # -----------------------------------------------------------------------------------------
     def _set_id_anchor(self, chunk):

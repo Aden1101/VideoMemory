@@ -21,6 +21,8 @@ import os
 
 import torch
 
+from utils.env import env_float, env_int, env_str
+
 
 class ReplayPastMixin:
     def _build_replay_window(self, output, current_start_frame, a_end, *, composite=False):
@@ -30,15 +32,14 @@ class ReplayPastMixin:
         appeared, so the anchor frame is `a_end - 1`. `composite=True` keeps only the subject
         region of the replayed tail and takes the border from the current scene.
         """
-        if not int(os.environ.get("REPLAY_PAST", "0")):
+        if not env_int("REPLAY_PAST"):
             return None
-        n = current_start_frame if self.local_attn_size == -1 \
-            else min(self.local_attn_size, current_start_frame)
-        nf = int(os.environ.get("REPLAY_PAST_FRAMES", "0") or 0)
+        n = self._window_frames(current_start_frame)
+        nf = env_int("REPLAY_PAST_FRAMES")
         need = nf if 0 < nf < n else n
         assert a_end is not None and a_end - need >= 0, \
             f"replaying the past needs {need} frames of the first appearance before frame {a_end}"
-        slot_k = int(os.environ.get("REPLAY_PAST_SLOT", "-1") or -1)
+        slot_k = env_int("REPLAY_PAST_SLOT", -1)
         if slot_k >= 0:
             window = output[:, current_start_frame - n:current_start_frame].clone()
             pos = n - 1 - min(slot_k, n - 1)
@@ -70,10 +71,10 @@ class ReplayPastMixin:
         """Add noise of standard deviation `REPLAY_PAST_NOISE` to the replayed frames, keeping
         the root-mean-square level of the latents. Its own generator, so the main random stream
         is untouched and the paired arms keep identical noise."""
-        dose = float(os.environ.get("REPLAY_PAST_NOISE", "0") or 0)
+        dose = env_float("REPLAY_PAST_NOISE")
         if dose <= 0.0 or window is None:
             return window
-        nf_env = int(os.environ.get("REPLAY_PAST_FRAMES", "0") or 0)
+        nf_env = env_int("REPLAY_PAST_FRAMES")
         na = nf_env if 0 < nf_env < window.shape[1] else window.shape[1]
         g = torch.Generator(device=window.device)
         g.manual_seed(987654321 + current_start_frame)
@@ -88,7 +89,7 @@ class ReplayPastMixin:
                              *, timestep_override=None):
         """Refill the kv cache at a switch, with `window` in place of the true recent frames.
         `window=None` gives the plain recache."""
-        blocks_env = os.environ.get("REPLAY_PAST_BLOCKS", "").strip()
+        blocks_env = env_str("REPLAY_PAST_BLOCKS")
         sink0 = os.environ.get("REPLAY_PAST_POS", "") == "sink0"
         assert timestep_override is None or not (blocks_env or sink0), \
             "MEM_ANCHOR_T declares the noise level of the slot the recache writes, so it is " \

@@ -4,7 +4,7 @@ import os
 import torch
 
 from pipeline.switch.anchor_decode import _memdec_pooled_cond
-
+from utils.env import env_float, env_int
 
 
 class FrameBankMixin:
@@ -29,7 +29,7 @@ class FrameBankMixin:
         MEM_DECODE_ROUTED, which borrows the router's decision only. Default
         off on both counts => `_fb_store`/`_fb_select` stay no-ops and every existing arm is
         byte-identical."""
-        return bool(self._fb_mode()) or bool(int(os.environ.get("MEM_DECODE_ROUTED", "0") or 0))
+        return bool(self._fb_mode()) or bool(env_int("MEM_DECODE_ROUTED"))
 
     def _fb_reset(self):
         self._fb_bank = []       # list of {seg, prompt_idx, end_frame, key, frame}
@@ -82,7 +82,7 @@ class FrameBankMixin:
         the event (router_recalled / router_chosen_seg / router_s_max): it is a result of its own,
         not a detail (word routing dies in the generic regime)."""
         mode = mode or self._fb_mode()
-        tau = float(os.environ.get("FRAMEBANK_TAU", "0.90") or 0.90)
+        tau = env_float("FRAMEBANK_TAU", 0.90)
         tie = (os.environ.get("FRAMEBANK_TIE", "recent") or "recent").strip().lower()
         assert tie in ("recent", "first"), f"FRAMEBANK_TIE must be recent|first, got {tie!r}"
         subj = int(prompt_idx if subject is None else subject)

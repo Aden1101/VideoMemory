@@ -3,6 +3,8 @@ import os
 
 import torch
 
+from utils.env import env_str
+
 
 
 # MEM_WRITER: replace the write parameters of the memory cells with ones trained offline, on
@@ -70,7 +72,7 @@ def _memwriter_restore(cm):
 def _memwriter_sync(model):
     """Called once per inference() call, before any write happens. MEM_WRITER empty/unset =>
     no-op (or a restore, if a previous arm of this process had overlaid a writer)."""
-    path = os.environ.get("MEM_WRITER", "").strip()
+    path = env_str("MEM_WRITER")
     cm = _find_causal_model(model)
     applied = getattr(cm, "_memwriter_applied", None) if cm is not None else None
     if not path:
@@ -116,19 +118,9 @@ class MemoryStateMixin:
         to be written, and the injection smoothing buffers. Used to give the memory one slot per
         subject, frozen when a subject leaves the video and restored when it comes back.
 
-        The copies are shallow because the memory always replaces its state rather than editing
-        it in place, so the tensors held here cannot change under us."""
-        return [
-            {
-                "state": None if c.state is None else tuple(c.state),
-                "fifo": list(getattr(c, "fifo", []) or []),
-                "ema": dict(getattr(c, "ema", {}) or {}),
-            }
-            for c in self.ttt_cache
-        ]
+        See TTTBlockCache.snapshot for why a shallow copy is enough."""
+        return [c.snapshot() for c in self.ttt_cache]
 
     def _restore_ttt(self, snap):
         for c, s in zip(self.ttt_cache, snap):
-            c.state = s["state"]
-            c.fifo = list(s["fifo"])
-            c.ema = dict(s["ema"])
+            c.restore(s)

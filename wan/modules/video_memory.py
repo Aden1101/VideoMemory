@@ -72,6 +72,17 @@ class TTTBlockCache:
         # for the twin/BPTT snapshots. Empty and untouched unless eviction_feed is on.
         self.fifo = []
 
+    def snapshot(self):
+        """The cache as it stands, to be handed back to restore(). Shallow on purpose: state
+        tuples, EMA entries and FIFO entries are always replaced, never edited in place, so
+        holding the references is enough and costs no memory."""
+        return (self.state, dict(self.ema), list(self.fifo))
+
+    def restore(self, snap):
+        state, ema, fifo = snap
+        # fresh containers, so later writes to this cache leave the snapshot reusable
+        self.state, self.ema, self.fifo = state, dict(ema), list(fifo)
+
 
 def inv_softplus(x):
     """ Inverse of the softplus function """

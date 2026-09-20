@@ -1208,8 +1208,7 @@ class Trainer:
                 _seed_every = int(getattr(self.config, "train_seed_every", 0))
                 _gen_idx = self.step // max(1, int(getattr(self.config, "dfake_gen_update_ratio", 1)))
                 seed_step = _seed_every > 0 and (_gen_idx % _seed_every == 0)   # every N-th generator step
-                _twin_on = any(float(getattr(self.config, _k, 0.0)) > 0.0
-                             for _k in ("adv_loss_weight", "dnh_weight", "act_weight", "flick_weight"))
+                _twin_on = self.streaming_model._twin_on   # one definition, the model's
                 if getattr(self.config, "id_loss_weight", 0.0) > 0.0 or _twin_on or seed_step:
                     self.streaming_active = False
                     self.start_new_sequence()

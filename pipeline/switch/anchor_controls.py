@@ -3,7 +3,7 @@ import os
 
 import torch
 
-
+from utils.env import env_float, env_int, env_str
 
 
 class AnchorControlsMixin:
@@ -35,8 +35,8 @@ class AnchorControlsMixin:
         grammar, same sharpness, wrong instance. ANCHOR_BLUR_SIGMA blurs
         the true frame instead. Both are off by default => byte-identical to every existing arm."""
         real = output[:, lo:hi]
-        src = os.environ.get("ANCHOR_FROM_FILE", "").strip()
-        sig = os.environ.get("ANCHOR_BLUR_SIGMA", "").strip()
+        src = env_str("ANCHOR_FROM_FILE")
+        sig = env_str("ANCHOR_BLUR_SIGMA")
         assert not (src and sig), "ANCHOR_FROM_FILE and ANCHOR_BLUR_SIGMA are mutually exclusive"
         if src:
             assert hi - lo == 1, f"ANCHOR_FROM_FILE replaces ONE frame, asked for {hi - lo}"
@@ -56,7 +56,7 @@ class AnchorControlsMixin:
         replay splices) so another cell can splice the same frame. Free side-effect, no RNG draw.
         If the file already exists it is checked bitwise instead of rewritten: every
         MEM_ZERO_ALL arm of a given (pair, seed) must produce the same segment A."""
-        path = os.environ.get("ANCHOR_DUMP", "").strip()
+        path = env_str("ANCHOR_DUMP")
         if not path:
             return
         assert a_end is not None and a_end >= 1, "ANCHOR_DUMP before the first switch"
@@ -88,10 +88,10 @@ class AnchorControlsMixin:
     #   MEM_DECODE_SRC=path    use the anchor decoded from ANOTHER video's memory: same decoder,
     #                          same fidelity, same statistics, wrong content.
     def _maybe_wrong_anchor(self, frame):
-        src = os.environ.get("MEM_DECODE_SRC", "").strip()
+        src = env_str("MEM_DECODE_SRC")
         if not src:
             return frame
-        assert float(os.environ.get("MEM_DECODE_NOISE", "0") or 0) <= 0.0, \
+        assert env_float("MEM_DECODE_NOISE") <= 0.0, \
             "MEM_DECODE_SRC and MEM_DECODE_NOISE are two different control arms, not a stack"
         assert os.path.exists(src), f"MEM_DECODE_SRC: no such anchor dump {src}"
         t = torch.load(src, map_location="cpu", weights_only=False)
@@ -108,7 +108,7 @@ class AnchorControlsMixin:
         return out
 
     def _maybe_noise_anchor(self, frame, output, current_start_frame, n):
-        s = float(os.environ.get("MEM_DECODE_NOISE", "0") or 0)
+        s = env_float("MEM_DECODE_NOISE")
         if s <= 0.0:
             return frame
         s = min(s, 1.0)
@@ -120,7 +120,7 @@ class AnchorControlsMixin:
         _g = torch.Generator(device=frame.device)
         # per-cell seed (injected by the driver) so the 24 paired cells do not all share one
         # noise realization; + the switch frame so a scenario with 2 revisits draws twice.
-        _g.manual_seed(int(os.environ.get("MEM_DECODE_NOISE_SEED", "192837465") or 192837465)
+        _g.manual_seed(env_int("MEM_DECODE_NOISE_SEED", 192837465)
                        + current_start_frame)
         eps = torch.randn(frame.shape, generator=_g, device=frame.device, dtype=torch.float32)
         noise = mu + sd * eps
@@ -157,7 +157,7 @@ class AnchorControlsMixin:
         """Returns (window, timestep_override). When the hook is off it returns the window object
         itself and None, so anything already rendered stays reproducible. Draws from its own
         generator, never from the global random stream."""
-        t = float(os.environ.get("MEM_ANCHOR_T", "0") or 0)
+        t = env_float("MEM_ANCHOR_T")
         if t <= 0.0:
             return splice, None
         assert 0.0 < t <= 1000.0, f"MEM_ANCHOR_T must be in (0, 1000], got {t}"
@@ -167,7 +167,7 @@ class AnchorControlsMixin:
         part = splice[:, lo:hi]
         dev = part.device
         _g = torch.Generator(device=dev)
-        _g.manual_seed(int(os.environ.get("MEM_ANCHOR_T_SEED", "77400241") or 77400241)
+        _g.manual_seed(env_int("MEM_ANCHOR_T_SEED", 77400241)
                        + int(current_start_frame))
         eps = torch.randn(part.shape, generator=_g, device=dev, dtype=torch.float32)
         tt = torch.ones([part.shape[0] * part.shape[1]], device=dev, dtype=torch.float32) * t
