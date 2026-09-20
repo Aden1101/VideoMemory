@@ -504,10 +504,10 @@ class CausalWanSelfAttention(nn.Module):
                 k_win = temp_k[:, window_start:local_end_index]
                 v_win = temp_v[:, window_start:local_end_index]
                 if rope_enhance:
-                    # cache dropout: sink_tokens == 0 never ran with rope_enhance before
-                    # (config sink was always > 0; this path crashed on an unbound
-                    # roped_query). Mirror the sink>0 windowed rope with a zero-length sink:
-                    # temp_k holds UNroped keys under rope_enhance, so rope the window here.
+                    # cache dropout reaches this branch with sink_tokens == 0, which no config
+                    # does, so roped_query has to be built here too. Mirror the sink>0 windowed
+                    # rope with a zero-length sink: temp_k holds UNroped keys under
+                    # rope_enhance, so rope the window here.
                     rope_start_f = min(21 - (q.shape[1] // frame_seqlen), current_start_frame)
                     rope_start_f_k_win = max(
                         rope_start_f - (self.max_attention_size // frame_seqlen) + gen_frame, 0)
@@ -606,9 +606,9 @@ class CausalWanAttentionBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
         # parallel memory branch (None = unchanged baseline block)
-        # mem_state_type/mem_linear_beta (P0, ADDITIVE): "swiglu" (default) = the historical
-        # cell, strictly unchanged; "linear_delta" = matrix-state W with the sealed delta
-        # rule (plan 2026-08-07 bras M2), read/write core swapped inside the cell only.
+        # mem_state_type picks the state inside the cell: "swiglu" is the trained fast-weight
+        # MLP, "linear_delta" a single matrix W written by a training-free delta rule. Only the
+        # read/write core differs; the gate, the modulation and the injection are shared.
         self.memory = VideoMemoryLayer(dim=dim, num_heads=1, inter_multi=4,
                                        g_init=gate_init, checkpoint_write=ckpt_write,
                                        gate_extra=gate_extra, use_decay=use_decay,
@@ -697,6 +697,16 @@ class CausalWanAttentionBlock(nn.Module):
             # CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
             # the bf16 round trip between CPU and GPU is exact.
             ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
+        # MEM_REJECT_STREAM=1, a control arm (results/run1_write_current_chunk/eval_R1): remove,
+        # per token, the component of the injection parallel to the residual stream x. That
+        # component is "more of what is already there", the part suspected of damping motion;
+        # only the orthogonal remainder is injected. No renormalisation afterwards, so a read
+        # that is entirely self-similar injects nearly nothing.
+        if int(os.environ.get("MEM_REJECT_STREAM", "0")) != 0:
+            _xh = x.detach().float()
+            _xh = _xh / _xh.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            _m = mem_out.float()
+            mem_out = (_m - (_m * _xh).sum(-1, keepdim=True) * _xh).to(mem_out.dtype)
         x = x + (mem_out.detach() if ttt_update else mem_out)
         if ttt_update:
             # attribute write on a TTTBlockCache object (not a dict key!):this mutation survives the call stack.
@@ -850,7 +860,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6,
-                 memory_layers=(5,),
+                 memory_layers=(),
                  gate_init=0.1,
                  ckpt_write=False,
                  gate_extra=None,

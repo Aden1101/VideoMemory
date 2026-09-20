@@ -414,10 +414,10 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         """Cache surgery at one schedule boundary.
 
         is_revisit=False -> plain switch: no recall hook fires and, with FRAMEBANK
-        off, the call is byte-identical to the legacy first switch.
+        off, the call is byte-identical to the first switch of `inference()`.
         is_revisit=True  -> the entering prompt has been seen before: the recall hooks fire.
         `a_end` = end latent frame (exclusive) of the segment where the entering subject first
-        appeared, i.e. the anchor frame is `a_end - 1`. In the legacy A->B->A rollout that is
+        appeared, i.e. the anchor frame is `a_end - 1`. In the fixed A->B->A rollout of `inference()` that is
         `self._first_switch_frame`, so this is a strict generalization of the block in
         `inference()` (same statements, same order, same tensors).
 
@@ -427,7 +427,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         """
         assert not int(os.environ.get("MEM_DECODE_THRU", "0") or 0), \
             "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
-            "eviction arithmetic assumes the single legacy anchor, run it through inference()"
+            "eviction arithmetic assumes the single anchor of the A->B->A rollout, run it through inference()"
         _splice = None
         _ts_over = None                  # MEM_ANCHOR_T: per-slot declared timestep of the recache
         _comp_before = getattr(self, "_comp_applied", 0)
@@ -561,10 +561,10 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                    conditioning differs but the subject (hence the re-ID reference and the
                    frame-bank ceiling) is the same, and the router has a real matching job.
 
-        Legacy equivalence: schedule [(0, 0), (sw1, 1), (sw2, 0)] with prompts [A, B] reproduces
+        Equivalence with `inference()`: schedule [(0, 0), (sw1, 1), (sw2, 0)] with prompts [A, B] reproduces
         `inference(noise, text_prompts_first=[A], text_prompts_second=[B], switch_frame_index=sw1,
         second_switch_frame_index=sw2)` exactly. The text encoder is called once per
-        schedule entry, in schedule order, exactly the legacy call sequence (A, B, A).
+        schedule entry, in schedule order, which is the call sequence of `inference()` (A, B, A).
         """
         batch_size, num_output_frames, num_channels, height, width = noise.shape
         assert num_output_frames % self.num_frame_per_block == 0
@@ -572,7 +572,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
 
         assert not int(os.environ.get("MEM_DECODE_THRU", "0") or 0), \
             "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
-            "eviction arithmetic assumes the single legacy anchor, run it through inference()"
+            "eviction arithmetic assumes the single anchor of the A->B->A rollout, run it through inference()"
         schedule = [(int(f), int(p)) for f, p in schedule]
         assert schedule and schedule[0][0] == 0, "schedule must start at frame 0"
         for i, (f, p) in enumerate(schedule):
@@ -600,7 +600,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                   f"{'  REVISIT of seg' + str(first_app[seg_subj[i]]) if is_revisit[i] else ''}"
                   f"  '{prompts[p][:60]}'", flush=True)
 
-        # one text-encoder call per schedule entry, in schedule order (legacy call sequence).
+        # one text-encoder call per schedule entry, in schedule order, as `inference()` does.
         conds = [self.text_encoder(text_prompts=[prompts[p]]) for _, p in schedule]
 
         output = self._begin_rollout(

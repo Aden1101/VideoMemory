@@ -177,9 +177,9 @@ def swiglu_fast_weight_gradient(k, v, w0, w1, w2, lr0, lr1, lr2):
 def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps, allreduce_fn=None,
                        decay=None, init_norms=None):
     """ Muon (Newton-Schulz) + fast-weight update.
-    Default (decay=None): LaCT renorm, ascend the Muon'd grad, then renorm each row to its
+    Default (decay=None): LaCT renorm, ascend the Muon'd grad, then renorm each column to its
     pre-update norm (norm conserved, no forgetting; the state only rotates in a fixed-norm shell).
-    Gated-delta (decay/init_norms set): w <- decay*w + muon(grad), then cap each row to its init norm
+    Gated-delta (decay/init_norms set): w <- decay*w + muon(grad), then cap each column to its init norm
     (shrink allowed = explicit forgetting). `allreduce_fn` = LaCT's context-parallel allreduce, on the raw gradients.
     """
     # Remember that the weight norm before the update is applied
@@ -196,7 +196,7 @@ def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps,
     w2_grad = zeropower_via_newtonschulz5(w2_grad, muon_update_steps)
 
     if decay is None:
-        # original: ascend then renorm each row back to its pre-update norm (no forgetting)
+        # ascend, then renorm each column back to its pre-update norm (no forgetting)
         w0 = w0 + w0_grad
         w1 = w1 + w1_grad
         w2 = w2 + w2_grad
@@ -205,7 +205,7 @@ def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps,
         w2 = w2 / (w2.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
         return w0, w1, w2
 
-    # gated-delta: decay (forget) the old state, add the update, cap each row norm to its init norm
+    # gated-delta: decay (forget) the old state, add the update, cap each column norm to its init norm
     d0, d1, d2 = decay
     n0, n1, n2 = init_norms
     w0 = d0 * w0 + w0_grad
@@ -276,7 +276,7 @@ class VideoMemoryLayer(nn.Module):
         detach_state: Optional[bool] = None,  # None -> detach in eval, keep graph in train
         checkpoint_write: bool = False,  # gradient-checkpoint the write update
         gate_extra: Optional[Sequence[str]] = None,  # extra gate inputs (off=[]): "agreement","denoising_step","frames_since_switch"
-        state_type: str = "swiglu",   # P0/M2: "swiglu" (default, strictly the historical cell)
+        state_type: str = "swiglu",   # "swiglu": the fast-weight MLP (w0, w1, w2)
                                       # | "linear_delta" (matrix state W, delta rule on raw h)
         linear_beta: float = 0.5,     # beta of the delta rule
     ):
@@ -286,8 +286,8 @@ class VideoMemoryLayer(nn.Module):
         # state_type="linear_delta" swaps only the state/read/write core of the cell:
         #   state : one matrix W (head_dim x head_dim) per block, init 0, fp32; fp16 or bf16
         #           would change the rounding of the sequential rule;
-        #   write : linear_delta_chunk_update on the raw evicted-chunk tokens (same tokens
-        #           the historical write receives, x_write of the eviction feed), k = h/||h||,
+        #   write : linear_delta_chunk_update on the raw evicted-chunk tokens (the same
+        #           x_write the SwiGLU write receives from the eviction feed), k = h/||h||,
         #           v = h, no qkv projection, no learned parameter, training-free;
         #   read  : o = W @ q for the existing read-path queries q (qkv projection + q_norm),
         #           plugged exactly where swiglu_apply reads today, so the whole downstream
@@ -295,7 +295,7 @@ class VideoMemoryLayer(nn.Module):
         # GPU footprint (nh=1, d=1536, B=1): W fp32 = 1536*1536*4 = 9.44 MB per block
         # (28.3 MB for the 3 deployed blocks; fp16 snapshot 4.72 MB/block, ~14.2 MB/age),
         # vs the SwiGLU state (w0+w1+w2 bf16, inter_multi=4) = 56.6 MB per block (169.9 MB
-        # for 3 blocks): ~6x smaller. The module still owns every historical parameter
+        # for 3 blocks): ~6x smaller. The module still owns every SwiGLU parameter
         # (qkv/lrs/proj/w0/w1/w2/...), so checkpoints load unchanged in both modes.
         assert state_type in ("swiglu", "linear_delta"), f"unknown state_type {state_type!r}"
         if state_type == "linear_delta":
@@ -442,7 +442,7 @@ class VideoMemoryLayer(nn.Module):
         if self.rel_norm:                      # amplitude fix: one chunk-scalar RMS per (b*h). relative
             s = x.float().pow(2).mean(dim=(1, 2), keepdim=True).add(1e-10).sqrt()  # eps inside sqrt: safe backward
             x = (x.float() / s).type_as(x)   # per-token read magnitude survives; write-count growth cancels/chunk
-        elif not self.single_norm:             # legacy: per-token o_norm (erases the read magnitude)
+        elif not self.single_norm:             # per-token o_norm (erases the read magnitude)
             x = self.o_norm(x)
         x = rearrange(x, '(b h) l d -> b l (h d)', h=self.num_heads, b=batch_size)
         if not self.use_modulation:
@@ -457,7 +457,7 @@ class VideoMemoryLayer(nn.Module):
         if self.bounded_mod:                  # bound scale/shift too -> injection amplitude state-independent
             scale, shift = torch.tanh(scale), torch.tanh(shift)
         # rel_norm: the raw (chunk-normed) read is the carrier so amplitude tracks read relevance;
-        # legacy: a_norm re-pins the carrier to unit variance (relevance-decoupled).
+        # otherwise a_norm re-pins the carrier to unit variance (relevance-decoupled).
         carrier = x if self.rel_norm else self.a_norm(x)
         out = gate * (carrier * (1 + scale) + shift)
         # diagnostics on the pre-dc-removal injection (0-dim scalars, no host sync)
@@ -546,12 +546,12 @@ class VideoMemoryLayer(nn.Module):
         if state is None:
             state = self.init_state(B, x.device, q.dtype)
         if getattr(self, "state_type", "swiglu") == "linear_delta":
-            # ---- P0 linear-delta core (additive; the else-branch below is the historical
-            # path, untouched). read, apply-first, plugged exactly where swiglu_apply reads:
+            # ---- linear-delta core; the else-branch below is the SwiGLU core. Read,
+            # apply-first, plugged exactly where swiglu_apply reads:
             # o_i = W @ q_i for the existing read-path queries q (fp32 matmul with the fp32
             # state, cast back to the compute dtype so everything downstream, gate, modulation
             # and injection, is unchanged). write: delta rule on the raw tokens of
-            # the same chunk the historical write receives (x_write of the eviction feed,
+            # the same chunk the SwiGLU write receives (x_write of the eviction feed,
             # else the current chunk). k/v/lr* of the qkv projection are unused by the rule.
             assert allreduce_fn is None, "linear_delta: context-parallel write not supported"
             (W,) = state
@@ -589,13 +589,13 @@ class VideoMemoryLayer(nn.Module):
         self.dbg_out_rms = out.detach().float().pow(2).mean().sqrt()
         return out, new_state
 
-    # ---- memory 2.0 write-replay (offline writer training), additive, step() untouched ----
+    # ---- write-replay: the write alone, for offline replays of a rollout's write chain ----
     def write_only(self, x_write, state, allreduce_fn=None, use_checkpoint=None, grad_fn=None,
                    micro_batch=None):
         """One fast-weight write: state -> new state from the evicted-chunk hidden x_write.
 
         Exactly the do_update branch of step() with x_write given, factored out so the
-        write-replay trainer (memory 2.0) can re-run the write chain offline on collected h
+        offline write-replay can re-run the write chain on collected h
         sequences and get bitwise the same states as the in-situ rollout
         Parity contract:
           - `_qkv_lr(x_write)` is reused as is: the qkv projection stays one fused matmul
@@ -611,17 +611,16 @@ class VideoMemoryLayer(nn.Module):
         use_checkpoint: None -> self.checkpoint_write (the config flag, same as step());
         the checkpoint branch is only taken when grads are enabled, so a no_grad replay
         follows the exact same code path as no_grad inference.
-        grad_fn (additive, diagnostic only, registry section "arm MLP-CORRECTEUR", 07/08):
-        the inner-loop gradient function, with the exact signature of
+        grad_fn (diagnostic replays only): the inner-loop gradient function, with the exact signature of
         `swiglu_fast_weight_gradient` (k, v, w0, w1, w2, lr0, lr1, lr2) -> (g0, g1, g2).
         None (the default, and the only value any training/inference path ever passes) calls
-        `swiglu_fast_weight_gradient` itself, so the default write is bitwise the historical
-        one, calling the same function object through a local name changes nothing.
+        `swiglu_fast_weight_gradient` itself, so the default write is bitwise the write of
+        step(): calling the same function object through a local name changes nothing.
         This exists so an offline replay can swap the write objective (error-correcting
         variant) without duplicating a single line of the parity contract above.
-        micro_batch (additive, diagnostic only, registry "plan FACTORIEL", 07/08): None (the
+        micro_batch (diagnostic replays only): None (the
         default, and the only value any training/inference path ever passes) = one update on
-        the whole chunk, bitwise the historical write. An int m > 0 makes the write sequential:
+        the whole chunk, bitwise the write of step(). An int m > 0 makes the write sequential:
         the chunk's tokens are consumed in slices of m in their natural index order, each slice
         seeing the state left by the previous ones. Invariants deliberately preserved so that
         only the update schedule changes:
@@ -634,7 +633,7 @@ class VideoMemoryLayer(nn.Module):
             intermediate state is a real state (the next slice reads it), so it must be valid.
         No gradient checkpointing on this path: it is an offline no_grad diagnostic replay.
         Returns the new (w0, w1, w2) tuple. Nothing on the module is mutated."""
-        # P0 guard: this is the SwiGLU write-replay path; the linear_delta state replays
+        # this is the SwiGLU write-replay path; the linear_delta state replays
         # offline, by replaying the rule on the stored tokens, never through here.
         assert getattr(self, "state_type", "swiglu") == "swiglu", \
             f"write_only is undefined for state_type={self.state_type!r}"
@@ -676,7 +675,7 @@ class VideoMemoryLayer(nn.Module):
 def replay_writes(layer, h_seq, detach_state=False, state=None, detach_init=True,
                   n_bptt_writes=None, use_checkpoint=None, allreduce_fn=None,
                   return_all=False, grad_fn=None, micro_batch=None):
-    """Differentiable write-replay (memory 2.0): re-run a cell's whole write sequence on an
+    """Differentiable write-replay: re-run a cell's whole write sequence on an
     ordered list of evicted-chunk hiddens, offline, keeping the graph toward the write
     parameters (qkv, k_norm, lrs, decay_logit).
 
@@ -699,15 +698,15 @@ def replay_writes(layer, h_seq, detach_state=False, state=None, detach_init=True
             the first in-situ write pass (state is None until the first write pass, which
             initializes it from the w0/w1/w2 init parameters).
         detach_init: detach the initial state from the w0/w1/w2 init parameters (True =
-            phase A/B, w-inits frozen; False = phase C, gradient flows into the inits).
+            the inits stay frozen; False = the gradient flows into them).
         n_bptt_writes: truncated BPTT, only the last n writes build a graph, older writes
             run under no_grad (stop-gradient at the boundary). The forward is unchanged, so
-            bitwise parity with inference is preserved (design 1.4 mitigation 3). None =
+            bitwise parity with inference is preserved. None =
             full BPTT. 0 = pure forward.
         use_checkpoint: per-write gradient checkpointing; None -> layer.checkpoint_write.
         return_all: also return the list of states, one per write.
-        grad_fn, micro_batch: forwarded verbatim to write_only; None (default) = the historical
-            write objective and the historical one-step schedule, bitwise (see write_only's
+        grad_fn, micro_batch: forwarded verbatim to write_only; None (default) = the write
+            objective and the one-step schedule of step(), bitwise (see write_only's
             docstring). Diagnostic replays only.
 
     Returns: final (w0, w1, w2), or (final, [per-write states]) if return_all."""

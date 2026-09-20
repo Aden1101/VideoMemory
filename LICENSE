@@ -1,0 +1,10 @@
+Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+
+This repository is a fork of Anchor-Forcing (https://github.com/vivoCameraResearch/Anchor-Forcing)
+and inherits its license. Unless a file says otherwise, its content is licensed under
+CC BY-NC-SA 4.0. The full legal text is at:
+
+    https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
+
+Files that carry their own license header (the Apache-2.0 headers inherited from upstream)
+remain under the license that header names.

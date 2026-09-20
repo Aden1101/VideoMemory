@@ -1208,9 +1208,9 @@ class Trainer:
                 _seed_every = int(getattr(self.config, "train_seed_every", 0))
                 _gen_idx = self.step // max(1, int(getattr(self.config, "dfake_gen_update_ratio", 1)))
                 seed_step = _seed_every > 0 and (_gen_idx % _seed_every == 0)   # every N-th generator step
-                _e3_on = any(float(getattr(self.config, _k, 0.0)) > 0.0
+                _twin_on = any(float(getattr(self.config, _k, 0.0)) > 0.0
                              for _k in ("adv_loss_weight", "dnh_weight", "act_weight", "flick_weight"))
-                if getattr(self.config, "id_loss_weight", 0.0) > 0.0 or _e3_on or seed_step:
+                if getattr(self.config, "id_loss_weight", 0.0) > 0.0 or _twin_on or seed_step:
                     self.streaming_active = False
                     self.start_new_sequence()
                 # seed steps also grad chunk 0 -> more grad chunks; normalize each per-chunk backward so
@@ -1222,7 +1222,7 @@ class Trainer:
                     _used += 1
                     rg = (_k >= K_bptt - W) or (seed_step and _k == 0)   # +chunk 0 on seed steps
                     # build the mem-OFF counterfactual twin only for the last (grad-tail) chunk
-                    _mk_twin = (rg and _k == K_bptt - 1 and _e3_on)
+                    _mk_twin = (rg and _k == K_bptt - 1 and _twin_on)
                     _gc, _ci = self.streaming_model.generate_next_chunk(
                         requires_grad=rg, detach_state=(_k == K_bptt - W),
                         keep_last_write_grad=(rg and _k < K_bptt - 1 and _k + 1 > K_bptt - W),
@@ -1378,7 +1378,7 @@ class Trainer:
             alloc = torch.cuda.max_memory_allocated() / 2**30
             reserved = torch.cuda.max_memory_reserved() / 2**30
             if not dist.is_initialized() or dist.get_rank() == 0:
-                print(f"[VRAM_PROFILE] layers={getattr(self.config, 'model_kwargs', {}).get('memory_layers', [5])} "
+                print(f"[VRAM_PROFILE] layers={getattr(self.config, 'model_kwargs', {}).get('memory_layers', [])} "
                       f"train_write={getattr(self.config, 'train_write', False)} "
                       f"alloc_GiB={alloc:.2f} reserved_GiB={reserved:.2f}", flush=True)
             if dist.is_initialized():
@@ -1602,10 +1602,10 @@ class Trainer:
                         # counterfactual-objective terms (dose/dnh/motion-match), logged every
                         # generator step so act_floor is calibratable and mm_ext/motion is observable
                         for _k, _v in generator_log_dict.items():
-                            if _k.startswith("e3_"):
+                            if _k.startswith("twin_"):
                                 try:
                                     _val = _v.mean().item() if hasattr(_v, "mean") else float(_v)
-                                    self.writer.add_scalar(f"e3/{_k}", _val, self.step)
+                                    self.writer.add_scalar(f"twin/{_k}", _val, self.step)
                                 except Exception:
                                     pass
 

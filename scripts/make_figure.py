@@ -2,9 +2,7 @@
 """README figure: the two metrics against the training step, one column per run.
 
 The training step is on the x axis, so time reads left to right and the reader needs no
-arrowheads or start/end labels to know which way a run went. An earlier version plotted
-identity against motion, with the checkpoints joined in order; neither axis was time, so the
-path folded back on itself and the lines crossed for no reason the data supports.
+arrowheads or start/end labels to know which way a run went.
 
 Top row is identity, bottom row is motion, sharing a y scale across the row so the four runs
 are comparable. The dashed line in each panel is that run's own unmodified-model reference,
@@ -13,6 +11,12 @@ which is why panel 4's sits lower: it starts from a different fine-tune.
 Each run was also evaluated with an EMA checkpoint and at 480 frames. Those are different
 evaluation settings of the same step, not different steps, so mixing them into one line makes
 it meaningless. Only the plain eval<step>[_sink1] series is drawn.
+
+The sink size is not the same everywhere, and the panels say so. Run 1 was evaluated with 3
+sink frames, runs 2 to 4 with 1. The unmodified-model reference was generated once per
+starting fine-tune, with 3 sink frames. So within a panel the two arms are comparable
+everywhere, but in panels 2 to 4 they pay a sink handicap the dashed line does not: measured on
+run 1 at step 1250, going from sink 3 to sink 1 costs 0.06 to 0.09 of identity.
 
 Reads results/*/eval*/metrics.txt directly, so the figure comes from the
 measured numbers and never from a hand-copied table.
@@ -38,9 +42,12 @@ RUNS = [("run1_write_current_chunk", "1. writes the frames\nit is generating"),
         ("run2_write_evicted_chunk", "2. writes the frames\njust forgotten"),
         ("run3_write_evicted_stable", "3. same, plus the\nstability fixes"),
         ("run4_from_longlive_lora", "4. same, from the\nprevious fine-tune")]
+# sink frames the two arms were evaluated with; the reference line is sink 3 in every panel
+ARM_SINK = {"run1_write_current_chunk": 3, "run2_write_evicted_chunk": 1,
+            "run3_write_evicted_stable": 1, "run4_from_longlive_lora": 1}
 KEEP = re.compile(r"^eval(\d+)(_sink1)?$")      # plain series only: no _ema, no _480, no _msc05
-# One shape throughout: round dots on a line, told apart by colour. Mixing marker shapes
-# made the legend something to decode before the chart could be read.
+# One shape throughout: round dots on a line, told apart by colour, so the legend has nothing
+# to decode.
 C = {"memon": "#2a78d6", "memzero": "#eb6834", "stock": "#1baf7a"}
 INK, INK2, MUTED, LINE = "#0b0b0b", "#52514e", "#8a8880", "#dedad3"
 
@@ -65,7 +72,10 @@ def load(run):
             if g:
                 dd = dict(zip(("memon", "memzero", "stock"), map(float, g.groups())))
         if ident and dd:
-            out[int(m.group(1))] = (ident, dd)          # keyed by step -> deduplicated
+            # One point per step. Run 2 has step 500 at both sink settings; directories are
+            # visited in sorted order, so eval500_sink1 replaces eval500 and the line stays
+            # at sink 1 throughout.
+            out[int(m.group(1))] = (ident, dd)
     return [(s, *out[s]) for s in sorted(out)]
 
 
@@ -75,8 +85,13 @@ fig.patch.set_facecolor("#ffffff")
 ROWS = [(1, "identity kept\n(DINO, first vs last frame)"),      # index into (step, ident, dd)
         (2, "motion\n(VBench dynamic degree)")]
 
+ALL = {run: load(run) for run, _ in RUNS}
+# The headline is the arm-against-arm gap, the one comparison that holds in every panel.
+gaps = [i["memon"] - i["memzero"] for pts in ALL.values() for _, i, _ in pts]
+n_lower = sum(g < 0 for g in gaps)
+
 for col, (run, label) in enumerate(RUNS):
-    pts = load(run)
+    pts = ALL[run]
     steps = [p[0] for p in pts]
     for row, (idx, ylab) in enumerate(ROWS):
         ax = axes[row][col]
@@ -101,11 +116,16 @@ for col, (run, label) in enumerate(RUNS):
         if col == 0:
             ax.set_ylabel(ylab, fontsize=9.5, color=INK2, labelpad=8)
     axes[0][col].set_title(label, fontsize=10.5, color=INK, fontweight="bold",
-                           loc="left", pad=10, linespacing=1.35)
+                           loc="left", pad=22, linespacing=1.35)
+    note = (f"arms at sink {ARM_SINK[run]}" if ARM_SINK[run] == 3
+            else f"arms at sink {ARM_SINK[run]}, reference at sink 3")
+    axes[0][col].text(0.0, 1.035, note, transform=axes[0][col].transAxes,
+                      fontsize=8.5, color=MUTED, ha="left", va="bottom")
 
 axes[0][0].set_ylim(0.20, 0.85)
 axes[1][0].set_ylim(-0.05, 1.10)
-fig.suptitle("No run beats the unmodified model on both metrics at once",
+fig.suptitle(f"Memory on scores lower identity than memory off at {n_lower} of {len(gaps)} "
+             f"checkpoints (mean gap {sum(gaps) / len(gaps):+.2f})",
              fontsize=14, color=INK, fontweight="bold", x=0.012, ha="left", y=0.975)
 fig.text(0.5, 0.055, "training step", fontsize=10, color=INK2, ha="center")
 fig.legend(handles=[
@@ -113,20 +133,22 @@ fig.legend(handles=[
            markeredgecolor="#ffffff", markersize=6, lw=1.8, label="memory active"),
     Line2D([], [], marker="o", color=C["memzero"], markerfacecolor=C["memzero"],
            markeredgecolor="#ffffff", markersize=6, lw=1.8, label="memory zeroed"),
-    Line2D([], [], color=C["stock"], ls=(0, (5, 3)), lw=1.5, label="unmodified model")],
+    Line2D([], [], color=C["stock"], ls=(0, (5, 3)), lw=1.5,
+           label="unmodified model (sink 3)")],
     loc="lower center", ncol=3, frameon=False, fontsize=10, labelcolor=INK2,
     handletextpad=.7, columnspacing=3.0, bbox_to_anchor=(0.5, -0.005))
 
 fig.tight_layout(rect=[0.005, 0.085, 1, 0.925])
 fig.savefig("assets/motion_identity.png", facecolor="#ffffff", bbox_inches="tight")
 
-# The title is a claim about the data, so check it. "Beats on both metrics" means strictly
-# better on identity AND on motion than this run's own unmodified reference. Single-metric
-# wins do exist and are visible in the figure: run 1 ends above its identity line, having
-# given up a third of its motion to get there.
+# The README also says no arm matches its reference on both metrics at once, so check it.
+# Single-metric wins exist and are visible: run 1's memory-zeroed arm ends above its identity
+# line, with a third fewer clips rated dynamic. For runs 2 to 4 this check is lenient on
+# identity, since the arms are at sink 1 and the reference at sink 3, and nearly unfalsifiable
+# on motion for runs 1 to 3, whose reference sits at the 0.99 ceiling.
 beaten = []
 for run, _ in RUNS:
-    pts = load(run)
+    pts = ALL[run]
     sx, sy = pts[0][2]["stock"], pts[0][1]["stock"]
     for step, i, d in pts:
         for arm in ("memon", "memzero"):
@@ -134,5 +156,7 @@ for run, _ in RUNS:
                 beaten.append((run, step, arm))
     print(f"{run:14} {len(pts)} checkpoints : {[s for s, _, _ in pts]}  "
           f"reference ({sx:.3f}, {sy:.3f})")
-assert not beaten, f"the title is false, these points beat their reference: {beaten}"
-print("\ntitle verified: no arm is above AND right of its own reference")
+assert not beaten, f"these points match or beat their reference on both metrics: {beaten}"
+print(f"\nno arm is at or above its own reference on both metrics; "
+      f"memon < memzero on identity at {n_lower}/{len(gaps)} checkpoints, "
+      f"mean gap {sum(gaps) / len(gaps):+.4f}")

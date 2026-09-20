@@ -101,7 +101,7 @@ class WanTextEncoder(torch.nn.Module):
         return self._resident_device
 
     def encode(self, text_prompts: List[str]) -> torch.Tensor:
-        """The actual encoding, cache-free. This is the historical body of `forward`."""
+        """The actual encoding, cache-free; `forward` wraps it with the prompt cache."""
         self._build()
         ids, mask = self.tokenizer(
             text_prompts, return_mask=True, add_special_tokens=True)
@@ -208,7 +208,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             local_attn_size=-1,
             sink_size=0,
             use_gan=False,
-            memory_layers=(5,),
+            memory_layers=(),
             gate_init=0.1,
             ckpt_write=False,
             gate_extra=None,
@@ -223,7 +223,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             mem_stream_scale=0.0,
             ema_alpha=0.0,
             eviction_feed=False,
-            mem_state_type="swiglu",   # P0: "linear_delta" = matrix-state delta-rule memory
+            mem_state_type="swiglu",   # or "linear_delta": matrix state, training-free delta rule
             mem_linear_beta=0.5
     ):
         super().__init__()

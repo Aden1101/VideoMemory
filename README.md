@@ -8,8 +8,8 @@ Upstream's README is kept at [`UPSTREAM_README.md`](UPSTREAM_README.md).
 
 ## The problem
 
-The model generates 3 latent frames at a time and attends to a rolling window of 12 frames plus
-3 pinned sink frames. Everything older is evicted. Identity is long-range information, so once
+The model generates 3 latent frames at a time and attends to 12 frames: 3 pinned sink frames
+and a rolling window of 9. Everything older is evicted. Identity is long-range information, so once
 the subject established at second 0 leaves the window, only the prompt constrains it, and the
 prompt gives a category ("a woman in a red coat"), never the instance. Those attributes drift.
 
@@ -24,7 +24,7 @@ chunk t                    chunk t+1
    │                          │
    ▼                          ▼
 ┌────────────────────────────────────────┐
-│  KV cache   [ sink ×3 | window ×12 ]   │  FIFO, oldest chunk evicted
+│  KV cache   [ sink ×3 | window ×9 ]    │  FIFO, oldest chunk evicted
 └────────────────────────────────────────┘
                  │ evicted chunk  (what attention can no longer see)
                  ▼
@@ -56,7 +56,8 @@ Training compares each chunk against a counterfactual twin of itself: the same c
 regenerated with the memory switched off, sharing history, KV cache and noise, so the only
 difference between the two is the injection. `model/streaming_training.py` builds that twin and
 scores four terms against it. Identity may not get worse, motion must match, and the injection
-must be measurably non-zero.
+must be measurably non-zero. All four terms are weighted zero in the runs reported below, which
+are plain DMD; the twin is there to be read, not to explain the figure.
 
 ## Result
 
@@ -67,26 +68,48 @@ dashed line is that run's own unmodified model. The four share everything except
 titles name: same frozen backbone, same LoRA co-training, and the same objective, plain DMD
 distillation with every extra loss term in the codebase weighted zero. Run 4 differs from run 3
 by one line of config, the fine-tune it starts from, which is why its reference sits lower. Six
-prompts per point, one seed; EMA and 480-frame evaluations are left out so each line is one
-comparable series.
+prompts per point, one seed, no repeat, so there is no noise estimate. One point per step; EMA
+and 480-frame evaluations are left out, and where a step was evaluated at two sink sizes the
+sink-1 measurement is the one drawn.
 
-The memory does not beat attention plus sink. Training costs motion: in runs 1 to 3 both arms
-fall under the motion reference, and turning the memory on does not buy identity back. Where
-motion does come back, run 2 at step 1250, identity has collapsed to 0.36. Run 1 ends above its
-identity reference with a third less motion, which is what a near-frozen video scores. Run 4
-keeps more motion than its own reference and still loses identity.
+The two arms of a panel are always comparable. The dashed line is not, in panels 2 to 4: the
+reference was generated once, with 3 sink frames, while those arms were evaluated with 1. Run 1
+has both measurements at step 1250, and going from sink 3 to sink 1 costs 0.06 to 0.09 of
+identity, the size of the effects below. So the conclusions rest on memory active against memory
+zeroed; against the reference, only run 1 is a fair comparison.
 
-The reason generalises. The training objective (chunk-local DMD) and the usual metrics reward
-the same thing, temporal self-similarity, so a learnable memory converges to a freeze or to a
-constant-bias degeneracy that the dashboard scores as healthy. The leftmost points above are
-frozen videos, and VBench still rates their subject consistency at 0.93.
+The memory does not help. With it active, identity is lower than with it zeroed at 10 of the 15
+checkpoints, by 0.07 on average. Training costs motion: in runs 1 to 3 both arms fall under the
+motion reference, memory or not, so that cost belongs to the continued training and not to the
+memory. Where motion does come back, run 2 at step 1250, identity with the memory active has
+collapsed to 0.36. In run 1, the one fair comparison to the reference, the only arm that ends
+above it on identity is the memory-zeroed one (0.773 against 0.743), with a third fewer clips
+rated dynamic; with the memory active identity is 0.667 and dynamic degree 0.23, a near-frozen
+video. Run 4 keeps more motion than its reference, and the memory still lowers identity there at
+two checkpoints out of three.
 
-Controls matter here: an anchor decoded from a different video helps as much as the right one,
-which is how the apparent gain turned out never to have been content-driven.
+The likely reason, for this write rule, this objective and this backbone, which is all that
+was tested: chunk-local DMD and the usual metrics reward the same thing, temporal
+self-similarity, so a learnable memory converges to a freeze or to a constant-bias degeneracy
+that the dashboard scores as healthy. The frozen checkpoints show it: run 1 at step 1250 and
+run 2 at step 750 have a dynamic degree of 0.23 and 0.24, and VBench rates their subject
+consistency at 0.97 and 0.98, above the unmodified model's 0.95.
+
+A second line of work, in `pipeline/switch/`, tests recall directly. The prompt switches from
+subject A to B and back to A, and at the return the model is handed an anchor: one latent frame
+of A's first appearance, real or decoded from the memory state. Controls matter here: an anchor
+taken from a different video helps as much as the right one, which is how the apparent gain
+turned out never to have been content-driven.
 
 One lead is still open. A training-free delta write rule reads the subject out of the state
 where the deployed rule does not: median 13.5/19 against 7.0 over 10 seeds, with a background
-control at chance.
+control at chance. The score counts, out of 19 video pairs with a clearly distinct subject, how
+many the state tells apart in a two-way choice, so chance is 9.5; it is read offline from
+replayed states (`write_only` and `replay_writes` in `wan/modules/video_memory.py` are that
+replay's interface). The two distributions barely overlap (11 to 16 against 6 to 10), but the
+delta rule's median sits just under the 14/19 a single seed needs to be significant. The probe
+scripts ran on the training cluster and are not in this repository, so these numbers cannot be
+reproduced from here.
 
 ## Running it
 
@@ -97,9 +120,20 @@ AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path 
 ```
 
 That config runs the unmodified model. The four training runs behind the figure have their
-configs under `configs/runs/`, and their measurements under `results/`. Always declare
-`memory_layers` explicitly, because the model default is a memory branch whose weights are in
-no checkpoint.
+configs under `configs/runs/`, and their measurements under `results/`.
+
+Each table under `results/` comes from four steps on one checkpoint, six held-out prompts,
+seed 42, 240 latent frames:
+
+1. generate with the memory active;
+2. generate again with `MEM_ZERO_ALL=1`, same config, which zeroes the injection and nothing else;
+3. run VBench (subject consistency, background consistency, dynamic degree) on both, and on
+   the unmodified model's videos, which are generated once and reused;
+4. `python scripts/eval_metrics.py`, which adds the DINO first-to-last identity, the lag-1 and
+   lag-2 motion and the paired distances, and writes `metrics.txt`.
+
+The driver that chained these on the cluster is not included; `results/README.md` says what is
+comparable to what.
 
 Two passes because the text encoder (11.4 GB) and the generator do not fit in memory together on
 a consumer machine: pass 1 encodes and exits, pass 2 never loads the encoder. Training needs
@@ -107,7 +141,7 @@ CUDA and two 48 GB cards.
 
 Runs on CUDA, Apple Metal and CPU. On CUDA every device call delegates to the original
 `torch.cuda` one, so no previously measured number moves. `tests/test_device.py` checks that by
-reimplementing the pre-patch rotary embedding and demanding bitwise equality.
+reimplementing upstream's rotary embedding and demanding bitwise equality.
 
 ```bash
 python tests/test_device.py            # device layer
@@ -119,4 +153,4 @@ python tests/test_inference_smoke.py   # real model, streaming, no weights neede
 The base import (`392b3f8`) is an unmodified copy of upstream `vivoCameraResearch/Anchor-Forcing`.
 The backbone, the DMD distillation and the streaming pipeline are theirs. Everything after that
 commit is this work: the memory cell, its write rules, the training objectives and the
-evaluation code. License CC BY-NC-SA 4.0, inherited from upstream.
+evaluation code. License CC BY-NC-SA 4.0, inherited from upstream; see [`LICENSE`](LICENSE).

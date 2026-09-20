@@ -108,9 +108,9 @@ class StreamingTrainingModel:
         # relu => zero gradient once satisfied: a floor, never a maximizer.
         self.act_weight = getattr(config, "act_weight", 0.0)
         self.act_floor = getattr(config, "act_floor", 0.05)              # relative AC-dose target (calibrate)
-        # anti-flicker (all defaults reproduce the previous objective exactly):
+        # anti-flicker (every default leaves the objective as it is without them):
         #  - motion_lag2: use the flicker-blind lag-2 motion statistic in mm_rel/mm_ext + the dose,
-        #    so frame-rate shimmer no longer counterfeits motion credit (removes the flicker payer).
+        #    so frame-rate shimmer cannot counterfeit motion credit (removes the flicker payer).
         #  - dose_tmean_remove: also subtract the per-site temporal mean in the AC-dose, so a static
         #    overlay (wallpaper) earns zero dose (escalation named in the docstring).
         #  - flick_weight/flick_deadband: latent second-temporal-difference hinge vs the twin (tripwire).
@@ -118,13 +118,13 @@ class StreamingTrainingModel:
         self.dose_tmean_remove = bool(getattr(config, "dose_tmean_remove", False))
         self.flick_weight = getattr(config, "flick_weight", 0.0)
         self.flick_deadband = getattr(config, "flick_deadband", 0.25)    # relative to the twin's roughness
-        self._e3_anchor_on = (self.adv_loss_weight > 0.0 or self.dnh_weight > 0.0)
-        self._e3_on = (self._e3_anchor_on or self.act_weight > 0.0
+        self._twin_anchor_on = (self.adv_loss_weight > 0.0 or self.dnh_weight > 0.0)
+        self._twin_on = (self._twin_anchor_on or self.act_weight > 0.0
                        or self.mm_rel_weight > 0.0 or self.mm_ext_weight > 0.0
                        or self.flick_weight > 0.0)
         self._motion_targets = None                                      # {sha1(prompt)[:16]: [m_c0..], "_global": [..]}
         _mt_path = getattr(config, "motion_target_path", None)
-        if _mt_path and self._e3_on:
+        if _mt_path and self._twin_on:
             import json as _json
             with open(_mt_path) as _f:
                 self._motion_targets = _json.load(_f)
@@ -889,7 +889,7 @@ class StreamingTrainingModel:
     #
     # The four runs behind the README figure turn all of this off and keep DMD alone, because the
     # stack fought the distillation and swept the model between freezing and flickering. With
-    # adv, dnh, act and flick at 0, _e3_on is false and the trainer never even builds the twin
+    # adv, dnh, act and flick at 0, _twin_on is false and the trainer never even builds the twin
     # (make_twin in trainer/distillation.py), so none of the code below runs.
     # -----------------------------------------------------------------------------------------
     def _set_id_anchor(self, chunk):
@@ -897,7 +897,7 @@ class StreamingTrainingModel:
         chunk. Uses the head frames (highest prompt fidelity, last to degrade under collapse) so the
         anchor is a real subject; supervised chunks compare their tail frames, so id_cos=1.0 becomes a
         genuine static-video alarm instead of a vacuous garbage-vs-garbage fixed point."""
-        if self.id_loss_weight <= 0.0 and not self._e3_anchor_on:
+        if self.id_loss_weight <= 0.0 and not self._twin_anchor_on:
             return
         k = max(1, int(self.id_decode_frames))
         with torch.no_grad():
@@ -977,11 +977,11 @@ class StreamingTrainingModel:
         - The twin is no-grad and shares history + KV + noise: the only differential lever is the
           memory injection during this chunk; nothing can be earned by degrading the baseline, and
           the paired design cancels prompt/noise variance.
-        - nothing pays for identity self-similarity anymore (id_loss removed, reward off): freeze has
+        - nothing pays for identity self-similarity (no id_loss, reward off): freeze has
           no payer, and mm_rel/mm_ext punish it; a frozen chunk also zeroes the dnh hinge trivially,
           so freeze buys nothing that neutrality does not already buy, at strictly higher mm cost.
         - The activity floor is a RELU: zero gradient once D_ac >= act_floor -> a floor, never a
-          maximizer -> no runaway (contrast: e2_amp's rel_norm pinned a fixed dose at every chunk;
+          maximizer -> no runaway (contrast: rel_norm alone pins a fixed dose at every chunk;
           here the floor only forbids ~zero dose, the envelope bounds it above, and D_ac's mean
           removal forbids satisfying it with the resurrected DC bias).
         - Under the box {identity not-worse, motion matched, DMD on-manifold, dose >= floor}, the
@@ -993,12 +993,12 @@ class StreamingTrainingModel:
         device = chunk.device
         _z = lambda: torch.zeros((), device=device)
         log = {
-            "e3_adv_loss": _z(), "e3_adv_raw": _z(), "e3_gate": _z(),
-            "e3_dnh": _z(), "e3_act": _z(), "e3_dose": _z(),
-            "e3_mm_rel": _z(), "e3_mm_ext": _z(), "e3_flick": _z(),
-            "e3_cos_on": torch.ones((), device=device), "e3_cos_cf": torch.ones((), device=device),
-            "e3_motion_on": _z(), "e3_motion_cf": _z(), "e3_motion_tgt": _z(),
-            "e3_active": _z(), "e3_oom_skip": _z(),
+            "twin_adv_loss": _z(), "twin_adv_raw": _z(), "twin_gate": _z(),
+            "twin_dnh": _z(), "twin_act": _z(), "twin_dose": _z(),
+            "twin_mm_rel": _z(), "twin_mm_ext": _z(), "twin_flick": _z(),
+            "twin_cos_on": torch.ones((), device=device), "twin_cos_cf": torch.ones((), device=device),
+            "twin_motion_on": _z(), "twin_motion_cf": _z(), "twin_motion_tgt": _z(),
+            "twin_active": _z(), "twin_oom_skip": _z(),
         }
         twin = chunk_info.get("twin_new_frames")
         chunk_start_frame = chunk_info["chunk_start_frame"]
@@ -1009,7 +1009,7 @@ class StreamingTrainingModel:
         new_real = chunk[:, ov:]                        # newly generated frames only (grad); twin spans
         # the same global frames and is decode-comparable (no first-frame re-encode contamination)
         # lag-2 (frame-rate-blind) motion statistic: frame-rate alternation contributes ~0 to a
-        # lag-2 delta while smooth motion contributes fully, so the memory can no longer counterfeit
+        # lag-2 delta while smooth motion contributes fully, so the memory cannot counterfeit
         # motion credit with shimmer. Falls back to the first difference when the flag is off or the
         # chunk is too short for a lag-2 window. (motion_targets.json must be regenerated to match.)
         if getattr(self, "motion_lag2", False) and new_real.shape[1] >= 3:
@@ -1085,15 +1085,15 @@ class StreamingTrainingModel:
                 + self.flick_weight * flick
                 + self.adv_loss_weight * (-adv))
         log.update({
-            "e3_adv_loss": (self.adv_loss_weight * (-adv)).detach(),
-            "e3_adv_raw": A.detach(), "e3_gate": gate.detach(),
-            "e3_dnh": dnh.detach(), "e3_act": act.detach(), "e3_dose": dose.detach(),
-            "e3_mm_rel": mm_rel.detach(), "e3_mm_ext": mm_ext.detach(),
-            "e3_flick": flick.detach(),
-            "e3_cos_on": cos_on.detach(), "e3_cos_cf": cos_cf.detach(),
-            "e3_motion_on": m_on.detach(), "e3_motion_cf": m_cf.detach(),
-            "e3_motion_tgt": (m_tgt.detach() if m_tgt is not None else m_cf.detach()),
-            "e3_active": torch.ones((), device=device),
+            "twin_adv_loss": (self.adv_loss_weight * (-adv)).detach(),
+            "twin_adv_raw": A.detach(), "twin_gate": gate.detach(),
+            "twin_dnh": dnh.detach(), "twin_act": act.detach(), "twin_dose": dose.detach(),
+            "twin_mm_rel": mm_rel.detach(), "twin_mm_ext": mm_ext.detach(),
+            "twin_flick": flick.detach(),
+            "twin_cos_on": cos_on.detach(), "twin_cos_cf": cos_cf.detach(),
+            "twin_motion_on": m_on.detach(), "twin_motion_cf": m_cf.detach(),
+            "twin_motion_tgt": (m_tgt.detach() if m_tgt is not None else m_cf.detach()),
+            "twin_active": torch.ones((), device=device),
         })
         return loss, log
 
@@ -1176,32 +1176,32 @@ class StreamingTrainingModel:
                     print("[StreamingTrain-Model] identity/tv loss OOM, skipped this step")
 
         ###### counterfactual objective (do-no-harm + activity floor + motion match) ######
-        if self._e3_on:
+        if self._twin_on:
             try:
-                adv_loss, e3_log = self._compute_advantage_loss(chunk, chunk_info)
+                adv_loss, twin_log = self._compute_advantage_loss(chunk, chunk_info)
                 dmd_loss = dmd_loss + adv_loss
-                dmd_log_dict.update(e3_log)
+                dmd_log_dict.update(twin_log)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 # keep the log keys present so merge_dict_list (keyed off chunk 0) does not raise;
-                # e3_oom_skip=1 makes silent skipping visible in wandb
+                # twin_oom_skip=1 makes silent skipping visible in wandb
                 dmd_log_dict.update({
-                    "e3_adv_loss": torch.zeros((), device=self.device),
-                    "e3_adv_raw": torch.zeros((), device=self.device),
-                    "e3_gate": torch.zeros((), device=self.device),
-                    "e3_dnh": torch.zeros((), device=self.device),
-                    "e3_act": torch.zeros((), device=self.device),
-                    "e3_dose": torch.zeros((), device=self.device),
-                    "e3_mm_rel": torch.zeros((), device=self.device),
-                    "e3_mm_ext": torch.zeros((), device=self.device),
-                    "e3_flick": torch.zeros((), device=self.device),
-                    "e3_cos_on": torch.ones((), device=self.device),
-                    "e3_cos_cf": torch.ones((), device=self.device),
-                    "e3_motion_on": torch.zeros((), device=self.device),
-                    "e3_motion_cf": torch.zeros((), device=self.device),
-                    "e3_motion_tgt": torch.zeros((), device=self.device),
-                    "e3_active": torch.zeros((), device=self.device),
-                    "e3_oom_skip": torch.ones((), device=self.device),
+                    "twin_adv_loss": torch.zeros((), device=self.device),
+                    "twin_adv_raw": torch.zeros((), device=self.device),
+                    "twin_gate": torch.zeros((), device=self.device),
+                    "twin_dnh": torch.zeros((), device=self.device),
+                    "twin_act": torch.zeros((), device=self.device),
+                    "twin_dose": torch.zeros((), device=self.device),
+                    "twin_mm_rel": torch.zeros((), device=self.device),
+                    "twin_mm_ext": torch.zeros((), device=self.device),
+                    "twin_flick": torch.zeros((), device=self.device),
+                    "twin_cos_on": torch.ones((), device=self.device),
+                    "twin_cos_cf": torch.ones((), device=self.device),
+                    "twin_motion_on": torch.zeros((), device=self.device),
+                    "twin_motion_cf": torch.zeros((), device=self.device),
+                    "twin_motion_tgt": torch.zeros((), device=self.device),
+                    "twin_active": torch.zeros((), device=self.device),
+                    "twin_oom_skip": torch.ones((), device=self.device),
                 })
                 if (not dist.is_initialized() or dist.get_rank() == 0):
                     print("[StreamingTrain-Model] advantage loss OOM, skipped this chunk")

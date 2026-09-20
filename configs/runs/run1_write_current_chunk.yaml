@@ -8,7 +8,8 @@
 #   lr_mem                 the memory gets its own learning rate, 10x the LoRA's
 #   train_write            the write update is built into the graph, so writing is trained too
 #   bptt_* / grad_tail_W   how far back the gradient reaches across chunks, and at what VRAM cost
-#   *_weight: 0.0          the extra loss terms, all off, which is what makes this run plain DMD
+#   (no *_weight key)      the extra loss terms default to 0 in the code; leaving them out is
+#                          what makes this run plain DMD
 #   *_cpu_offload          the frozen teacher and the text encoder live on CPU
 trainer: score_distillation
 max_iters: 2000

@@ -1,12 +1,3 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
-#
-# Licensed under the Apache License, Version 2.0 (the "License").
-# You may not use this file except in compliance with the License.
-# To view a copy of this license, visit http://www.apache.org/licenses/LICENSE-2.0
-#
-# No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
-#
-# SPDX-License-Identifier: Apache-2.0
 """Bringing back only the subject of the anchor, and keeping the current background."""
 import os
 
@@ -38,7 +29,7 @@ class CompositeMixin:
         (m, 1 - m), so they sum to 1 EVERYWHERE by construction. smoothstep => C1 at both ends
         of the ring, hence no seam in the decoded pixels.
         (cy, cx) = ellipse center in PIXELS of the latent grid; None = the geometric center
-        (the historical behaviour, used by every existing composite arm)."""
+        (the default, which every composite arm uses unless it passes a center)."""
         assert 0.0 < crop <= 1.0, f"MEM_COMP_CROP must be in (0, 1], got {crop}"
         assert 0.0 <= feather < 1.0, f"MEM_COMP_FEATHER must be in [0, 1), got {feather}"
         cy = (H - 1) / 2.0 if cy is None else float(cy)
@@ -102,7 +93,7 @@ class CompositeMixin:
     def _maybe_composite(self, anchor, output, current_start_frame):
         """Blend the recalled anchor (the subject) onto the last true latent frame of the current
         context (background). Returns `anchor` itself (same object) when the hook is off, so the
-        legacy code path is untouched."""
+        caller's path is byte-identical without it."""
         if not int(os.environ.get("MEM_DECODE_COMPOSITE", "0") or 0):
             return anchor
         assert os.environ.get("REPLAY_PAST_POS", "") not in ("head", "sink0"), \

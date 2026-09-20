@@ -10,7 +10,6 @@ model_kwargs:
   local_attn_size: 12
   timestep_shift: 5.0
   sink_size: 3
-  # Declare explicitly: the model defaults to memory_layers=(5,) with gate_init=0.1.
   memory_layers: []
 
 data_path: ckpt/prompts/bench/vbench_all_dimension_extended.txt
