@@ -6,7 +6,6 @@ import torch
 from utils.env import env_str
 
 
-
 # MEM_WRITER: replace the write parameters of the memory cells with ones trained offline, on
 # replayed writes. Off unless the variable names a checkpoint, and nothing else changes: the
 # rollout still runs with the injection silenced, only the writes that build the state differ.
@@ -112,7 +111,6 @@ def _memwriter_sync(model):
 
 
 class MemoryStateMixin:
-    # Internal helpers
     def _snapshot_ttt(self):
         """Freeze the memory as it stands: the fast weights, the queue of evicted chunks waiting
         to be written, and the injection smoothing buffers. Used to give the memory one slot per

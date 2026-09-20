@@ -7,11 +7,12 @@ import torch
 from utils.env import env_int, env_str
 
 
-
 # MEM_DECODE: when a subject comes back, the frame fed into the attention context is decoded
 # from the live memory state by a decoder trained offline, instead of being the real past frame.
 # Off unless MEM_DECODE names that decoder's checkpoint.
 _MEMDEC_CACHE = {}   # (abs ckpt path, device str) -> loaded AnchorFrameDecoder, once per process
+# the blocks whose fast-weight state the decoder reads: the memory_layers it was trained on
+_MEMDEC_BLOCKS = (5, 16, 27)
 
 
 def _memdec_pooled_cond(cond_dict):
@@ -34,8 +35,8 @@ def _memdec_get_decoder(ckpt_path, device):
     """Lazy-load (once per process+device) the offline-trained AnchorFrameDecoder from a
     train_decoder.py checkpoint ({'decoder': state_dict, 'step': ...} or a bare state_dict).
     cond_dim/cond_hidden are detected from the state_dict keys: 'cond_in.weight' of shape
-    (cond_hidden, cond_dim) exists only on v1.1 conditioned decoders; absent = v1.0
-    unconditioned (cond_dim=0 creates no cond modules, state_dict matches strictly).
+    (cond_hidden, cond_dim) exists only on prompt-conditioned decoders; absent = an
+    unconditioned one (cond_dim=0 creates no cond modules, state_dict matches strictly).
     Kept in fp32 on the device (training kept fp32 params; one decode per video, speed moot).
     RNG hygiene: AnchorFrameDecoder.__init__ draws from the global torch RNG (queries/pos/
     linear inits) and this lazy load runs mid-ROLLOUT at the return switch, without the
@@ -78,11 +79,11 @@ class AnchorDecodeMixin:
         same lazy load protected by fork_rng."""
         _dev = next(self.generator.parameters()).device
         _dec = _memdec_get_decoder(ckpt_path, _dev)
-        for _bi in (5, 16, 27):
+        for _bi in _MEMDEC_BLOCKS:
             assert self.ttt_cache[_bi].state is not None, \
                 f"MEM_DECODE: no live memory state on block {_bi}"
         _sts = [tuple(t.detach().to(_dev, torch.float32)
-                      for t in self.ttt_cache[_bi].state) for _bi in (5, 16, 27)]
+                      for t in self.ttt_cache[_bi].state) for _bi in _MEMDEC_BLOCKS]
         _cond = None
         if getattr(_dec, "cond_dim", 0):
             _cond = _memdec_pooled_cond(cond_dict).to(_dev, torch.float32)[None]
@@ -121,10 +122,9 @@ class AnchorDecodeMixin:
               f"(write age 1), frame cached for the return splice; "
               f"cond={'ON' if _cond_on else 'off'}", flush=True)
 
-
-    # Used by the driver that handles several prompt switches in one video. `inference()` is left
-    # alone and `inference_schedule()` generalises it; the two are checked to produce
-    # bitwise identical latents on the single-switch schedule, for every arm.
+    # Both drivers build their window here. `inference_schedule()` generalises `inference()`,
+    # and the two are checked to produce bitwise identical latents on the single-switch
+    # schedule, for every arm.
     @staticmethod
     def _memdec_window(output, current_start_frame, n, anchor, kslots, slot_offset):
         """The 12-frame recache window carrying the recalled anchor.

@@ -101,7 +101,4 @@ class SinkMixin:
                 self.kv_cache1[bi]["k"][:, :n_tok].copy_(_tmp[bi]["k"][:, :n_tok])
                 self.kv_cache1[bi]["v"][:, :n_tok].copy_(_tmp[bi]["v"][:, :n_tok])
         del _tmp
-        for blk in self.crossattn_cache:
-            blk["k"].zero_()
-            blk["v"].zero_()
-            blk["is_init"] = False
+        self._reset_crossattn_cache()

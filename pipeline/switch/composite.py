@@ -20,7 +20,7 @@ class CompositeMixin:
     #   MEM_COMP_CROP=0.6       fraction of H and W covered by the ellipse at m = 0.5 (the
     #                           center-60 % of the re-ID crop by default)
     #   MEM_COMP_FEATHER=0.3    relative half-width of the smoothstep ring around the ellipse
-    #   MEM_COMP_DUMP=<prefix>  debug: save {bg, anchor, composite, mask} for the eye board
+    #   MEM_COMP_DUMP=<prefix>  debug: save {bg, anchor, composite, mask} for visual inspection
     @staticmethod
     def _composite_mask(H, W, crop, feather, device, dtype, cy=None, cx=None):
         """Soft elliptical mask on the latent grid: 1 = take the anchor (the subject),

@@ -89,10 +89,7 @@ class AdditiveKVMixin:
             sa._add_pos = pos
             sa._add_capture = False
             sa._add_captured = None
-        for blk in self.crossattn_cache:
-            blk["k"].zero_()
-            blk["v"].zero_()
-            blk["is_init"] = False
+        self._reset_crossattn_cache()
         self._add_installed = True
         print(f"[MEM_ADDITIVE_KV] anchor frame installed as {n_tok} EXTRA k/v tokens on "
               f"{len(blocks)} blocks (gain={gain}, rope band "

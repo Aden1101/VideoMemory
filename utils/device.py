@@ -30,24 +30,14 @@ def _detect():
     return cpu
 
 
-# Resolved once at import, like the old `gpu`, but without querying a driver that is not
-# there. That line is what crashed the whole inference path off CUDA.
+# Resolved once at import, without querying a driver that may not be there: on a machine
+# with no CUDA, asking torch.cuda for the current device raises.
 device = _detect()
-gpu = device                      # legacy name, kept so nothing upstream breaks
+gpu = device                      # upstream's name for it, kept so its imports still work
 
 
 def kind(dev=None):
     return (dev or device).type
-
-
-def is_cuda(dev=None):
-    return kind(dev) == "cuda"
-
-
-def autocast_device_type(dev=None):
-    """First argument to torch.autocast. Whether to enable autocast at all is the caller's
-    decision; this only names the device."""
-    return kind(dev)
 
 
 def supports_float64(dev=None):

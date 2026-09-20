@@ -34,14 +34,12 @@ class SdeditMixin:
         device. Draws no global RNG (a dedicated generator, like _maybe_noise_anchor), so the
         paired memzero noise stream is untouched.
 
-        Block size (MEM_SDEDIT_FRAMES, default = num_frame_per_block). The first implementation
-        denoised a block of one latent frame and the eye board (2026-08-04) showed it produces
-        high-frequency mosaic, not sharp content, including at sigma = 1.0, which is the model's
-        own full 4-step sampler and must therefore render a clean image. That isolates the cause:
-        a 1-frame block is out of distribution for this backbone (it is trained and cached with
-        num_frame_per_block = 3, and frames inside a block attend to each other), not the noise
-        level. So the anchor is replicated to a native-size block and the middle frame is read
-        back. MEM_SDEDIT_FRAMES=1 restores the broken variant, on purpose, as a control."""
+        Block size (MEM_SDEDIT_FRAMES, default = num_frame_per_block). A block of one latent
+        frame comes out as high-frequency mosaic, even at sigma = 1.0, which is the model's own
+        full sampler and must render a clean image: a 1-frame block is out of distribution for
+        this backbone, trained and cached with num_frame_per_block = 3, where frames inside a
+        block attend to each other. So the anchor is replicated to a native-size block and the
+        middle frame is read back. MEM_SDEDIT_FRAMES=1 is kept as the control that shows it."""
         dev = next(self.generator.parameters()).device
         assert frame.shape[1] == 1, \
             f"MEM_SDEDIT sharpens ONE latent frame, got {frame.shape[1]}"
@@ -68,10 +66,7 @@ class SdeditMixin:
         self.generator.model.block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
             device=dev, num_frames=nf, frame_seqlen=self.frame_seq_length,
             num_frame_per_block=self.num_frame_per_block, local_attn_size=self.local_attn_size)
-        for blk in self.crossattn_cache:           # the return prompt, freshly cross-attended
-            blk["k"].zero_()
-            blk["v"].zero_()
-            blk["is_init"] = False
+        self._reset_crossattn_cache()     # the return prompt, freshly cross-attended
         with torch.no_grad():
             for i, t in enumerate(steps):
                 for c in _tmp:                     # every call is an independent 1-frame denoise
@@ -93,10 +88,7 @@ class SdeditMixin:
                 if i + 1 < len(steps):
                     xt = _renoise(x0_pred, steps[i + 1])
         del _tmp
-        for blk in self.crossattn_cache:           # nothing of the phantom pass may survive
-            blk["k"].zero_()
-            blk["v"].zero_()
-            blk["is_init"] = False
+        self._reset_crossattn_cache()     # nothing of the phantom pass may survive
         # the middle frame of the block: frames inside a block attend to each other, and latent
         # frame 0 of a Wan clip is the odd one out (1 pixel frame vs 4 for the others).
         _pick = nf // 2
@@ -125,7 +117,8 @@ class SdeditMixin:
         rel = float((a - b).norm() / (b.norm() + 1e-12))
         hf0, hf1 = self._lat_hf(frame), self._lat_hf(out)
         print(f"[MEM_SDEDIT] anchor SHARPENED with the model prior (sigma={s}, trajectory "
-              f"{[round(t, 1) for t in self._sdedit_steps(s)]}, 1-frame mode, return prompt): "
+              f"{[round(t, 1) for t in self._sdedit_steps(s)]}, "
+              f"{env_int('MEM_SDEDIT_FRAMES') or self.num_frame_per_block}-frame block, return prompt): "
               f"cos with the raw anchor {cos:.4f}, rel-L2 {rel:.4f}, latent |laplacian| "
               f"{hf0:.4f} -> {hf1:.4f} (x{hf1 / max(hf0, 1e-9):.2f}), std "
               f"{float(frame.float().std()):.3f} -> {float(out.float().std()):.3f}", flush=True)

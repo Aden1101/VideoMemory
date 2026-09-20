@@ -101,18 +101,15 @@ if config.generator_ckpt:
                 print(f"[Warning] {len(missing)} parameters are missing when loading checkpoint: {missing[:8]} ...")
             if len(unexpected) > 0:
                 print(f"[Warning] {len(unexpected)} unexpected parameters encountered when loading checkpoint: {unexpected[:8]} ...")
-        # same memory-aware safety net as the non-EMA branch: only memory keys may be missing
-        non_memory_missing = [k for k in missing if "memory" not in k]
-        assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
-        assert not unexpected, f"Unexpected keys: {list(unexpected)[:5]}"
     else:
-        # acceptable missing keys are the memory params (they keep their fresh init)
         missing, unexpected = pipeline.generator.load_state_dict(raw_gen_state_dict, strict=False)
-        non_memory_missing = [k for k in missing if "memory" not in k]
-        assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
-        assert not unexpected, f"Unexpected keys: {list(unexpected)[:5]}"
         if local_rank == 0 and len(missing) > 0:
             print(f"[memory] {len(missing)} keys kept at init (not in checkpoint)")
+    # only the memory parameters may be absent from a checkpoint: they keep their fresh init
+    # here and are loaded from lora_ckpt below
+    non_memory_missing = [k for k in missing if "memory" not in k]
+    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
+    assert not unexpected, f"Unexpected keys: {list(unexpected)[:5]}"
 
 # --------------------------- LoRA support (optional) ---------------------------
 from utils.lora_utils import configure_lora_for_model

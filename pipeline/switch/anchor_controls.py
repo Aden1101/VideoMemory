@@ -6,6 +6,13 @@ import torch
 from utils.env import env_float, env_int, env_str
 
 
+def _load_anchor(path):
+    """An anchor latent from disk: either the {"anchor": tensor, "frame": i} dict that
+    ANCHOR_DUMP writes, or a bare tensor as MEM_DECODE_DUMP writes."""
+    t = torch.load(path, map_location="cpu", weights_only=False)
+    return t["anchor"] if isinstance(t, dict) and "anchor" in t else t
+
+
 class AnchorControlsMixin:
     def _blur_latent(self, lat, sigma):
         """Blur a real frame: decode it to pixels, blur, re-encode. Used to find how much detail
@@ -40,8 +47,7 @@ class AnchorControlsMixin:
         assert not (src and sig), "ANCHOR_FROM_FILE and ANCHOR_BLUR_SIGMA are mutually exclusive"
         if src:
             assert hi - lo == 1, f"ANCHOR_FROM_FILE replaces ONE frame, asked for {hi - lo}"
-            t = torch.load(src, map_location="cpu", weights_only=False)
-            t = t["anchor"] if isinstance(t, dict) and "anchor" in t else t
+            t = _load_anchor(src)
             assert tuple(t.shape) == tuple(real.shape), \
                 f"ANCHOR_FROM_FILE {src}: shape {tuple(t.shape)} != {tuple(real.shape)}"
             print(f"[ANCHOR_FROM_FILE] anchor content REPLACED by {src} "
@@ -64,8 +70,7 @@ class AnchorControlsMixin:
         # so that the same frame can be spliced back unchanged.
         cur = output[:, a_end - 1:a_end].detach().cpu().clone()
         if os.path.exists(path):
-            old = torch.load(path, map_location="cpu", weights_only=False)
-            old = old["anchor"] if isinstance(old, dict) and "anchor" in old else old
+            old = _load_anchor(path)
             d = float((old.float() - cur.float()).abs().max())
             print(f"[ANCHOR_DUMP] existing {os.path.basename(path)} re-checked: "
                   f"max|diff| = {d:.3e}", flush=True)
@@ -94,8 +99,7 @@ class AnchorControlsMixin:
         assert env_float("MEM_DECODE_NOISE") <= 0.0, \
             "MEM_DECODE_SRC and MEM_DECODE_NOISE are two different control arms, not a stack"
         assert os.path.exists(src), f"MEM_DECODE_SRC: no such anchor dump {src}"
-        t = torch.load(src, map_location="cpu", weights_only=False)
-        t = t["anchor"] if isinstance(t, dict) and "anchor" in t else t
+        t = _load_anchor(src)
         assert tuple(t.shape) == tuple(frame.shape), \
             f"MEM_DECODE_SRC {src}: shape {tuple(t.shape)} != this cell's anchor {tuple(frame.shape)}"
         out = t.to(dtype=frame.dtype, device=frame.device)
@@ -131,7 +135,6 @@ class AnchorControlsMixin:
               f"anchor std {float(frame.float().std()):.3f} -> spliced std "
               f"{float(out.float().std()):.3f}", flush=True)
         return out
-
 
     # ---- stop lying to the model about the anchor's noise level ------------------------------
     # The splice declares the anchor as a clean frame (t = 0) although it is blurry and off the

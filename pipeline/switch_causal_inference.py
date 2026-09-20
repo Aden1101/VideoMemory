@@ -47,6 +47,13 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
 
+    def _reset_crossattn_cache(self):
+        """Forget the cached text keys and values, so the next forward cross-attends afresh."""
+        for blk in self.crossattn_cache:
+            blk["k"].zero_()
+            blk["v"].zero_()
+            blk["is_init"] = False
+
     def _window_frames(self, current_start_frame):
         """How many past frames the attention context holds when generation reaches
         `current_start_frame`: all of them under global attention, else the local window."""
@@ -369,9 +376,8 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                         torch.save(_frame.detach().to("cpu", torch.float16),
                                    f"{_dump}.f{current_start_frame}.pt")
                         print(f"[MEM_DECODE_DUMP] anchor latent saved -> {_dump}.f{current_start_frame}.pt")
-                    _splice = torch.cat(
-                        [output[:, current_start_frame - (_n - _kslots):current_start_frame]]
-                        + [_frame] * _kslots, dim=1)
+                    _splice = self._memdec_window(output, current_start_frame, _n, _frame,
+                                                  _kslots, slot_offset=-1)
                     print(f"[MEM_DECODE] decoded anchor spliced at recency ({_kslots}/{_n} slots), "
                           f"cond={'thru' if _cond is None else ('ON' if _cond else 'off')}",
                           flush=True)
