@@ -8,7 +8,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 import json
-import math
 import os
 from typing import List, Optional
 import torch
@@ -17,11 +16,7 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from pipeline.causal_inference import CausalInferencePipeline  # reuse init utilities
 from wan.modules.video_memory import TTTBlockCache
-import torch.distributed as dist
-from utils.debug_option import DEBUG
-from pipeline.switch.anchor_decode import _memdec_get_decoder  # noqa: F401  (imported elsewhere)
-from pipeline.switch.memory_state import (MemoryStateMixin, _find_causal_model,  # noqa: F401
-                                          _memwriter_sync)
+from pipeline.switch.memory_state import MemoryStateMixin, _memwriter_sync
 from pipeline.switch.anchor_decode import AnchorDecodeMixin
 from pipeline.switch.anchor_controls import AnchorControlsMixin
 from pipeline.switch.sdedit import SdeditMixin
@@ -29,9 +24,12 @@ from pipeline.switch.sink import SinkMixin
 from pipeline.switch.composite import CompositeMixin
 from pipeline.switch.additive_kv import AdditiveKVMixin
 from pipeline.switch.frame_bank import FrameBankMixin
+from pipeline.switch.replay import ReplayPastMixin
 
 
-class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorControlsMixin, SdeditMixin, SinkMixin, CompositeMixin, AdditiveKVMixin, FrameBankMixin, CausalInferencePipeline):
+class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorControlsMixin,
+                                    SdeditMixin, SinkMixin, CompositeMixin, AdditiveKVMixin,
+                                    FrameBankMixin, ReplayPastMixin, CausalInferencePipeline):
     """Generate a video, switch prompt one or more times, and optionally feed a past
     subject back into the attention context at the return. Each way of feeding it back
     lives in its own module under pipeline/switch/."""
@@ -47,6 +45,113 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
+
+    def _begin_rollout(self, noise, low_memory, first_switch_frame=None):
+        """Everything both drivers do before the first chunk: free the text encoder, allocate
+        the output, size and clear the caches, and reset the per-rollout memory state.
+        Returns the output tensor."""
+        batch_size, num_output_frames, num_channels, height, width = noise.shape
+        if low_memory:
+            gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
+            move_model_to_device_with_memory_preservation(
+                self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation
+            )
+        # the output lives on the CPU in low-memory mode, to leave the GPU to the model
+        output_device = torch.device('cpu') if low_memory else noise.device
+        output = torch.zeros([batch_size, num_output_frames, num_channels, height, width],
+                             device=output_device, dtype=noise.dtype)
+
+        local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
+        if local_attn_cfg != -1:
+            kv_cache_size = local_attn_cfg * self.frame_seq_length
+            kv_policy = f"int->local, size={local_attn_cfg}"
+        else:
+            kv_cache_size = num_output_frames * self.frame_seq_length
+            kv_policy = "global (-1)"
+        print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, "
+              f"frame_seq_length: {self.frame_seq_length}, "
+              f"num_output_frames: {num_output_frames})")
+        self._initialize_kv_cache(batch_size, dtype=noise.dtype, device=noise.device,
+                                  kv_cache_size_override=kv_cache_size)
+        self._initialize_crossattn_cache(batch_size=batch_size, dtype=noise.dtype,
+                                         device=noise.device)
+
+        # fast-weight memory state, fresh per sequence
+        self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
+        # MEM_WRITER: overlay the offline-trained write parameters on the memory cells before
+        # the first write of this rollout. Default off = no-op; consumes no random draw, so the
+        # paired arms keep identical noise streams.
+        _memwriter_sync(self.generator.model)
+
+        self._switch_global_frame = None
+        self._first_switch_frame = first_switch_frame
+        self._ttt_snap_A = None
+        self._ttt_snap_by_prompt = {}
+        self._thru_frame = None          # MEM_DECODE_THRU cache, per rollout
+        self._thru_info = None
+        self._comp_applied = 0           # MEM_DECODE_COMPOSITE bookkeeping, per rollout
+        self._comp_gate_now = 1.0
+        self._add_installed = False
+        self._add_mass_log = []          # attention mass per source, per chunk, per block
+        self._clear_add_kv()             # no additive channel may survive from a previous arm
+        self._fb_reset()
+        self.generator.model.local_attn_size = self.local_attn_size
+        print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
+        self._set_all_modules_max_attention_size(self.local_attn_size)
+        return output
+
+    def _denoise_chunk(self, noise, output, cond, current_start_frame, num_input_frames,
+                       current_num_frames):
+        """Generate one chunk under `cond` and write it into `output`.
+
+        Runs the sampler's denoising steps on the chunk's slice of `noise`, then re-runs the
+        result once at the context noise level, which is the pass that refreshes the kv cache
+        and performs the memory write for this chunk.
+        """
+        batch_size = noise.shape[0]
+        noisy_input = noise[:, current_start_frame - num_input_frames:
+                            current_start_frame + current_num_frames - num_input_frames]
+        for index, current_timestep in enumerate(self.denoising_step_list):
+            timestep = torch.ones([batch_size, current_num_frames], device=noise.device,
+                                  dtype=torch.int64) * current_timestep
+            _, denoised_pred = self.generator(
+                noisy_image_or_video=noisy_input,
+                conditional_dict=cond,
+                timestep=timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                rope_enhance=self.rope_enhance,
+                ttt_cache=self.ttt_cache,
+                ttt_update=False,
+                switch_global_frame=self._switch_global_frame,
+            )
+            if index < len(self.denoising_step_list) - 1:
+                next_timestep = self.denoising_step_list[index + 1]
+                noisy_input = self.scheduler.add_noise(
+                    denoised_pred.flatten(0, 1),
+                    torch.randn_like(denoised_pred.flatten(0, 1)),
+                    next_timestep * torch.ones([batch_size * current_num_frames],
+                                               device=noise.device, dtype=torch.long),
+                ).unflatten(0, denoised_pred.shape[:2])
+
+        output[:, current_start_frame:
+               current_start_frame + current_num_frames] = denoised_pred.to(output.device)
+
+        # rerun with clean context noise: this is the pass that updates the cache and writes
+        # to the memory
+        self.generator(
+            noisy_image_or_video=denoised_pred,
+            conditional_dict=cond,
+            timestep=torch.ones_like(timestep) * self.args.context_noise,
+            kv_cache=self.kv_cache1,
+            crossattn_cache=self.crossattn_cache,
+            current_start=current_start_frame * self.frame_seq_length,
+            rope_enhance=self.rope_enhance,
+            ttt_cache=self.ttt_cache,
+            ttt_update=True,
+            switch_global_frame=self._switch_global_frame,
+        )
 
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict,
                               frames_override=None, timestep_override=None):
@@ -170,24 +275,22 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         num_blocks = num_output_frames // self.num_frame_per_block
 
         assert not int(os.environ.get("MEM_DECODE_COMPOSITE", "0") or 0), \
-            "MEM_DECODE_COMPOSITE (arms oracle1comp / memdec21c) is implemented in the N-switch " \
-            "driver only, run those arms through inference_schedule()"
+            "MEM_DECODE_COMPOSITE is implemented in the N-switch driver only, " \
+            "run it through inference_schedule()"
         assert not int(os.environ.get("MEM_ADDITIVE_KV", "0") or 0), \
-            "MEM_ADDITIVE_KV (arm oracle1add) is implemented in the N-switch driver only, " \
+            "MEM_ADDITIVE_KV is implemented in the N-switch driver only, " \
             "run it through inference_schedule()"
         assert int(os.environ.get("MEM_DECODE_SLOT_OFFSET", "-1") or -1) < 0, \
             "MEM_DECODE_SLOT_OFFSET (gate 2) is implemented in the N-switch driver only"
         assert float(os.environ.get("MEM_ANCHOR_T", "0") or 0) <= 0.0, \
-            "MEM_ANCHOR_T (lot offensif 2026-08-04, arms i1_*) is implemented in the N-switch " \
-            "driver only, run it through inference_schedule()"
+            "MEM_ANCHOR_T is implemented in the N-switch driver only, " \
+            "run it through inference_schedule()"
         assert float(os.environ.get("MEM_SDEDIT", "0") or 0) <= 0.0 \
             and not int(os.environ.get("MEM_SINKPURGE", "0") or 0), \
-            "MEM_SDEDIT / MEM_SINKPURGE (mini-batterie training-free 2026-08-04, arms " \
-            "sdedit_ours / sdedit_wrong / sinkpurge) are implemented in the N-switch driver only"
+            "MEM_SDEDIT / MEM_SINKPURGE are implemented in the N-switch driver only"
         assert float(os.environ.get("MEM_DECODE_NOISE", "0") or 0) <= 0.0 \
             and not os.environ.get("MEM_DECODE_SRC", "").strip(), \
-            "MEM_DECODE_NOISE / MEM_DECODE_SRC (reviewer controls noiseanchor / wronganchor, " \
-            "2026-08-03) are implemented in the N-switch driver only"
+            "MEM_DECODE_NOISE / MEM_DECODE_SRC are implemented in the N-switch driver only"
 
         # Encode both prompts upfront
         cond_first = self.text_encoder(text_prompts=text_prompts_first)
@@ -201,65 +304,9 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 text_prompts_third = text_prompts_first
             cond_third = self.text_encoder(text_prompts=text_prompts_third)
 
-        if low_memory:
-            gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
-            move_model_to_device_with_memory_preservation(
-                self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation
-            )
-
-        # Place output on CPU to save GPU memory
-        output_device = torch.device('cpu') if low_memory else noise.device
-        output = torch.zeros(
-            [batch_size, num_output_frames, num_channels, height, width],
-            device=output_device,
-            dtype=noise.dtype
-        )
-
-        local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
-        kv_policy = ""
-        if local_attn_cfg != -1:
-            # local attention
-            kv_cache_size = local_attn_cfg * self.frame_seq_length
-            kv_policy = f"int->local, size={local_attn_cfg}"
-        else:
-            # global attention
-            kv_cache_size = num_output_frames * self.frame_seq_length
-            kv_policy = "global (-1)"
-        print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
-
-        self._initialize_kv_cache(
-            batch_size,
-            dtype=noise.dtype,
-            device=noise.device,
-            kv_cache_size_override=kv_cache_size
-        )
-        self._initialize_crossattn_cache(
-            batch_size=batch_size,
-            dtype=noise.dtype,
-            device=noise.device
-        )
-        # fast-weight memory state, fresh per sequence
-        # stock model with the memory never read or written)
-        self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
-        # MEM_WRITER (arm memdec20, memory 2.0): overlay the offline-trained write parameters on
-        # the memory cells before the first write of this rollout. Default off = no-op; consumes
-        # no RNG draw, so the paired arms keep identical noise streams.
-        _memwriter_sync(self.generator.model)
-
+        output = self._begin_rollout(noise, low_memory)
         current_start_frame = 0
         num_input_frames = 0
-        self._switch_global_frame = None
-        self._first_switch_frame = None
-        self._ttt_snap_A = None
-        self._thru_frame = None          # MEM_DECODE_THRU cache (arm oracle1thru), per rollout
-        self._thru_info = None
-        self._comp_gate_now = 1.0
-        self._add_installed = False
-        self._add_mass_log = []          # T1: masse par source, par chunk et par bloc
-        self._clear_add_kv()             # no additive channel may survive from a previous arm
-        self.generator.model.local_attn_size = self.local_attn_size
-        print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
-        self._set_all_modules_max_attention_size(self.local_attn_size)
 
         # Temporal denoising by blocks
         all_num_frames = [self.num_frame_per_block] * num_blocks
@@ -275,77 +322,25 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 if int(os.environ.get("MEM_EPISODIC", "0")) and getattr(self, "_ttt_snap_A", None):
                     self._restore_ttt(self._ttt_snap_A)
                     print(f"[MEM_EPISODIC] restored A-era memory state at frame {current_start_frame}")
-                # ORACLE_SPLICE rebuilds the attention window from the REAL frames of the
-                # subject's first appearance instead of the current ones. It is deliberate
-                # cheating: it gives the ceiling that a perfect memory could reach.
-                _splice = None
-                # dump the original-A anchor latent for the twin arm (free,
-                # no RNG draw, off by default) before any splice touches `output`.
+                # Replaying the past: rebuild the attention window from the real frames of
+                # the subject's first appearance instead of the current ones. Deliberate
+                # cheating, it gives the ceiling that a perfect memory could reach.
+                # The anchor is dumped first, before any replay touches `output`.
                 self._dump_anchor(output, self._first_switch_frame)
-                if int(os.environ.get("ORACLE_SPLICE", "0")):
-                    _n = current_start_frame if self.local_attn_size == -1 \
-                        else min(self.local_attn_size, current_start_frame)
-                    _a_end = self._first_switch_frame
-                    assert _a_end is not None and _a_end - _n >= 0, \
-                        f"oracle splice needs {_n} frames of original A before frame {_a_end}"
-                    # how few real frames still suffice: only the last nf slots carry the past,
-                    # the rest keeps the true recent tail. 0 = the whole window.
-                    _nf = int(os.environ.get("ORACLE_SPLICE_FRAMES", "0") or 0)
-                    # does the position matter: the single past frame replaces the window slot
-                    # k frames before the most recent one. k=0 is the most recent slot, k of 3 to
-                    # 6 reads as "a few moments ago". -1 or unset = off.
-                    _slot_k = int(os.environ.get("ORACLE_SPLICE_SLOT", "-1") or -1)
-                    if _slot_k >= 0:
-                        _splice = output[:, current_start_frame - _n:current_start_frame].clone()
-                        _pos = _n - 1 - min(_slot_k, _n - 1)
-                        _splice[:, _pos:_pos + 1] = self._anchor_content(output, _a_end - 1, _a_end)
-                        print(f"[ORACLE_SPLICE] anchor at window slot {_pos}/{_n} "
-                              f"({_slot_k} frames before most-recent)")
-                    elif 0 < _nf < _n:
-                        # ORACLE_SPLICE_POS=head puts the anchor in the oldest window slots
-                        # instead of the most recent: a distant reference, not a recent frame.
-                        if os.environ.get("ORACLE_SPLICE_POS", "") == "head":
-                            _splice = torch.cat([
-                                self._anchor_content(output, _a_end - _nf, _a_end),
-                                output[:, current_start_frame - (_n - _nf):current_start_frame]],
-                                dim=1)
-                            print(f"[ORACLE_SPLICE] partial HEAD: first {_nf}/{_n} window slots "
-                                  f"from original A [{_a_end - _nf}, {_a_end}), rest = recent tail")
-                        else:
-                            _splice = torch.cat([
-                                output[:, current_start_frame - _n:current_start_frame - _nf],
-                                self._anchor_content(output, _a_end - _nf, _a_end)], dim=1)
-                            print(f"[ORACLE_SPLICE] partial: last {_nf}/{_n} window slots from original A "
-                                  f"[{_a_end - _nf}, {_a_end}), rest = true recent tail")
-                    else:
-                        _splice = self._anchor_content(output, _a_end - _n, _a_end)
-                        print(f"[ORACLE_SPLICE] recaching frames [{_a_end - _n}, {_a_end}) of original A "
-                              f"at positions [{current_start_frame - _n}, {current_start_frame})")
-                # ORACLE_SPLICE_NOISE degrades the anchor with RMS-preserving noise, to imitate
-                # an imperfect recall. Its own generator, so the main random stream is untouched.
-                _dose = float(os.environ.get("ORACLE_SPLICE_NOISE", "0") or 0)
-                if _dose > 0.0 and _splice is not None:
-                    _nf_env = int(os.environ.get("ORACLE_SPLICE_FRAMES", "0") or 0)
-                    _na = _nf_env if 0 < _nf_env < _splice.shape[1] else _splice.shape[1]
-                    _g = torch.Generator(device=_splice.device)
-                    _g.manual_seed(987654321 + current_start_frame)
-                    _a_part = _splice[:, -_na:]
-                    _eps = torch.randn(_a_part.shape, generator=_g, device=_a_part.device,
-                                       dtype=torch.float32).to(_a_part.dtype)
-                    _a_deg = ((1.0 - _dose ** 2) ** 0.5) * _a_part + _dose * _eps
-                    _splice = torch.cat([_splice[:, :-_na], _a_deg], dim=1)
-                    print(f"[ORACLE_SPLICE_NOISE] degraded last {_na} splice frame(s), sigma={_dose}")
+                _splice = self._build_replay_window(output, current_start_frame,
+                                                    self._first_switch_frame)
+                _splice = self._degrade_replay_window(_splice, current_start_frame)
                 # the frame fed back is decoded from the live memory instead of being the real
                 # past frame. Same mechanism as above, but nothing is read from the true past:
                 # this is the arm that actually tests the memory.
                 _dec_ckpt = os.environ.get("MEM_DECODE", "").strip()
                 if _dec_ckpt:
-                    assert _splice is None, "MEM_DECODE and ORACLE_SPLICE are mutually exclusive"
+                    assert _splice is None, "MEM_DECODE and REPLAY_PAST are mutually exclusive"
                     _n = current_start_frame if self.local_attn_size == -1 \
                         else min(self.local_attn_size, current_start_frame)
                     if int(os.environ.get("MEM_DECODE_THRU", "0") or 0):
-                        # arm oracle1thru: the frame was already decoded at the eviction of the
-                        # anchor chunk (write age 1); nothing is decoded here.
+                        # the frame was already decoded at the eviction of the anchor
+                        # chunk (write age 1); nothing is decoded here.
                         assert self._thru_frame is not None, \
                             "MEM_DECODE_THRU: the anchor chunk was never evicted before the " \
                             "return switch (check switch indices / local_attn_size)"
@@ -358,7 +353,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                     _cond = _cond_on
                     # MEM_DECODE_SLOTS (default 1): repeat the decoded anchor over the last k
                     # window slots, evicts B from the readable context k times faster (window-
-                    # mixing fix; oracle3 proved multi-slot anchors keep the same re-ID score).
+                    # mixing fix; multi-slot anchors keep the same re-identification score).
                     _kslots = max(1, int(os.environ.get("MEM_DECODE_SLOTS", "1") or 1))
                     # MEM_DECODE_DUMP (debug/eye-check): save the decoded anchor latent so it
                     # can be VAE-decoded and inspected (is the anchor clean-A or an A/B fusion?)
@@ -373,35 +368,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                     print(f"[MEM_DECODE] decoded anchor spliced at recency ({_kslots}/{_n} slots), "
                           f"cond={'thru' if _cond is None else ('ON' if _cond else 'off')}",
                           flush=True)
-                _blocks_env = os.environ.get("ORACLE_SPLICE_BLOCKS", "").strip()
-                if _splice is not None and _blocks_env:
-                    # keep the anchor recache only on the listed blocks, a normal one elsewhere:
-                    # does the anchor at the memory blocks alone bring the subject back? Both
-                    # passes see the same frames at the same positions, so restoring k/v is exact.
-                    _keep = {int(b) for b in _blocks_env.split(",") if b != ""}
-                    self._recache_after_switch(output, current_start_frame, cond_third)
-                    _snap_kv = {bi: {kk: self.kv_cache1[bi][kk].detach().to("cpu", copy=True)
-                                     for kk in ("k", "v")}
-                                for bi in range(self.num_transformer_blocks) if bi not in _keep}
-                    self._recache_after_switch(output, current_start_frame, cond_third,
-                                               frames_override=_splice)
-                    with torch.no_grad():
-                        for bi, kv in _snap_kv.items():
-                            self.kv_cache1[bi]["k"].copy_(kv["k"].to(self.kv_cache1[bi]["k"].device))
-                            self.kv_cache1[bi]["v"].copy_(kv["v"].to(self.kv_cache1[bi]["v"].device))
-                    del _snap_kv
-                    print(f"[ORACLE_SPLICE_BLOCKS] oracle KV kept ONLY on blocks {sorted(_keep)}, "
-                          f"other blocks restored to the normal recache")
-                elif os.environ.get("ORACLE_SPLICE_POS", "") == "sink0" and _splice is not None:
-                    # normal recache (window = true recent tail),
-                    # then the anchor frame overwrites the sink slot (read forever, never evicted)
-                    self._recache_after_switch(output, current_start_frame, cond_third)
-                    self._write_sink_anchor(_splice[:, -1:], cond_third)
-                    print(f"[ORACLE_SPLICE] sink0: anchor frame written into the SINK slot "
-                          f"(persistent), window = normal recent tail")
-                else:
-                    self._recache_after_switch(output, current_start_frame, cond_third,
-                                               frames_override=_splice)
+                self._recache_with_replay(output, current_start_frame, cond_third, _splice)
                 cond_in_use = cond_third
                 using_third = True
                 self._switch_global_frame = current_start_frame
@@ -423,62 +390,10 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 cond_in_use = (cond_third if using_third
                                else (cond_second if using_second else cond_first))
             
-            noisy_input = noise[:, current_start_frame - num_input_frames : current_start_frame + current_num_frames - num_input_frames]
+            self._denoise_chunk(noise, output, cond_in_use, current_start_frame,
+                                num_input_frames, current_num_frames)
 
-            # Spatial denoising loop (same as parent but uses cond_in_use)
-            for index, current_timestep in enumerate(self.denoising_step_list):
-                timestep = torch.ones([batch_size, current_num_frames], device=noise.device, dtype=torch.int64) * current_timestep
-                if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                        rope_enhance=self.rope_enhance,
-                        ttt_cache=self.ttt_cache,
-                        ttt_update=False,
-                        switch_global_frame=self._switch_global_frame,
-                    )
-                    next_timestep = self.denoising_step_list[index + 1]
-                    noisy_input = self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep * torch.ones([batch_size * current_num_frames], device=noise.device, dtype=torch.long),
-                    ).unflatten(0, denoised_pred.shape[:2])
-                else:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                        rope_enhance=self.rope_enhance,
-                        ttt_cache=self.ttt_cache,
-                        ttt_update=False,
-                        switch_global_frame=self._switch_global_frame,
-                    )
-
-            output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
-
-            # rerun with clean context noise for cache update
-            context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_in_use,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-                rope_enhance=self.rope_enhance,
-                ttt_cache=self.ttt_cache,
-                ttt_update=True,
-                switch_global_frame=self._switch_global_frame,
-            )
-
-            # MEM_DECODE_THRU (arm oracle1thru, default off = no-op): the write that stores the
+            # MEM_DECODE_THRU (default off = no-op): the write that stores the
             # anchor chunk has just happened -> decode and cache the frame now (age 1 write).
             self._thru_maybe_decode(current_start_frame, cond_third, output.dtype, output.device)
 
@@ -507,11 +422,11 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         `inference()` (same statements, same order, same tensors).
 
         Note on FRAMEBANK: its router runs at every transition, revisit or not, Echo-Forcing
-        has no oracle telling it which switch is a revisit, so a false recall on a fresh scene
+        is never told which switch is a revisit, so a false recall on a fresh scene
         is a real failure mode of the baseline and must be measurable, not hidden.
         """
         assert not int(os.environ.get("MEM_DECODE_THRU", "0") or 0), \
-            "MEM_DECODE_THRU (arm oracle1thru) is not supported by the N-switch driver: its " \
+            "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
             "eviction arithmetic assumes the single legacy anchor, run it through inference()"
         _splice = None
         _ts_over = None                  # MEM_ANCHOR_T: per-slot declared timestep of the recache
@@ -531,70 +446,28 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         # ---- MEM_ADDITIVE_KV (gate 1): the anchor enters as extra k/v tokens, no splice ------
         _addk = bool(is_revisit and int(os.environ.get("MEM_ADDITIVE_KV", "0") or 0))
         if _addk:
-            assert not int(os.environ.get("ORACLE_SPLICE", "0") or 0) and not self._fb_mode(), \
-                "MEM_ADDITIVE_KV is the NO-EVICTION channel: it must not be combined with a " \
-                "splice arm (ORACLE_SPLICE / FRAMEBANK)"
+            assert not int(os.environ.get("REPLAY_PAST", "0") or 0) and not self._fb_mode(), \
+                "MEM_ADDITIVE_KV is the channel that evicts nothing: do not combine it with a " \
+                "splice arm (REPLAY_PAST / FRAMEBANK)"
             _ck = os.environ.get("MEM_DECODE", "").strip()
-            if _ck:                       # future arm memdec20add: the decoded anchor, additive
+            if _ck:                       # the decoded anchor, additive
                 _content, _ = self._memdec_frame(_ck, cond_new, output.dtype, output.device)
-            else:                         # arm oracle1add: the true anchor frame, additive
+            else:                         # the true anchor frame, additive
                 _content = self._anchor_content(output, a_end - 1, a_end)
             self._install_add_kv(_content, cond_new)
-        if is_revisit and int(os.environ.get("ORACLE_SPLICE", "0")):
-            _n = current_start_frame if self.local_attn_size == -1 \
-                else min(self.local_attn_size, current_start_frame)
-            _a_end = a_end
-            _nf = int(os.environ.get("ORACLE_SPLICE_FRAMES", "0") or 0)
-            _need = _nf if 0 < _nf < _n else _n
-            assert _a_end - _need >= 0, \
-                f"oracle splice needs {_need} frames of the first appearance before frame {_a_end}"
-            _slot_k = int(os.environ.get("ORACLE_SPLICE_SLOT", "-1") or -1)
-            if _slot_k >= 0:
-                _splice = output[:, current_start_frame - _n:current_start_frame].clone()
-                _pos = _n - 1 - min(_slot_k, _n - 1)
-                _splice[:, _pos:_pos + 1] = self._anchor_content(output, _a_end - 1, _a_end)
-                print(f"[ORACLE_SPLICE] anchor at window slot {_pos}/{_n} "
-                      f"({_slot_k} frames before most-recent)")
-            elif 0 < _nf < _n:
-                if os.environ.get("ORACLE_SPLICE_POS", "") == "head":
-                    _splice = torch.cat([
-                        self._anchor_content(output, _a_end - _nf, _a_end),
-                        output[:, current_start_frame - (_n - _nf):current_start_frame]], dim=1)
-                    print(f"[ORACLE_SPLICE] partial HEAD: first {_nf}/{_n} window slots "
-                          f"from first appearance [{_a_end - _nf}, {_a_end}), rest = recent tail")
-                else:
-                    _splice = torch.cat([
-                        output[:, current_start_frame - _n:current_start_frame - _nf],
-                        self._maybe_composite(
-                            self._anchor_content(output, _a_end - _nf, _a_end),
-                            output, current_start_frame)], dim=1)
-                    print(f"[ORACLE_SPLICE] partial: last {_nf}/{_n} window slots from the first "
-                          f"appearance [{_a_end - _nf}, {_a_end}), rest = true recent tail")
-            else:
-                _splice = self._anchor_content(output, _a_end - _n, _a_end)
-                print(f"[ORACLE_SPLICE] recaching frames [{_a_end - _n}, {_a_end}) of the first "
-                      f"appearance at positions [{current_start_frame - _n}, {current_start_frame})")
-        _dose = float(os.environ.get("ORACLE_SPLICE_NOISE", "0") or 0)
-        if _dose > 0.0 and _splice is not None:
-            _nf_env = int(os.environ.get("ORACLE_SPLICE_FRAMES", "0") or 0)
-            _na = _nf_env if 0 < _nf_env < _splice.shape[1] else _splice.shape[1]
-            _g = torch.Generator(device=_splice.device)
-            _g.manual_seed(987654321 + current_start_frame)
-            _a_part = _splice[:, -_na:]
-            _eps = torch.randn(_a_part.shape, generator=_g, device=_a_part.device,
-                               dtype=torch.float32).to(_a_part.dtype)
-            _a_deg = ((1.0 - _dose ** 2) ** 0.5) * _a_part + _dose * _eps
-            _splice = torch.cat([_splice[:, :-_na], _a_deg], dim=1)
-            print(f"[ORACLE_SPLICE_NOISE] degraded last {_na} splice frame(s), sigma={_dose}")
+        if is_revisit:
+            _splice = self._build_replay_window(output, current_start_frame, a_end,
+                                                composite=True)
+        _splice = self._degrade_replay_window(_splice, current_start_frame)
         # ---- FRAMEBANK (Echo-Forcing-style real-content recall), routes at every switch ------
         if self._fb_mode():
             assert _splice is None and not os.environ.get("MEM_DECODE", "").strip(), \
-                "FRAMEBANK, ORACLE_SPLICE and MEM_DECODE are mutually exclusive"
+                "FRAMEBANK, REPLAY_PAST and MEM_DECODE are mutually exclusive"
             _n = current_start_frame if self.local_attn_size == -1 \
                 else min(self.local_attn_size, current_start_frame)
-            # FRAMEBANK_GT (pilote texte-insuffisant): le QUAND = la verite du planning, pour que
-            # framebank, memdec20 et wronganchor splicent EXACTEMENT au meme instant (egalite
-            # stricte). Le routeur tourne quand meme et sa decision est loguee.
+            # FRAMEBANK_GT: take the moment of the recall from the schedule rather than from
+            # the router, so every arm brings its frame back at exactly the same instant and
+            # only the content differs. The router still runs and its decision is logged.
             _gt = bool(int(os.environ.get("FRAMEBANK_GT", "0") or 0))
             _fb_frame, _ = self._fb_select(seg_idx, prompt_idx, cond_new, subject=subject,
                                            force=(bool(is_revisit) if _gt else None))
@@ -622,7 +495,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                   f"(ground truth was {'revisit' if is_revisit else 'fresh'})", flush=True)
         _dec_ckpt = os.environ.get("MEM_DECODE", "").strip() if (_fires and not _addk) else ""
         if _dec_ckpt:
-            assert _splice is None, "MEM_DECODE and ORACLE_SPLICE are mutually exclusive"
+            assert _splice is None, "MEM_DECODE and REPLAY_PAST are mutually exclusive"
             _n = current_start_frame if self.local_attn_size == -1 \
                 else min(self.local_attn_size, current_start_frame)
             _frame, _cond_on = self._memdec_frame(_dec_ckpt, cond_new, output.dtype, output.device)
@@ -647,47 +520,21 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
             _frame = self._maybe_composite(_frame, output, current_start_frame)
             _soff = int(os.environ.get("MEM_DECODE_SLOT_OFFSET", "-1") or -1)
             _splice = self._memdec_window(output, current_start_frame, _n, _frame, _kslots, _soff)
-            # MEM_ANCHOR_T (arms i1_*): stop lying about the anchor's noise level. OFF by default,
-            # and it returns the splice object itself then, so every arm on disk is unchanged.
+            # MEM_ANCHOR_T: stop lying about the anchor's noise level. Off by default, and it
+            # returns the window object itself then, so every arm on disk is unchanged.
             _splice, _ts_over = self._maybe_declare_anchor_noise(
                 _splice, _n, _kslots, _soff, current_start_frame)
             print(f"[MEM_DECODE] decoded anchor spliced ({_kslots}/{_n} slots, window convention "
-                  f"{'LEGACY (recency duplicated)' if _soff < 0 else f'oracle, slot_offset={_soff}'}"
+                  f"{'recency duplicated' if _soff < 0 else f'slot_offset={_soff}'}"
                   f"), cond={'thru' if _cond is None else ('ON' if _cond else 'off')}", flush=True)
         if int(os.environ.get("MEM_DECODE_COMPOSITE", "0") or 0) and _splice is not None:
             assert getattr(self, "_comp_applied", 0) > _comp_before, \
-                "MEM_DECODE_COMPOSITE=1 but the splice built at this switch carries NO " \
+                "MEM_DECODE_COMPOSITE=1 but the splice built at this switch carries no " \
                 "composited anchor, unsupported placement (SLOT / POS=head / full window / " \
                 "FRAMEBANK content)"
-        _blocks_env = os.environ.get("ORACLE_SPLICE_BLOCKS", "").strip()
-        assert _ts_over is None or not (_blocks_env
-                                        or os.environ.get("ORACLE_SPLICE_POS", "") == "sink0"), \
-            "MEM_ANCHOR_T is defined for the plain recency splice (it declares the noise level " \
-            "of the slot the recache writes), not for ORACLE_SPLICE_BLOCKS / POS=sink0"
-        if _splice is not None and _blocks_env:
-            _keep = {int(b) for b in _blocks_env.split(",") if b != ""}
-            self._recache_after_switch(output, current_start_frame, cond_new)
-            _snap_kv = {bi: {kk: self.kv_cache1[bi][kk].detach().to("cpu", copy=True)
-                             for kk in ("k", "v")}
-                        for bi in range(self.num_transformer_blocks) if bi not in _keep}
-            self._recache_after_switch(output, current_start_frame, cond_new,
-                                       frames_override=_splice)
-            with torch.no_grad():
-                for bi, kv in _snap_kv.items():
-                    self.kv_cache1[bi]["k"].copy_(kv["k"].to(self.kv_cache1[bi]["k"].device))
-                    self.kv_cache1[bi]["v"].copy_(kv["v"].to(self.kv_cache1[bi]["v"].device))
-            del _snap_kv
-            print(f"[ORACLE_SPLICE_BLOCKS] oracle KV kept ONLY on blocks {sorted(_keep)}, "
-                  f"other blocks restored to the normal recache")
-        elif os.environ.get("ORACLE_SPLICE_POS", "") == "sink0" and _splice is not None:
-            self._recache_after_switch(output, current_start_frame, cond_new)
-            self._write_sink_anchor(_splice[:, -1:], cond_new)
-            print(f"[ORACLE_SPLICE] sink0: anchor frame written into the SINK slot "
-                  f"(persistent), window = normal recent tail")
-        else:
-            self._recache_after_switch(output, current_start_frame, cond_new,
-                                       frames_override=_splice, timestep_override=_ts_over)
-        # MEM_SINKPURGE (arm sinkpurge): after the recache, so it rewrites the sink slots of the
+        self._recache_with_replay(output, current_start_frame, cond_new, _splice,
+                                  timestep_override=_ts_over)
+        # MEM_SINKPURGE: after the recache, so it rewrites the sink slots of the
         # cache the return will actually read. No-op unless the hook is on (default off).
         self._maybe_sinkpurge(output, current_start_frame, cond_new, is_revisit)
 
@@ -716,7 +563,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
 
         Legacy equivalence: schedule [(0, 0), (sw1, 1), (sw2, 0)] with prompts [A, B] reproduces
         `inference(noise, text_prompts_first=[A], text_prompts_second=[B], switch_frame_index=sw1,
-        second_switch_frame_index=sw2)` bitwise (selftest a). The text encoder is called once per
+        second_switch_frame_index=sw2)` exactly. The text encoder is called once per
         schedule entry, in schedule order, exactly the legacy call sequence (A, B, A).
         """
         batch_size, num_output_frames, num_channels, height, width = noise.shape
@@ -724,7 +571,7 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         num_blocks = num_output_frames // self.num_frame_per_block
 
         assert not int(os.environ.get("MEM_DECODE_THRU", "0") or 0), \
-            "MEM_DECODE_THRU (arm oracle1thru) is not supported by the N-switch driver: its " \
+            "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
             "eviction arithmetic assumes the single legacy anchor, run it through inference()"
         schedule = [(int(f), int(p)) for f, p in schedule]
         assert schedule and schedule[0][0] == 0, "schedule must start at frame 0"
@@ -756,54 +603,11 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         # one text-encoder call per schedule entry, in schedule order (legacy call sequence).
         conds = [self.text_encoder(text_prompts=[prompts[p]]) for _, p in schedule]
 
-        if low_memory:
-            gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
-            move_model_to_device_with_memory_preservation(
-                self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation
-            )
-
-        output_device = torch.device('cpu') if low_memory else noise.device
-        output = torch.zeros(
-            [batch_size, num_output_frames, num_channels, height, width],
-            device=output_device,
-            dtype=noise.dtype
-        )
-
-        local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
-        kv_policy = ""
-        if local_attn_cfg != -1:
-            kv_cache_size = local_attn_cfg * self.frame_seq_length
-            kv_policy = f"int->local, size={local_attn_cfg}"
-        else:
-            kv_cache_size = num_output_frames * self.frame_seq_length
-            kv_policy = "global (-1)"
-        print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
-
-        self._initialize_kv_cache(
-            batch_size, dtype=noise.dtype, device=noise.device,
-            kv_cache_size_override=kv_cache_size)
-        self._initialize_crossattn_cache(
-            batch_size=batch_size, dtype=noise.dtype, device=noise.device)
-        self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
-        _memwriter_sync(self.generator.model)
-
+        output = self._begin_rollout(
+            noise, low_memory,
+            first_switch_frame=schedule[1][0] if len(schedule) > 1 else None)
         current_start_frame = 0
         num_input_frames = 0
-        self._switch_global_frame = None
-        self._first_switch_frame = schedule[1][0] if len(schedule) > 1 else None
-        self._ttt_snap_A = None
-        self._ttt_snap_by_prompt = {}
-        self._thru_frame = None
-        self._thru_info = None
-        self._comp_applied = 0           # MEM_DECODE_COMPOSITE bookkeeping, per rollout
-        self._comp_gate_now = 1.0
-        self._add_installed = False
-        self._add_mass_log = []          # T1: masse par source, par chunk et par bloc
-        self._clear_add_kv()             # no additive channel may survive from a previous arm
-        self._fb_reset()
-        self.generator.model.local_attn_size = self.local_attn_size
-        print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
-        self._set_all_modules_max_attention_size(self.local_attn_size)
 
         all_num_frames = [self.num_frame_per_block] * num_blocks
 
@@ -833,62 +637,12 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                       f"{current_start_frame}", flush=True)
             cond_in_use = conds[seg]
 
-            noisy_input = noise[:, current_start_frame - num_input_frames : current_start_frame + current_num_frames - num_input_frames]
+            self._denoise_chunk(noise, output, cond_in_use, current_start_frame,
+                                num_input_frames, current_num_frames)
 
-            for index, current_timestep in enumerate(self.denoising_step_list):
-                timestep = torch.ones([batch_size, current_num_frames], device=noise.device, dtype=torch.int64) * current_timestep
-                if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                        rope_enhance=self.rope_enhance,
-                        ttt_cache=self.ttt_cache,
-                        ttt_update=False,
-                        switch_global_frame=self._switch_global_frame,
-                    )
-                    next_timestep = self.denoising_step_list[index + 1]
-                    noisy_input = self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep * torch.ones([batch_size * current_num_frames], device=noise.device, dtype=torch.long),
-                    ).unflatten(0, denoised_pred.shape[:2])
-                else:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                        rope_enhance=self.rope_enhance,
-                        ttt_cache=self.ttt_cache,
-                        ttt_update=False,
-                        switch_global_frame=self._switch_global_frame,
-                    )
-
-            output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
-
-            context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_in_use,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-                rope_enhance=self.rope_enhance,
-                ttt_cache=self.ttt_cache,
-                ttt_update=True,
-                switch_global_frame=self._switch_global_frame,
-            )
-
-            # T1 (lot offensif 2026-08-04): trace de la masse d'attention par source, un point par
-            # chunk genere, par bloc. Sans MEM_ADD_MASS_SRC=1 le report vaut None et rien n'est
-            # accumule (aucun cout, aucun changement de sortie).
+            # Trace of the attention mass per source, one point per generated chunk and per
+            # block. Without MEM_ADD_MASS_SRC=1 the report is None and nothing is accumulated,
+            # so this costs nothing and changes no output.
             if getattr(self, "_add_installed", False):
                 _src = self._add_mass_src_report()
                 if _src is not None:
@@ -906,7 +660,8 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                   f"mean {sum(_v) / max(1, len(_v)):.4f}, min {min(_v):.4f}, max {max(_v):.4f} "
                   f"| per block " + " ".join(f"{b}:{m:.3f}" for b, m in sorted(_mass.items())),
                   flush=True)
-        # T1: masse par source [sink | fenetre | ancre]. Resume + dump complet (bloc x pas).
+        # Attention mass per source [sink | window | anchor]: summary, plus a full dump
+        # (block x step) when MEM_ADD_MASS_DUMP names a file.
         _log = getattr(self, "_add_mass_log", None)
         if _log:
             _post = [e for e in _log if e["frame"] > (self._switch_global_frame or 0)]
@@ -915,18 +670,18 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                     / max(1, sum(len(e["per_block"]) for e in _use))
                     for k in ("sink", "window", "anchor")}
             _ntok = next(iter(_use[-1]["per_block"].values()))["n_tok"]
-            print(f"[MEM_ADD_MASS_SRC] masse d'attention par SOURCE apres le retour "
-                  f"({len(_use)} pas x {len(_use[-1]['per_block'])} blocs) : "
-                  f"sink {_agg['sink']:.4f} | fenetre {_agg['window']:.4f} | "
-                  f"ANCRE {_agg['anchor']:.4f}   (tokens {_ntok} = sink/fenetre/ancre, "
-                  f"part uniforme de l'ancre "
+            print(f"[MEM_ADD_MASS_SRC] attention mass per source after the return "
+                  f"({len(_use)} steps x {len(_use[-1]['per_block'])} blocks): "
+                  f"sink {_agg['sink']:.4f} | window {_agg['window']:.4f} | "
+                  f"anchor {_agg['anchor']:.4f}   (tokens {_ntok} = sink/window/anchor, "
+                  f"uniform share of the anchor "
                   f"{_ntok[2] / max(1, sum(_ntok)):.4f})", flush=True)
             _dump = os.environ.get("MEM_ADD_MASS_DUMP", "").strip()
             if _dump:
                 os.makedirs(os.path.dirname(_dump) or ".", exist_ok=True)
                 with open(_dump, "w") as _f:
                     json.dump({"summary_after_return": _agg, "n_tok": _ntok, "steps": _log}, _f)
-                print(f"[MEM_ADD_MASS_SRC] trace complete -> {_dump}", flush=True)
+                print(f"[MEM_ADD_MASS_SRC] full trace -> {_dump}", flush=True)
 
         # the generation loop is over and nothing reads these caches again, so release them
         # (~3.5 GB) right before the VAE decode, the biggest allocation of the rollout.

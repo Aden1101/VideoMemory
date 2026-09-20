@@ -14,7 +14,7 @@ Each run was also evaluated with an EMA checkpoint and at 480 frames. Those are 
 evaluation settings of the same step, not different steps, so mixing them into one line makes
 it meaningless. Only the plain eval<step>[_sink1] series is drawn.
 
-Reads results/*/eval*/metrics_c1_step*.txt directly, so the figure comes from the
+Reads results/*/eval*/metrics.txt directly, so the figure comes from the
 measured numbers and never from a hand-copied table.
 
     python scripts/make_figure.py               # writes assets/motion_identity.png
@@ -27,17 +27,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-# Panels are numbered and titled by what changed between runs. The directory names on the
-# left are internal run codes, kept only so each panel can be traced back to results/.
+# Panels are numbered and titled by what changed between runs; the directory on the left holds
+# that run's measurements, and configs/runs/ holds the config it was trained with.
 #
 # All four share the same backbone (Wan2.1-1.3B, frozen), the same LoRA co-training (rank
 # 256, unfrozen on every block) and the same objective: plain DMD distillation. Every extra
 # loss term in the codebase (identity, anti-freeze, counterfactual advantage, motion
 # matching, anti-flicker) is weighted 0 in all four configs. What differs is in the titles.
-RUNS = [("c1_cotrain", "1. writes the frames\nit is generating"),
-        ("c2_eviction", "2. writes the frames\njust forgotten"),
-        ("c3_stable", "3. same, plus the\nstability fixes"),
-        ("l1_longlive", "4. same, from the\nprevious fine-tune")]
+RUNS = [("run1_write_current_chunk", "1. writes the frames\nit is generating"),
+        ("run2_write_evicted_chunk", "2. writes the frames\njust forgotten"),
+        ("run3_write_evicted_stable", "3. same, plus the\nstability fixes"),
+        ("run4_from_longlive_lora", "4. same, from the\nprevious fine-tune")]
 KEEP = re.compile(r"^eval(\d+)(_sink1)?$")      # plain series only: no _ema, no _480, no _msc05
 # One shape throughout: round dots on a line, told apart by colour. Mixing marker shapes
 # made the legend something to decode before the chart could be read.
@@ -52,11 +52,10 @@ def load(run):
         m = KEEP.match(d)
         if not m:
             continue
-        files = [f for f in os.listdir(os.path.join(base, d))
-                 if f.startswith("metrics_c1_step") and f.endswith(".txt") and "stdout" not in f]
-        if not files:
+        path = os.path.join(base, d, "metrics.txt")
+        if not os.path.exists(path):
             continue
-        t = open(os.path.join(base, d, sorted(files)[0])).read()
+        t = open(path).read()
         ident, dd = {}, {}
         for line in t.split("\n"):
             g = re.match(r"^(memon|memzero|stock)\s+\d+\s+[\d.]+\s+[\d.]+\s+\S+\s+([\d.]+)", line)

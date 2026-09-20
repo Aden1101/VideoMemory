@@ -8,14 +8,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """Adding the anchor to the attention context instead of evicting a true frame for it."""
-import json
-import math
 import os
 
 import torch
-import torch.distributed as dist
 
-from utils.debug_option import DEBUG
 from pipeline.switch.memory_state import _find_causal_model
 
 
@@ -122,7 +118,7 @@ class AdditiveKVMixin:
                 for bi, blk in enumerate(cm.blocks)}
 
     def _add_mass_src_report(self):
-        """T1 (lot offensif 2026-08-04): attention mass by source [sink | window | anchor] per
+        """Attention mass by source [sink | window | anchor] per
         block, at the last forward. `window` = everything in the context that is not the sink
         (the prompt cache, when active, is counted there). None unless MEM_ADD_MASS_SRC=1."""
         cm = _find_causal_model(self.generator.model)

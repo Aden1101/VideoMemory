@@ -8,14 +8,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """Bringing back only the subject of the anchor, and keeping the current background."""
-import json
-import math
 import os
 
 import torch
-import torch.distributed as dist
 
-from utils.debug_option import DEBUG
 
 
 
@@ -26,9 +22,9 @@ class CompositeMixin:
     # the past: a shop awning flips colour at the return, while the frame-bank baseline brings
     # the subject back into an intact scene. The border metric saw it, the re-ID crop did not.
     # The fix is to composite the spliced latent instead of overwriting it:
-    #     composite = m * ANCHOR (the subject, decoded or real) + (1 - m) * background
+    #     composite = m * anchor (the subject, decoded or real) + (1 - m) * background
     # with background = the last true latent frame of the current context (the frame produced just
-    # before the return switch, i.e. exactly the frame oracle1 evicts) and m a soft elliptical
+    # before the return switch, i.e. exactly the frame the replay evicts) and m a soft elliptical
     # center mask. The recalled identity keeps the center; the world keeps rolling at the border.
     #   MEM_DECODE_COMPOSITE=1  turn it on   (default 0/unset = every existing arm byte-identical)
     #   MEM_COMP_CROP=0.6       fraction of H and W covered by the ellipse at m = 0.5 (the
@@ -40,7 +36,7 @@ class CompositeMixin:
         """Soft elliptical mask on the latent grid: 1 = take the anchor (the subject),
         0 = keep the current context (the background). The blend weights are the pair
         (m, 1 - m), so they sum to 1 EVERYWHERE by construction. smoothstep => C1 at both ends
-        of the ring, hence no seam in the decoded pixels (selftest_composite.py).
+        of the ring, hence no seam in the decoded pixels.
         (cy, cx) = ellipse center in PIXELS of the latent grid; None = the geometric center
         (the historical behaviour, used by every existing composite arm)."""
         assert 0.0 < crop <= 1.0, f"MEM_COMP_CROP must be in (0, 1], got {crop}"
@@ -77,7 +73,7 @@ class CompositeMixin:
     def _comp_alpha(self):
         """Composite DOSE in [0, 1]. alpha = 1 (default) = the full composite; alpha = 0 leaves
         the anchor STRICTLY untouched, i.e. the arm falls back to its non-composite twin, which
-        is what makes the prompt gate safe to ship (selftest).
+        is what makes the prompt gate safe to ship.
           MEM_COMP_ALPHA=a          fixed dose
           MEM_COMP_PROMPT_GATE=1    a is multiplied by a ramp on the cosine between the prompt
                                     ENTERING at this revisit and the prompt of the segment being
@@ -104,12 +100,12 @@ class CompositeMixin:
               f"-> composite dose alpha = {self._comp_gate_now:.3f} (ramp {lo}..{hi})", flush=True)
 
     def _maybe_composite(self, anchor, output, current_start_frame):
-        """Blend the recalled ANCHOR (subject) onto the last true latent frame of the current
+        """Blend the recalled anchor (the subject) onto the last true latent frame of the current
         context (background). Returns `anchor` itself (same object) when the hook is off, so the
         legacy code path is untouched."""
         if not int(os.environ.get("MEM_DECODE_COMPOSITE", "0") or 0):
             return anchor
-        assert os.environ.get("ORACLE_SPLICE_POS", "") not in ("head", "sink0"), \
+        assert os.environ.get("REPLAY_PAST_POS", "") not in ("head", "sink0"), \
             "MEM_DECODE_COMPOSITE is defined for the RECENCY placement only (the background it " \
             "blends into is the CURRENT context, which only makes sense at the recency slot)"
         assert current_start_frame >= 1, "MEM_DECODE_COMPOSITE before any frame was produced"
@@ -132,7 +128,8 @@ class CompositeMixin:
         uniform = int(os.environ.get("MEM_COMP_UNIFORM", "0") or 0)
         union = int(os.environ.get("MEM_COMP_UNION", "0") or 0)
         cy = cx = None
-        w_noise = w_anchor = None   # MEM_COMP_FILL: poids de la region "sujet courant" / de l'ancre
+        w_noise = w_anchor = None   # MEM_COMP_FILL: weights of the current-subject region and
+                                    # of the anchor region
         if shift:
             cx = (W - 1) / 2.0 + shift * W
         m = self._composite_mask(H, W, crop, feather, anchor.device, torch.float32, cy, cx)
@@ -179,7 +176,7 @@ class CompositeMixin:
         # (bitwise the non-composite arm), alpha = 1 is the full composite.
         alpha = self._comp_alpha()
         if alpha != 1.0 and w_noise is None:
-            # (le chemin MEM_COMP_FILL applique alpha lui-meme, sur ses trois poids)
+            # the MEM_COMP_FILL path applies alpha itself, on its three weights
             m = 1.0 - alpha * (1.0 - m)
         a_use = anchor
         sig = float(os.environ.get("MEM_COMP_ANCHOR_NOISE", "0") or 0)
@@ -200,11 +197,11 @@ class CompositeMixin:
             #   w_bg = 1 - m        the world, untouched
             # alpha scales the two non-anchor weights, so alpha = 0 still gives the pure anchor.
             assert not (invert or uniform), \
-                "MEM_COMP_FILL=noise est defini pour le masque UNION nu (pas avec invert/uniform)"
+                "MEM_COMP_FILL=noise is defined for the plain union mask, not with invert or uniform"
             assert w_anchor is not None
             _fs = min(float(os.environ.get("MEM_COMP_FILL_SIGMA", "1.0") or 1.0), 1.0)
             _gf = torch.Generator(device=anchor.device)
-            _gf.manual_seed(192837465 + current_start_frame)      # meme graine que le gate 3
+            _gf.manual_seed(192837465 + current_start_frame)      # same seed as the noise above
             _eps_fill = torch.randn(anchor.shape, generator=_gf, device=anchor.device,
                                     dtype=torch.float32).to(anchor.dtype)
             _eps_fill = ((1.0 - _fs ** 2) ** 0.5) * a_use + _fs * _eps_fill

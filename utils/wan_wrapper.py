@@ -121,7 +121,7 @@ class WanTextEncoder(torch.nn.Module):
         Missing prompts are encoded in a single batch (the encoder works batch-wise) then written
         to the cache. The result is reassembled in input order: shuffling the rows would pair a
         prompt with another one's conditioning, an error that raises no exception and would
-        falsify an entire campaign."""
+        falsify a whole evaluation run."""
         want = self._dtype_probe.dtype
         cached, missing = prompt_cache.get_many(text_prompts, self.cache_dir, want)
         if missing:

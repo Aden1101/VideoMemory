@@ -96,9 +96,10 @@ python scripts/encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_
 AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path configs/inference.yaml
 ```
 
-That config runs the unmodified model. The memory arms carry their own configs under
-`results/`. Always declare `memory_layers` explicitly, because the model default is a
-memory branch whose weights are in no checkpoint.
+That config runs the unmodified model. The four training runs behind the figure have their
+configs under `configs/runs/`, and their measurements under `results/`. Always declare
+`memory_layers` explicitly, because the model default is a memory branch whose weights are in
+no checkpoint.
 
 Two passes because the text encoder (11.4 GB) and the generator do not fit in memory together on
 a consumer machine: pass 1 encodes and exits, pass 2 never loads the encoder. Training needs

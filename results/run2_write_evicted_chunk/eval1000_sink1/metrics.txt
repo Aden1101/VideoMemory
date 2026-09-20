@@ -1,5 +1,5 @@
 ============================================================================================
-c1_cotrain step-250  ::  3-way memory eval  (memon | memzero=LoRA-drift-only | AF-stock)
+run 2, writes the frames just forgotten  |  step 1000  |  sink1  ::  3-way memory eval  (memon | memzero=LoRA-drift-only | AF-stock)
 ============================================================================================
 pre-registered thresholds: NOISE_FLOOR(DINO cos-dist)=0.18  FREEZE_LAG=0.01  VBENCH_PARITY_TOL=0.02  DRIFT_PARITY_TOL=0.03
 

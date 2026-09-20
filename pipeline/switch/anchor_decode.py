@@ -8,14 +8,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """Rebuilding an image of the subject out of the memory state alone."""
-import json
 import math
 import os
 
 import torch
-import torch.distributed as dist
 
-from utils.debug_option import DEBUG
 
 
 # MEM_DECODE: when a subject comes back, the frame fed into the attention context is decoded
@@ -53,7 +50,7 @@ def _memdec_get_decoder(ckpt_path, device):
     key = (os.path.abspath(ckpt_path), str(device))
     if key in _MEMDEC_CACHE:
         return _MEMDEC_CACHE[key]
-    from wan.modules.video_memory import AnchorFrameDecoder
+    from wan.modules.anchor_decoder import AnchorFrameDecoder
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ck["decoder"] if isinstance(ck, dict) and "decoder" in ck else ck
     assert isinstance(sd, dict) and "head.weight" in sd, \
@@ -101,7 +98,7 @@ class AnchorDecodeMixin:
         return _frame[:, 0:1].to(dtype=out_dtype, device=out_device), _cond is not None
 
     def _thru_maybe_decode(self, current_start_frame, cond_third, out_dtype, out_device):
-        """MEM_DECODE_THRU (arm oracle1thru): decode the memory state at the moment the chunk
+        """MEM_DECODE_THRU: decode the memory state at the moment the chunk
         carrying the anchor frame is evicted (i.e. the write that stores it has just happened,
         write age = 1, the decoder's best regime) and CACHE the frame; the return switch then
         splices that frame instead of decoding a ~20-writes-old state. Isolates 'the write+read
@@ -126,33 +123,33 @@ class AnchorDecodeMixin:
         self._thru_frame, _cond_on = self._memdec_frame(_ck, cond_third, out_dtype, out_device)
         self._thru_info = {"anchor_frame": int(_anchor_frame), "anchor_chunk": int(_anchor_chunk),
                            "evict_chunk": int(_cur_chunk), "window_chunks": int(_wc)}
-        print(f"[MEM_DECODE_THRU] anchor chunk {_anchor_chunk} (frame {_anchor_frame}) EVICTED "
-              f"and WRITTEN at chunk {_cur_chunk} (window_chunks {_wc}) -> state decoded NOW "
+        print(f"[MEM_DECODE_THRU] anchor chunk {_anchor_chunk} (frame {_anchor_frame}) evicted "
+              f"and written at chunk {_cur_chunk} (window_chunks {_wc}), state decoded now "
               f"(write age 1), frame cached for the return splice; "
               f"cond={'ON' if _cond_on else 'off'}", flush=True)
 
 
     # Used by the driver that handles several prompt switches in one video. `inference()` is left
-    # alone and `inference_schedule()` generalises it; a selftest checks that the two produce
+    # alone and `inference_schedule()` generalises it; the two are checked to produce
     # bitwise identical latents on the single-switch schedule, for every arm.
     @staticmethod
     def _memdec_window(output, current_start_frame, n, anchor, kslots, slot_offset):
         """The 12-frame recache window carrying the recalled anchor.
 
-        Window convention (fixed 2026-08-02, gate 2). The historical MEM_DECODE path built
+        Two conventions, because the original MEM_DECODE path built
             [output[cur - (n - k) : cur]] + [anchor] * k
-        i.e. it kept the true most recent frame cur-1 and appended the anchor after it, so every
-        true frame of the window sat one slot EARLIER than in the oracle path, which builds
+        which keeps the true most recent frame cur-1 and appends the anchor after it, while the
+        real-frame replay builds
             [output[cur - n : cur - k]] + [anchor] * k
-        (the anchor replaces the most recent true frame). The two arms were therefore not
-        measuring the same thing at all: memdec20's window duplicated the recency while
-        oracle1's replaced it. Slot_offset >= 0 selects the oracle convention:
-            slot_offset = 0  anchor at the recency slot, the 11 other slots = output[cur-12:cur-1]
-                             -> index-identical to the oracle1 splice (selftest)
+        where the anchor replaces that most recent true frame. The first duplicates the recency,
+        the second replaces it, so the two are not measuring the same thing. slot_offset >= 0
+        selects the second:
+            slot_offset = 0  anchor at the recency slot, the 11 others = output[cur-12:cur-1],
+                             so the indices match the real-frame replay exactly
             slot_offset = j  the anchor is pushed j slots back and the true frames keep the
-                             recency (the model's immediate past stays real)
-        slot_offset < 0 keeps the legacy (asymmetric) construction so the 144 mp4s already on
-        disk stay reproducible."""
+                             recency, so the model's immediate past stays real
+        slot_offset < 0 keeps the first construction, so videos already rendered with it stay
+        reproducible."""
         if slot_offset < 0:
             return torch.cat(
                 [output[:, current_start_frame - (n - kslots):current_start_frame]]

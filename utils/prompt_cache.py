@@ -19,7 +19,7 @@ size of its own chain noise, so a rounding error introduced here would be invisi
 wrong.
 
 The key is the sha256 of the prompt text and the dtype, so the cache is reusable across runs
-and campaigns and identical prompts are encoded once.
+and evaluation runs, so identical prompts are encoded once.
 """
 import hashlib
 import os
@@ -44,7 +44,7 @@ def key_of(prompt: str, dtype=None) -> str:
     encoder included. An embedding computed in float32 and then cast is not the one a bfloat16
     encoder would have produced, since weights and activations both differ. Mixing them gives
     a subtly wrong conditioning with no error raised, which is the class of bug this project
-    has already paid two campaigns for.
+    has already paid for twice.
     """
     tag = dtype_tag(dtype) if dtype is not None else "float32"
     return hashlib.sha256(f"{tag}|{prompt}".encode("utf-8")).hexdigest()

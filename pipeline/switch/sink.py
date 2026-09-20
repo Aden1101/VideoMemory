@@ -8,14 +8,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """Rewriting the pinned sink frames instead of a slot of the rolling window."""
-import json
-import math
 import os
 
 import torch
-import torch.distributed as dist
 
-from utils.debug_option import DEBUG
 from pipeline.switch.memory_state import _find_causal_model
 
 
@@ -44,14 +40,14 @@ class SinkMixin:
         mode = int(os.environ.get("MEM_SINKPURGE", "0") or 0)
         if not mode or not (is_revisit or mode >= 2):
             return
-        assert os.environ.get("ORACLE_SPLICE_POS", "") != "sink0", \
-            "MEM_SINKPURGE and ORACLE_SPLICE_POS=sink0 both rewrite the sink: not a stack"
+        assert os.environ.get("REPLAY_PAST_POS", "") != "sink0", \
+            "MEM_SINKPURGE and REPLAY_PAST_POS=sink0 both rewrite the sink: not a stack"
         assert not os.environ.get("MEM_DECODE", "").strip() \
-            and not int(os.environ.get("ORACLE_SPLICE", "0") or 0) and not self._fb_mode(), \
-            "MEM_SINKPURGE is the NO-SPLICE, NO-MEMORY control: it must not be combined with a " \
-            "recall arm (MEM_DECODE / ORACLE_SPLICE / FRAMEBANK)"
+            and not int(os.environ.get("REPLAY_PAST", "0") or 0) and not self._fb_mode(), \
+            "MEM_SINKPURGE is the control with neither a splice nor a memory: do not combine " \
+            "it with a recall arm (MEM_DECODE / REPLAY_PAST / FRAMEBANK)"
         assert getattr(self, "global_sink", False), \
-            "MEM_SINKPURGE targets the PINNED (global) sink; global_sink is off in this config"
+            "MEM_SINKPURGE targets the pinned (global) sink; global_sink is off in this config"
         k = self._sink_frames()
         assert k >= 1, "MEM_SINKPURGE: sink_size is 0, there is nothing pinned to purge"
         assert current_start_frame >= k, \

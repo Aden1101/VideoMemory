@@ -8,14 +8,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """Saving and restoring the memory itself: one slot per subject, and the offline writer overlay."""
-import json
-import math
 import os
 
 import torch
-import torch.distributed as dist
 
-from utils.debug_option import DEBUG
 
 
 # MEM_WRITER: replace the write parameters of the memory cells with ones trained offline, on

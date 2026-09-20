@@ -31,10 +31,7 @@ Thumbs.db
 
 .claude/
 
-# --- reference/ : the research record, kept on disk, not published ---------------------
-# About 650 files of probes, campaign scripts, run configs and session notes from June to
-# August 2026. All of it is in git history at commit cf1d8f1. The numbers behind the README
-# figure live in results/ instead, and the figure is regenerated from them.
+# --- reference ---------------------
 reference/
 
 # --- wandb local cache ---

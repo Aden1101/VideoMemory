@@ -8,14 +8,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """The Echo-Forcing baseline: a pool of real past frames, routed back by similarity."""
-import json
-import math
 import os
 
 import torch
-import torch.distributed as dist
 
-from utils.debug_option import DEBUG
 from pipeline.switch.anchor_decode import _memdec_pooled_cond
 
 
@@ -30,7 +26,7 @@ class FrameBankMixin:
     # as our own recall; only where the content comes from differs.
     #   FRAMEBANK=""       off (default)
     #   FRAMEBANK="key"    real routing: argmax cosine over non-adjacent entries, recall iff >= tau
-    #   FRAMEBANK="oracle" ceiling of the same bank: ground-truth prompt identity, no cosine
+    #   FRAMEBANK="truth"  ceiling of the same bank: ground-truth prompt identity, no cosine
     #   FRAMEBANK_TAU      routing threshold (default 0.90)
     #   FRAMEBANK_TIE      "recent" (default, freshest true observation) | "first" (1st appearance)
     def _fb_mode(self):
@@ -39,7 +35,7 @@ class FrameBankMixin:
     def _route_on(self):
         """Is the Echo-Forcing ROUTER (bank + cosine decision) needed at all this rollout?
         True for the framebank arms (which also splice the banked frame) and for
-        MEM_DECODE_ROUTED (arm memdec20r), which borrows the router's DECISION only. Default
+        MEM_DECODE_ROUTED, which borrows the router's decision only. Default
         off on both counts => `_fb_store`/`_fb_select` stay no-ops and every existing arm is
         byte-identical."""
         return bool(self._fb_mode()) or bool(int(os.environ.get("MEM_DECODE_ROUTED", "0") or 0))
@@ -59,8 +55,8 @@ class FrameBankMixin:
     def _fb_store(self, output, current_start_frame, seg_idx, prompt_idx, cond, subject=None):
         """Scene lifecycle 'preserve': the segment that just ended enters the pool.
         `subject` = the ground-truth identity of the segment (which may be described by several
-        different prompt strings, cf. the paraphrase scenarios); it is used only by the oracle
-        selection and by the correctness bookkeeping, the real router never sees it."""
+        different prompt strings, as in the paraphrase scenarios); it is used only by the
+        ground-truth selection and the correctness bookkeeping, the real router never sees it."""
         if not self._route_on():
             return
         assert current_start_frame >= 1, "FRAMEBANK store before any frame was produced"
@@ -90,7 +86,7 @@ class FrameBankMixin:
         force=True recalls the argmax candidate even below tau, force=False recalls nothing.
         Default None = the published behaviour, bitwise. Why: with an impoverished return prompt
         ('the animal from earlier returns') the prompt cosine collapses, the bank never fires and
-        the arm silently degenerates into memzero, the comparison with memdec20 would then be
+        the arm silently degenerates into a no-recall run, and the comparison would then be
         'a splice vs no splice', not 'which content'. What the router would have done is kept in
         the event (router_recalled / router_chosen_seg / router_s_max): it is a result of its own,
         not a detail (word routing dies in the generic regime)."""
@@ -110,7 +106,7 @@ class FrameBankMixin:
                               "subject": e["subject"], "end_frame": e["end_frame"], "sim": s}
                              for e, s in zip(cands, sims)]}
         pick = None
-        if mode == "oracle":
+        if mode == "truth":
             ok = [e for e in cands if e["subject"] == subj]
             if ok:
                 pick = ok[-1] if tie == "recent" else ok[0]
@@ -124,19 +120,20 @@ class FrameBankMixin:
                     pick = best[-1] if tie == "recent" else best[0]
             ev["rule"] = f"argmax cosine over non-adjacent scenes, recall iff s_max >= {tau}"
         else:
-            raise AssertionError(f"FRAMEBANK={mode!r} (expected ''|'key'|'oracle')")
+            raise AssertionError(f"FRAMEBANK={mode!r} (expected ''|'key'|'truth')")
         if force is not None:
-            # ce que le ROUTEUR aurait fait est conserve tel quel (resultat a part entiere)
+            # what the router would have done is kept as is, it is a result of its own
             ev["router_recalled"] = pick is not None
             ev["router_chosen_seg"] = None if pick is None else int(pick["seg"])
             ev["router_chosen_subject"] = None if pick is None else int(pick["subject"])
             ev["router_correct"] = bool(pick is not None and pick["subject"] == subj)
             ev["forced"] = bool(force)
-            ev["rule"] += " | FRAMEBANK_GT: le QUAND vient du planning, la SELECTION reste celle "
-            ev["rule"] += "de la methode (argmax meme sous tau)" if mode == "key" else "du plafond"
+            ev["rule"] += " | FRAMEBANK_GT: the moment comes from the schedule, the selection "
+            ev["rule"] += ("stays the router's (argmax even below tau)" if mode == "key"
+                           else "stays the ground-truth one")
             pick = None
             if force and cands:
-                if mode == "oracle":
+                if mode == "truth":
                     ok = [e for e in cands if e["subject"] == subj]
                     pick = (ok[-1] if tie == "recent" else ok[0]) if ok else None
                 else:

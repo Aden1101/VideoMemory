@@ -8,14 +8,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """Re-noising the anchor and denoising it again, to sharpen what the decoder produced."""
-import json
-import math
 import os
 
 import torch
-import torch.distributed as dist
 
-from utils.debug_option import DEBUG
 
 
 
@@ -35,7 +31,7 @@ class SdeditMixin:
     #   MEM_SDEDIT=s        0 or unset = off, and the anchor comes back untouched
     #   MEM_SDEDIT_SEED=n   per-run seed, so paired runs do not share one noise draw
     def _sdedit_steps(self, sigma):
-        """[t_start] + the sampler's own remaining timesteps strictly below it. With the campaign
+        """[t_start] + the sampler's own remaining timesteps strictly below it. With the
         config (denoising_step_list [1000, 750, 500, 250], warp_denoising_step, shift 5) the warped
         sampler grid is ~[1000, 937.5, 833.3, 625], so s <= 0.625 gives one model call and larger s
         walks the tail of the real schedule."""

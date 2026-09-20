@@ -24,7 +24,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import (
     StateDictType, FullStateDictConfig, FullOptimStateDictConfig
 )
-from torchvision.io import write_video
+from utils.video_io import write_video  # torchvision when available, else imageio
 
 # LoRA related imports
 import peft

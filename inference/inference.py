@@ -5,7 +5,6 @@ import torch
 import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from torchvision import transforms
 from utils.video_io import write_video  # torchvision when available, else imageio
 from einops import rearrange
 import torch.distributed as dist
@@ -19,7 +18,7 @@ from pipeline import (
 from utils.dataset import TextDataset
 from utils.misc import set_seed
 
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
 from utils.device import device as af_device, describe as af_describe
 
 parser = argparse.ArgumentParser()

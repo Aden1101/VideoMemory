@@ -19,8 +19,9 @@ from pipeline.switch.anchor_decode import AnchorDecodeMixin
 from pipeline.switch.composite import CompositeMixin
 from pipeline.switch.frame_bank import FrameBankMixin
 from pipeline.switch.memory_state import MemoryStateMixin
+from pipeline.switch.replay import ReplayPastMixin
 from pipeline.switch.sdedit import SdeditMixin
 from pipeline.switch.sink import SinkMixin
 
 __all__ = ["AdditiveKVMixin", "AnchorControlsMixin", "AnchorDecodeMixin", "CompositeMixin",
-           "FrameBankMixin", "MemoryStateMixin", "SdeditMixin", "SinkMixin"]
+           "FrameBankMixin", "MemoryStateMixin", "ReplayPastMixin", "SdeditMixin", "SinkMixin"]

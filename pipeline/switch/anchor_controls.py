@@ -8,28 +8,24 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 """Degrading or replacing the anchor, to find out what about it actually helps."""
-import json
-import math
 import os
 
 import torch
-import torch.distributed as dist
 
-from utils.debug_option import DEBUG
 
 
 
 class AnchorControlsMixin:
     def _blur_latent(self, lat, sigma):
         """Blur a real frame: decode it to pixels, blur, re-encode. Used to find how much detail
-        the returning anchor actually needs. ORACLE_BLUR_SIGMA sets the blur radius.
+        the returning anchor actually needs. ANCHOR_BLUR_SIGMA sets the blur radius.
         The point is to degrade a true anchor down to the fidelity our own decoder reaches,
         which sits beyond a 32-pixel blur. sigma=0 is a pure encode-decode round trip, so it
         measures what the round trip alone costs."""
         import torchvision.transforms.functional as TVF
         _dev = next(self.generator.parameters()).device
         assert lat.shape[1] == 1, \
-            f"ORACLE_BLUR_SIGMA supports ONE latent frame (VAE temporal compression), got {lat.shape[1]}"
+            f"ANCHOR_BLUR_SIGMA supports ONE latent frame (VAE temporal compression), got {lat.shape[1]}"
         px = self.vae.decode_to_pixel(lat.to(device=_dev, dtype=torch.bfloat16),
                                       use_cache=False)          # (B,1,3,H,W) in [-1,1]
         if sigma > 0:
@@ -37,27 +33,27 @@ class AnchorControlsMixin:
             px = TVF.gaussian_blur(px[:, 0], kernel_size=[k, k], sigma=[sigma, sigma])[:, None]
         out = self.vae.encode_to_latent(px.permute(0, 2, 1, 3, 4).to(torch.bfloat16))
         self.vae.model.clear_cache()
-        print(f"[ORACLE_BLUR] anchor frame VAE round trip with sigma={sigma} px "
+        print(f"[ANCHOR_BLUR] anchor frame VAE round trip with sigma={sigma} px "
               f"(kernel {int(6 * sigma) | 1 if sigma > 0 else 0})", flush=True)
         return out.to(dtype=lat.dtype, device=lat.device)
 
     def _anchor_content(self, output, lo, hi):
         """The original-A content that gets spliced at the return: output[:, lo:hi] by default.
-        ORACLE_ANCHOR_SRC (arm oracle1twin) replaces it with a latent frame loaded from disk --
+        ANCHOR_FROM_FILE replaces it with a latent frame loaded from disk:
         the original-A anchor of ANOTHER SEED of the same prompt pair: same prompt, same scene
-        grammar, PERFECT sharpness, WRONG instance. ORACLE_BLUR_SIGMA (arm oracle1blur) blurs
+        grammar, same sharpness, wrong instance. ANCHOR_BLUR_SIGMA blurs
         the true frame instead. Both are off by default => byte-identical to every existing arm."""
         real = output[:, lo:hi]
-        src = os.environ.get("ORACLE_ANCHOR_SRC", "").strip()
-        sig = os.environ.get("ORACLE_BLUR_SIGMA", "").strip()
-        assert not (src and sig), "ORACLE_ANCHOR_SRC and ORACLE_BLUR_SIGMA are mutually exclusive"
+        src = os.environ.get("ANCHOR_FROM_FILE", "").strip()
+        sig = os.environ.get("ANCHOR_BLUR_SIGMA", "").strip()
+        assert not (src and sig), "ANCHOR_FROM_FILE and ANCHOR_BLUR_SIGMA are mutually exclusive"
         if src:
-            assert hi - lo == 1, f"ORACLE_ANCHOR_SRC replaces ONE frame, asked for {hi - lo}"
+            assert hi - lo == 1, f"ANCHOR_FROM_FILE replaces ONE frame, asked for {hi - lo}"
             t = torch.load(src, map_location="cpu", weights_only=False)
             t = t["anchor"] if isinstance(t, dict) and "anchor" in t else t
             assert tuple(t.shape) == tuple(real.shape), \
-                f"ORACLE_ANCHOR_SRC {src}: shape {tuple(t.shape)} != {tuple(real.shape)}"
-            print(f"[ORACLE_ANCHOR_SRC] anchor content REPLACED by {src} "
+                f"ANCHOR_FROM_FILE {src}: shape {tuple(t.shape)} != {tuple(real.shape)}"
+            print(f"[ANCHOR_FROM_FILE] anchor content REPLACED by {src} "
                   f"(other seed's original-A frame)", flush=True)
             return t.to(dtype=real.dtype, device=real.device)
         if sig:
@@ -65,30 +61,30 @@ class AnchorControlsMixin:
         return real
 
     def _dump_anchor(self, output, a_end):
-        """ORACLE_ANCHOR_DUMP: save the original-A anchor latent (the exact frame oracle1
-        splices) so another cell can splice the same frame. Free side-effect, no RNG draw.
+        """ANCHOR_DUMP: save the anchor latent of the first appearance (the exact frame the
+        replay splices) so another cell can splice the same frame. Free side-effect, no RNG draw.
         If the file already exists it is checked bitwise instead of rewritten: every
         MEM_ZERO_ALL arm of a given (pair, seed) must produce the same segment A."""
-        path = os.environ.get("ORACLE_ANCHOR_DUMP", "").strip()
+        path = os.environ.get("ANCHOR_DUMP", "").strip()
         if not path:
             return
-        assert a_end is not None and a_end >= 1, "ORACLE_ANCHOR_DUMP before the first switch"
+        assert a_end is not None and a_end >= 1, "ANCHOR_DUMP before the first switch"
         # native dtype (no fp16 cast): the twin arm must be able to splice it back bitwise,
-        # which is what selftest (a) with a seed offset of 0 checks.
+        # so that the same frame can be spliced back unchanged.
         cur = output[:, a_end - 1:a_end].detach().cpu().clone()
         if os.path.exists(path):
             old = torch.load(path, map_location="cpu", weights_only=False)
             old = old["anchor"] if isinstance(old, dict) and "anchor" in old else old
             d = float((old.float() - cur.float()).abs().max())
-            print(f"[ORACLE_ANCHOR_DUMP] existing {os.path.basename(path)} re-checked: "
+            print(f"[ANCHOR_DUMP] existing {os.path.basename(path)} re-checked: "
                   f"max|diff| = {d:.3e}", flush=True)
             assert d == 0.0, \
-                f"ORACLE_ANCHOR_DUMP: segment A differs from the stored anchor ({path}, {d:.3e})"
+                f"ANCHOR_DUMP: segment A differs from the stored anchor ({path}, {d:.3e})"
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({"anchor": cur, "frame": int(a_end - 1)}, path + ".tmp")
         os.replace(path + ".tmp", path)
-        print(f"[ORACLE_ANCHOR_DUMP] original-A anchor latent (frame {a_end - 1}) -> {path}",
+        print(f"[ANCHOR_DUMP] original-A anchor latent (frame {a_end - 1}) -> {path}",
               flush=True)
 
     # ---- controls: does the anchor help because of what it contains, or just by being there? ----
@@ -158,18 +154,18 @@ class AnchorControlsMixin:
     #   MEM_ANCHOR_T_SEED=n    seed of that noise
     @staticmethod
     def _anchor_slots(n, kslots, slot_offset):
-        """[lo, hi) : les slots de la fenetre de recache occupes par l'ancre, dans les DEUX
-        conventions de `_memdec_window` (legacy: les k derniers ; offset >= 0: pousses de
-        `offset` vers le passe). Une seule source de verite pour le hook et pour son selftest."""
+        """[lo, hi): the slots of the recache window that the anchor occupies, in both
+        conventions of `_memdec_window`: the last k slots when slot_offset < 0, or those k
+        slots pushed `slot_offset` further into the past otherwise."""
         if slot_offset < 0:
             return n - kslots, n
         lo = max(0, n - kslots - slot_offset)
         return lo, lo + kslots
 
     def _maybe_declare_anchor_noise(self, splice, n, kslots, slot_offset, current_start_frame):
-        """(splice, timestep_override), l'objet splice lui-MEME et None quand le hook est OFF,
-        donc tout bras deja sur disque reste bit a bit reproductible. Ne tire AUCUN RNG global
-        (generateur dedie, comme _maybe_noise_anchor)."""
+        """Returns (window, timestep_override). When the hook is off it returns the window object
+        itself and None, so anything already rendered stays reproducible. Draws from its own
+        generator, never from the global random stream."""
         t = float(os.environ.get("MEM_ANCHOR_T", "0") or 0)
         if t <= 0.0:
             return splice, None

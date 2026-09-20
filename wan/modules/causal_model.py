@@ -12,7 +12,7 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
-from wan.modules.video_memory import VideoMemoryLayer, TTTBlockCache
+from wan.modules.video_memory import VideoMemoryLayer
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
@@ -21,13 +21,9 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
 
-from utils.debug_option import DEBUG, MY_VISUAL_DEBUG
-from typing import List, Dict, Tuple
-import torch.nn.functional as F
+from utils.debug_option import DEBUG
 import copy
-import matplotlib.pyplot as plt
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -193,7 +189,7 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        # MEM_ADDITIVE_KV phantom pass (arm oracle1add): store the raw (pre-RoPE) k/v this block
+        # MEM_ADDITIVE_KV extra pass: store the raw (pre-RoPE) k/v this block
         # produces for the anchor frame. Attribute absent by default => zero cost, zero change.
         if getattr(self, "_add_capture", False):
             self._add_captured = (k.detach().clone(), v.detach().clone())
@@ -675,7 +671,7 @@ class CausalWanAttentionBlock(nn.Module):
         _mz_all = int(os.environ.get("MEM_ZERO_ALL", "0"))
         if _mz_all != 0:                    # any nonzero value zeroes the injection on every frame
             if not globals().get("_MZ_ANNOUNCED"):   # print once/process so mem-OFF arms are auditable
-                print(f"[MEM_ZERO_ALL={_mz_all}] memory injection ZEROED, mem-OFF ablation arm", flush=True)
+                print(f"[MEM_ZERO_ALL={_mz_all}] memory injection zeroed, mem-OFF ablation arm", flush=True)
                 globals()["_MZ_ANNOUNCED"] = True
             mem_out = mem_out * 0.0
         # bound the injection to a fraction of the local residual stream, so it cannot pile up
@@ -699,7 +695,7 @@ class CausalWanAttentionBlock(nn.Module):
                 mem_out = _alpha * mem_out + (1.0 - _alpha) * mem_ema_prev.to(device=mem_out.device, dtype=mem_out.dtype)
             # first observation at this key: mem_out passes through unchanged (EMA seed)
             # CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
-            # bf16 CPU<->GPU round-trip is bit-identical (twin selftest re-validated).
+            # the bf16 round trip between CPU and GPU is exact.
             ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
         x = x + (mem_out.detach() if ttt_update else mem_out)
         if ttt_update:

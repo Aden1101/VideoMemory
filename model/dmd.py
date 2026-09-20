@@ -11,7 +11,7 @@ import torch.distributed as dist
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, MY_VISUAL_DEBUG
 import utils.debug_option as dbg
 from einops import rearrange
-from torchvision.io import write_video
+from utils.video_io import write_video  # torchvision when available, else imageio
 import os
 from utils.device import hp
 

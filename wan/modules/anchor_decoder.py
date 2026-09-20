@@ -4,29 +4,29 @@ Trained offline, on pairs collected from real rollouts, and never run during gen
 an analysis tool. Loading it is what `MEM_DECODE` does when an experiment asks for an anchor
 rebuilt from the memory rather than taken from the real past.
 """
+import math
+
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 from torch import nn
 
-from wan.modules.video_memory import swiglu_apply
+from wan.modules.video_memory import RMSNorm, swiglu_apply
 
 
 class FrameMixerBlock(nn.Module):
-    """v2 anti-checkerboard spatial mixer block (memory2 phase B).
+    """Spatial mixer block, the fix for the checkerboard pattern.
 
-    The v1 decoder is strictly per token: each of the 30x52 queries reads the state on its own
-    and the head expands it into a 2x2 latent patch, so nothing ever forces two neighbouring
-    patches to agree, and the rendered frame carries a visible 2x2 checkerboard. This block
-    adds the one thing v1 lacks, a local spatial mixing on the token grid, as a residual
-    correction:
+    Without it the decoder is strictly per token: each of the 30x52 queries reads the state on
+    its own and the head expands it into a 2x2 latent patch, so nothing forces two neighbouring
+    patches to agree and the rendered frame carries a visible 2x2 checkerboard. This block adds
+    the missing piece, a local spatial mixing on the token grid, as a residual correction:
 
         x <- x + pw2(GELU(pw1(depthwise3x3(RMSNorm(x)))))
 
-    With pw2 ZERO-INIT (weight and bias) so the block is exactly the identity at init: a decoder
-    built with mixer=True and warm-started from a v1/A2 checkpoint computes the v1 function
-    bitwise (selftest_phaseB test 1), and the extra keys are the only ones missing from the
-    old state_dict."""
+    `pw2` is zero-initialised, weight and bias, so the block is exactly the identity at
+    initialisation: a decoder built with mixer=True and warm-started from a checkpoint trained
+    without the mixer computes the same function, and `mixer.*` are the only keys the old
+    state_dict is missing."""
 
     def __init__(self, dim, hidden, kernel=3, eps=1e-5):
         super().__init__()
@@ -48,68 +48,60 @@ class FrameMixerBlock(nn.Module):
 
 
 class AnchorFrameDecoder(nn.Module):
-    """State -> latent-frame decoder ("frame de rappel decodee", plan_final_sink_virtuel DESIGN v1).
+    """Turns the memory states back into one latent video frame.
 
-    STANDALONE readout module: reads the fast-weight states of the (3) VideoMemoryLayer cells
-    and synthesizes ONE latent video frame (B, 1, 16, 60, 104), to be spliced into the recache
-    via the existing frames_override hook at the revisit switch (the exact oracle1 mechanism,
-    +0.224 / 24+/0-). Trained OFFLINE on (states, evicted-frame) pairs -- this class is NOT
-    wired into any forward or pipeline here (additive code only; nothing existing is touched).
+    A standalone readout module: it reads the fast weights of the three VideoMemoryLayer cells
+    and synthesizes one latent frame (B, 1, 16, 60, 104), which the pipeline splices into the
+    cache at a revisit through the existing `frames_override` hook. Trained offline on
+    (states, evicted-frame) pairs. Nothing here runs during generation.
 
-    Inputs: `states` = sequence of num_blocks (w0, w1, w2) tuples, in memory_layers order
-    (e.g. blocks [5, 16, 27]). Shapes exactly as produced by VideoMemoryLayer(num_heads=1)
-    init_state()/step(): the leading axis is B*num_heads == B (nh=1 in causal_model.py),
-    w0 (B, dim, dim*inter_multi), w1 (B, dim*inter_multi, dim), w2 like w0.
-    States are INPUTS, not parameters: detached by default so no gradient ever reaches them
-    (detach_states=False is the v2 end-to-end escape hatch, unused in v1 offline training).
+    Inputs: `states` = one (w0, w1, w2) tuple per memory block, in `memory_layers` order
+    (blocks 5, 16, 27). Shapes exactly as `VideoMemoryLayer(num_heads=1).init_state()` and
+    `.step()` produce them, so the leading axis is B: w0 (B, dim, dim*inter_multi),
+    w1 (B, dim*inter_multi, dim), w2 like w0. States are inputs, not parameters, and are
+    detached by default so no gradient ever reaches them.
 
-    Architecture (localplan_B section 3.1 adapted to the frame readout of design 2):
-      - m = 30*52 = 1560 learned queries, ONE PER 2x2 LATENT PATCH of the frame. A factorized
-        learned 2D grid embedding (row 30 + col 52) is SHARED across blocks so the three reads
-        of a given patch address the same spatial slot; the query TABLE is PER-BLOCK (the
-        block-5/16/27 states live in depth-specific feature spaces, one shared table cannot
-        speak all three key spaces).
-      - per block b: q_norm (RMSNorm, mirroring the cell's own read path) on (queries_b + pos2d),
-        then swiglu_apply(q, w0, w1, w2) -> read (B, 1560, 1536); per-block RMSNorm on the read
-        (a plain normalization of a fresh read: nothing is subtracted anywhere in this module,
-        so there is no renorm-after-subtraction).
-      - fusion: concat of the 3 reads (4608) -> Linear 4608->3072 -> GELU -> Linear 3072->1536
-        -> LayerNorm (per token; no cross-token mixing: the state is a global associative
-        memory, each patch retrieves its own content by address).
-      - head: Linear 1536 -> 16*2*2 = 64 per token, ZERO-INIT (weight AND bias) => the decoder
-        emits an EXACTLY-NULL frame at init (never xavier noise into the cache), then
-        unpatchify to (B, 1, 16, 60, 104) mirroring CausalWanModel.unpatchify's layout
-        (token dim = (ph, pw, c), tokens (h, w) row-major).
+    Architecture
+      - m = 30*52 = 1560 learned queries, one per 2x2 latent patch of the frame. A factorized
+        learned 2D grid embedding (30 rows + 52 columns) is shared across blocks, so the three
+        reads of a given patch address the same spatial slot. The query table itself is per
+        block: the states of blocks 5, 16 and 27 live in depth-specific feature spaces and one
+        shared table cannot speak all three.
+      - per block: RMSNorm on (query + grid embedding), mirroring the cell's own read path,
+        then swiglu_apply(q, w0, w1, w2) giving a read of (B, 1560, 1536), then a per-block
+        RMSNorm on that read.
+      - fusion: the 3 reads concatenated (4608) -> Linear 4608 to 3072 -> GELU -> Linear 3072
+        to 1536 -> LayerNorm, per token. No cross-token mixing here: the state is a global
+        associative memory and each patch retrieves its own content by address.
+      - head: Linear 1536 to 16*2*2 = 64 per token, zero-initialised in weight and bias, so the
+        decoder emits an exactly null frame at initialisation rather than noise. Unpatchify to
+        (B, 1, 16, 60, 104) follows CausalWanModel.unpatchify: token dim = (ph, pw, c), tokens
+        in (h, w) row-major order.
 
-    Param count (defaults dim=1536, num_blocks=3, grid 30x52, fuse_hidden=3072) = 26,304,064:
-      queries 3*1560*1536 = 7,188,480 ; 2D grid emb (30+52)*1536 = 125,952 ;
-      q_norms + read_norms 6*1536 = 9,216 ; fuse 4608->3072->1536 (+biases) = 18,878,976 ;
-      out LayerNorm 3,072 ; head 1536->64 (+bias) = 98,368  => ~26.3M, under the 40M budget.
+    Parameter count with the defaults (dim=1536, num_blocks=3, grid 30x52, fuse_hidden=3072):
+    queries 3*1560*1536 = 7,188,480; grid embedding (30+52)*1536 = 125,952; the six norms
+    6*1536 = 9,216; fusion 4608->3072->1536 with biases = 18,878,976; output LayerNorm 3,072;
+    head 1536->64 with bias = 98,368. Total about 26.3M, under the 40M budget.
 
-    v1.1 OPTIONAL CONDITIONING (recency-bias attack, plan_final CORRECTIF v1): cond_dim > 0
-    adds a light MLP LayerNorm(cond_dim) -> Linear(cond_dim, cond_hidden) -> GELU ->
-    Linear(cond_hidden, num_blocks*2*dim) producing per-block FiLM (scale, shift) applied to
-    the NORMALIZED read queries: q <- q*(1+scale) + shift = "look in the state for what
-    matches THIS description" (cond = the POOLED T5 embedding of the prompt whose content
-    must be resurrected, i.e. prompt A at a revisit). The last linear is ZERO-INIT (weight
-    AND bias) so at init scale = shift = 0 and the conditioned decoder computes EXACTLY the
-    v1.0 function -- clean warm-start from a v1.0 checkpoint (its state_dict loads with
-    strict=False; the only missing keys are cond_norm/cond_in/cond_out at their inert init).
-    cond_dim = 0 (default) creates NO cond modules: state_dict and forward are byte-identical
-    to v1.0. The input LayerNorm makes the FiLM robust to the pooled-embedding scale (the
-    T5 mean pools over zero-padded positions, so the raw norm varies with prompt length).
-    Extra params at cond_dim=4096, cond_hidden=512: 8,192 + 2,097,664 + 4,727,808 =
-    6,833,664 => total 33,137,728, still under the 40M budget.
+    Optional conditioning: cond_dim > 0 adds LayerNorm(cond_dim) -> Linear(cond_dim,
+    cond_hidden) -> GELU -> Linear(cond_hidden, num_blocks*2*dim), producing a per-block
+    (scale, shift) pair applied to the normalized queries as q <- q*(1+scale) + shift. That is
+    "look in the state for what matches this description", where the description is the pooled
+    T5 embedding of the prompt whose subject must come back. The last linear is zero-initialised
+    in weight and bias, so scale = shift = 0 at initialisation and the conditioned decoder
+    computes the unconditioned function: an unconditioned checkpoint warm-starts with
+    strict=False, the only missing keys being the inert cond modules. cond_dim = 0, the default,
+    creates no conditioning module at all. The input LayerNorm makes the conditioning robust to
+    the scale of the pooled embedding, which varies with prompt length because T5 averages over
+    zero-padded positions. Extra parameters at cond_dim=4096, cond_hidden=512: 6,833,664, for a
+    total of 33.1M.
 
-    v2 OPTIONAL SPATIAL MIXER (memory2 phase B, anti-checkerboard): mixer=True inserts
-    `mixer_blocks` FrameMixerBlock AFTER the per-token reads/fusion and BEFORE the head, the
-    only place in the module where two neighbouring 2x2 patches can talk to each other. Every
-    block is zero-init on its last pointwise => the mixer is EXACTLY the identity at init, so
-    a v1/A2 checkpoint warm-starts into it with strict=False and the ONLY missing keys are
-    `mixer.*` (asserted by the trainer and by selftest_phaseB). mixer=False (default) creates
-    NO module: state_dict and forward are byte-identical to v1.
-    Extra params at dim=1536, mixer_hidden=768, 2 blocks: 2 * (1536 (norm) + 15,360 (dw) +
-    1,180,416 (pw1) + 1,181,184 (pw2)) = 4,756,992 => total 37,894,720, still under 40M.
+    Optional spatial mixer: mixer=True inserts `mixer_blocks` FrameMixerBlock between the
+    per-token fusion and the head, the only place in the module where two neighbouring patches
+    can talk to each other. Each is the identity at initialisation, so a checkpoint trained
+    without the mixer warm-starts with strict=False and `mixer.*` are the only missing keys.
+    mixer=False, the default, creates no module. Extra parameters at dim=1536,
+    mixer_hidden=768, 2 blocks: 4,756,992, for a total of 37.9M.
     """
 
     def __init__(
@@ -123,10 +115,10 @@ class AnchorFrameDecoder(nn.Module):
         patch_w: int = 2,
         z_dim: int = 16,           # latent channels
         fuse_hidden: int = 3072,
-        detach_states: bool = True,  # v1 offline: states are data, never receive gradient
-        cond_dim: int = 0,           # v1.1: pooled-prompt FiLM conditioning; 0 = off = exact v1.0
+        detach_states: bool = True,  # states are data, they never receive gradient
+        cond_dim: int = 0,           # pooled-prompt conditioning of the queries; 0 = off
         cond_hidden: int = 512,      # hidden width of the cond MLP (only used when cond_dim > 0)
-        mixer: bool = False,         # v2: spatial mixing on the token grid (default off = v1)
+        mixer: bool = False,         # spatial mixing on the token grid (default off)
         mixer_blocks: int = 2,       # number of residual mixer blocks
         mixer_hidden: int = 768,     # pointwise bottleneck width of a mixer block
         mixer_kernel: int = 3,       # depthwise kernel
@@ -141,8 +133,8 @@ class AnchorFrameDecoder(nn.Module):
         self.m = grid_h * grid_w
         self.detach_states = detach_states
 
-        # per-block query tables + shared factorized 2D grid embedding (init scale as in the
-        # localplan_B queries: randn / sqrt(dim); the q_norm renormalizes anyway)
+        # per-block query tables + shared factorized 2D grid embedding, initialised at
+        # randn / sqrt(dim); the norm on the queries renormalizes anyway
         self.queries = nn.Parameter(torch.randn(num_blocks, self.m, dim) / math.sqrt(dim))
         self.pos_row = nn.Parameter(torch.randn(grid_h, dim) / math.sqrt(dim))
         self.pos_col = nn.Parameter(torch.randn(grid_w, dim) / math.sqrt(dim))
@@ -157,9 +149,9 @@ class AnchorFrameDecoder(nn.Module):
         nn.init.zeros_(self.head.weight)   # null frame at init, never xavier noise
         nn.init.zeros_(self.head.bias)
 
-        # v1.1 optional FiLM conditioning on the read queries (cond_dim == 0 -> no modules
-        # created: the unconditioned decoder is strictly the v1.0 module, same state_dict)
-        # v2 spatial mixer (identity at init; no module created when mixer=False -> exact v1)
+        # optional conditioning of the read queries; cond_dim == 0 creates no module, so the
+        # unconditioned decoder keeps exactly the same state_dict
+        # spatial mixer, identity at init; no module created when mixer=False
         self.use_mixer = bool(mixer)
         if self.use_mixer:
             assert mixer_blocks > 0, "mixer=True with mixer_blocks=0"
@@ -174,7 +166,7 @@ class AnchorFrameDecoder(nn.Module):
             self.cond_in = nn.Linear(cond_dim, cond_hidden)
             self.cond_out = nn.Linear(cond_hidden, num_blocks * 2 * dim)
             nn.init.zeros_(self.cond_out.weight)  # FiLM identity at init: scale = shift = 0
-            nn.init.zeros_(self.cond_out.bias)    # -> conditioned model == v1.0 model exactly
+            nn.init.zeros_(self.cond_out.bias)    # conditioned model == unconditioned one at init
 
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -208,7 +200,7 @@ class AnchorFrameDecoder(nn.Module):
                 cond = cond[None]
             assert cond.dim() == 2 and cond.shape[-1] == self.cond_dim, \
                 f"cond {tuple(cond.shape)} != (B, {self.cond_dim})"
-            if self.detach_states:  # cond is data in v1 offline training, like the states
+            if self.detach_states:  # the conditioning is data, like the states
                 cond = cond.detach()
             f = self.cond_out(F.gelu(self.cond_in(self.cond_norm(cond.to(dtype)))))
             film = f.view(f.shape[0], self.num_blocks, 2, self.dim)  # (Bc, nb, {scale,shift}, dim)
@@ -239,13 +231,13 @@ class AnchorFrameDecoder(nn.Module):
                 assert fb.shape[0] == B, \
                     f"cond batch {film.shape[0]} != state batch {B} (and not broadcastable)"
                 # FiLM after the q_norm so the modulation is not renormalized away; at the
-                # zero-init (scale = shift = 0) this is q*1 + 0 == q exactly (v1.0 identity)
+                # zero-init means scale = shift = 0, so this is q*1 + 0 == q exactly
                 q = q * (1.0 + fb[:, b, 0].unsqueeze(1)) + fb[:, b, 1].unsqueeze(1)
             r = swiglu_apply(q, w0, w1, w2)                         # read: (B, m, dim)
             reads.append(self.read_norms[b](r))
         h = torch.cat(reads, dim=-1)                                # (B, m, 3*dim)
         h = self.fuse2(F.gelu(self.fuse1(h)))
-        if getattr(self, "use_mixer", False):                       # v2: inter-token spatial
+        if getattr(self, "use_mixer", False):                       # inter-token spatial
             for blk in self.mixer:                                  # mixing, identity at init
                 h = blk(h, self.grid_h, self.grid_w)
         tok = self.head(self.out_norm(h))                           # (B, m, 64), == 0 at init

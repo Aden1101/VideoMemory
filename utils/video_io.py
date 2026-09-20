@@ -1,8 +1,8 @@
 """Video writing, one entry point.
 
 `torchvision.io.write_video` was deprecated and then removed (gone as of torchvision 0.24).
-The repo imports it at the top of four files, so on any recent install the inference path
-breaks at import time with a message that says nothing about the real problem.
+It was imported at the top of several modules, so on any recent install the code broke at
+import time with a message that said nothing about the real problem.
 
 Torchvision is used when it is there, so behaviour and encoding are unchanged on a
 README-conformant install (torchvision 0.21). Otherwise this falls back to imageio, which is

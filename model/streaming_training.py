@@ -560,7 +560,7 @@ class StreamingTrainingModel:
         """Clone every piece of state a chunk generation mutates (KV / cross-attn / flow / prompt
         caches, fast-weight state, RNG streams, switch flag) so a mem-OFF twin of the same chunk can
         be generated and then fully undone. Tensor clones go to CPU to spare VRAM. Completeness is
-        validated empirically by E3_TWIN_SELFTEST=1 (twin with memory ON must equal the real chunk
+        validated empirically by TWIN_SELFTEST=1 (twin with memory ON must equal the real chunk
         bitwise)."""
         import random as _pyrand
         p = self.inference_pipeline
@@ -707,11 +707,11 @@ class StreamingTrainingModel:
         # Same pre-chunk state, same noise, same RNG stream, injection zeroed -> the only difference
         # vs the real chunk is the memory's injection during this chunk. Generated first, then every
         # mutated state is restored, so the real rollout below is bit-identical to a no-twin run.
-        # Selftest (mandatory before launch): E3_TWIN_SELFTEST=1 keeps the memory ON in the twin and
+        # Self-check: TWIN_SELFTEST=1 keeps the memory on in the twin and
         # the code below asserts twin == real, which validates snapshot completeness + RNG pairing.
         twin_new_frames = None
         if make_twin and self.state.get("previous_frames") is not None:
-            _selftest = os.environ.get("E3_TWIN_SELFTEST", "0") == "1"
+            _selftest = os.environ.get("TWIN_SELFTEST", "0") == "1"
             _snap = self._twin_snapshot()
             _prev_mz = os.environ.get("MEM_ZERO_ALL")
             if not _selftest:
@@ -743,7 +743,7 @@ class StreamingTrainingModel:
             keep_last_write_grad=keep_last_write_grad,
         )
 
-        if twin_new_frames is not None and os.environ.get("E3_TWIN_SELFTEST", "0") == "1":
+        if twin_new_frames is not None and os.environ.get("TWIN_SELFTEST", "0") == "1":
             _diff = (generated_new_frames.detach() - twin_new_frames).abs().max().item()
             print(f"[E3-TWIN-SELFTEST] rank{dist.get_rank() if dist.is_initialized() else 0} "
                   f"max|real - twin(mem ON)| = {_diff:.3e} (MUST be 0.0)", flush=True)
@@ -1072,7 +1072,7 @@ class StreamingTrainingModel:
         # do-no-harm hinge: fires only when the injection makes identity worse than mem-OFF (beyond
         # the noise deadband); no gate needed, under freeze it is zero, and the mm terms own freeze.
         dnh = F.relu(-A - self.dnh_deadband)
-        # bonus-mode clamped reward (default OFF): motion-validity gate detached (never a lever)
+        # bonus-mode clamped reward (off by default): motion-validity gate detached, never a lever
         with torch.no_grad():
             ref = m_tgt if m_tgt is not None else m_cf
             gate = torch.exp(-((torch.log(m_on.detach() + eps) - torch.log(ref + eps)) ** 2)
