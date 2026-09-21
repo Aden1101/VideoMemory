@@ -2,9 +2,9 @@
 """Bitwise fingerprints of the memory path, to tell a refactor from a behaviour change.
 
 A refactor must leave every number unchanged, and "it still runs" does not show that. This
-script runs three small deterministic computations and hashes what comes out: the memory cell
-alone, a miniature CausalWanModel rolled out with the memory branch live (read pass, then the
-write pass that feeds the evicted chunk), and the composite blend. It needs no weights.
+script runs two small deterministic computations and hashes what comes out: the memory cell
+alone, and a miniature CausalWanModel rolled out with the memory branch live (read pass, then
+the write pass that feeds the evicted chunk). It needs no weights.
 
     python tests/fingerprints.py --record   # on the code you trust: writes tests/fingerprints.json
     python tests/fingerprints.py            # on the code you changed: compares, exits 1 on a diff
@@ -24,7 +24,6 @@ import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from pipeline.switch.composite import CompositeMixin  # noqa: E402
 from utils.device import device  # noqa: E402
 from wan.modules.causal_model import CausalWanModel  # noqa: E402
 from wan.modules.video_memory import TTTBlockCache, VideoMemoryLayer  # noqa: E402
@@ -109,34 +108,7 @@ def model_rollout():
     return digest(*outs, *ttt[1].state)
 
 
-class _Composite(CompositeMixin):
-    _comp_applied, _comp_gate_now = 0, 1.0
-
-
-def composite_blend():
-    """The subject/background blend, plain and with the union mask and its noise fill."""
-    g = torch.Generator().manual_seed(7)
-    out = torch.randn(1, 200, 16, 60, 104, generator=g)
-    anchor = torch.randn(1, 1, 16, 60, 104, generator=g)
-    saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("MEM_COMP")}
-    results = []
-    try:
-        for extra in ({}, {"MEM_COMP_UNION": "1", "MEM_COMP_FILL": "floor"},
-                      {"MEM_COMP_ALPHA": "0.5", "MEM_COMP_ANCHOR_NOISE": "0.5"}):
-            for k in [k for k in os.environ if k.startswith("MEM_COMP")]:
-                del os.environ[k]
-            os.environ.update({"MEM_DECODE_COMPOSITE": "1", **extra})
-            results.append(_Composite()._maybe_composite(anchor, out, 180))
-    finally:
-        for k in [k for k in os.environ if k.startswith("MEM_COMP")]:
-            del os.environ[k]
-        os.environ.pop("MEM_DECODE_COMPOSITE", None)
-        os.environ.update({k: v for k, v in saved.items() if v is not None})
-    return digest(*results)
-
-
-CASES = {"cell_alone": cell_alone, "model_rollout": model_rollout,
-         "composite_blend": composite_blend}
+CASES = {"cell_alone": cell_alone, "model_rollout": model_rollout}
 
 
 def main():

@@ -19,10 +19,10 @@ import types
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MODULES = [
-    "wan.modules.video_memory", "wan.modules.memory_inject", "wan.modules.additive_attention",
+    "wan.modules.video_memory", "wan.modules.memory_inject",
     "wan.modules.anchor_decoder", "wan.modules.causal_model",
     "utils.env", "utils.log", "utils.device", "utils.prompt_cache", "utils.video_io", "utils.wan_wrapper",
-    "pipeline.switch", "pipeline.switch.noise", "pipeline.switch.schedule", "pipeline.switch.routing",
+    "pipeline.switch", "pipeline.switch.noise", "pipeline.switch.schedule",
     "pipeline.switch.driver", "pipeline.switch_causal_inference", "pipeline.memory_rollout",
     "pipeline.streaming_training", "pipeline.streaming_switch_training",
     "model.twin_objective", "model.streaming_training",

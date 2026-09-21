@@ -127,7 +127,7 @@ python tests/test_env_and_schedule.py  # arm switches and prompt schedule
 python tests/test_imports.py           # every module imports, heavy packages stubbed
 python tests/test_eval_report.py       # the scoring script writes the 29 published tables again
 python tests/test_readme_claims.py     # the numbers and the config claims of this README
-python -m utils.env                    # the 57 switches of the measurement arms, one line each
+python -m utils.env                    # the switches of the measurement arms, one line each
 ```
 
 With torch, `tests/test_memory_cell.py` checks what this README says of the cell through the code
@@ -165,11 +165,10 @@ into upstream's classes, so `git diff 392b3f8` on an upstream file shows call si
 |---|---|
 | `wan/modules/video_memory.py` | the memory cell: read, write gradient, Muon update, gated output |
 | `wan/modules/memory_inject.py` | the cell inside a transformer block, and the eviction feed |
-| `wan/modules/additive_attention.py` | attention over the context plus extra anchor tokens |
 | `model/twin_objective.py` | the counterfactual-twin objective |
 | `trainer/memory_training.py` | backpropagation across chunks, state snapshots, optimizer groups, memory logs |
 | `pipeline/memory_rollout.py` | the write pass under grad, and cache dropout |
-| `pipeline/switch/` | recall at a prompt switch: `driver.py` is the rollout, `schedule.py` its plan, and each other module one way of bringing the subject back, with its controls |
+| `pipeline/switch/` | recall at a prompt switch: `driver.py` is the rollout, `schedule.py` its plan, `replay.py` and `decoded_anchor.py` the two ways of bringing the subject back, `anchor_controls.py` the controls on what they carry |
 | `utils/device.py`, `utils/env.py`, `utils/prompt_cache.py` | device layer, arm switches, prompt cache |
 
 ## Credit

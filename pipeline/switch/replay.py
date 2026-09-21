@@ -9,8 +9,6 @@ Off by default.
                            the true recent tail. 0 or unset = the whole window.
     REPLAY_PAST_POS=head   put those k slots at the oldest end of the window instead of the
                            most recent one: a distant reference rather than a recent frame.
-    REPLAY_PAST_POS=sink0  leave the window alone and write the frame into the sink slot,
-                           which is read forever and never evicted.
     REPLAY_PAST_SLOT=j     a single past frame, placed j slots before the most recent one.
     REPLAY_PAST_NOISE=s    degrade the replayed frames with noise of standard deviation s,
                            to imitate an imperfect recall.
@@ -24,18 +22,16 @@ from utils.log import log
 
 
 def replay_position():
-    """REPLAY_PAST_POS: "" for the most recent slots, "head" for the oldest end of the window,
-    "sink0" for the sink slot."""
-    return env_choice("REPLAY_PAST_POS", ("head", "sink0"))
+    """REPLAY_PAST_POS: "" for the most recent slots, "head" for the oldest end of the window."""
+    return env_choice("REPLAY_PAST_POS", ("head",))
 
 
 class ReplayPastMixin:
-    def _build_replay_window(self, output, current_start_frame, a_end, *, composite=False):
+    def _build_replay_window(self, output, current_start_frame, a_end):
         """The window of latent frames to recache, or None when the arm is off.
 
         `a_end` is the end latent frame (exclusive) of the segment where the subject first
-        appeared, so the anchor frame is `a_end - 1`. `composite=True` keeps only the subject
-        region of the replayed tail and takes the border from the current scene.
+        appeared, so the anchor frame is `a_end - 1`.
         """
         if not env_int("REPLAY_PAST"):
             return None
@@ -59,11 +55,9 @@ class ReplayPastMixin:
                 log(f"[REPLAY_PAST] first {nf}/{n} window slots from the first appearance "
                     f"[{a_end - nf}, {a_end}), rest = recent tail")
             else:
-                tail = self._anchor_content(output, a_end - nf, a_end)
-                if composite:
-                    tail = self._maybe_composite(tail, output, current_start_frame)
                 window = torch.cat([
-                    output[:, current_start_frame - n:current_start_frame - nf], tail], dim=1)
+                    output[:, current_start_frame - n:current_start_frame - nf],
+                    self._anchor_content(output, a_end - nf, a_end)], dim=1)
                 log(f"[REPLAY_PAST] last {nf}/{n} window slots from the first appearance "
                     f"[{a_end - nf}, {a_end}), rest = true recent tail")
         else:
@@ -87,40 +81,25 @@ class ReplayPastMixin:
         log(f"[REPLAY_PAST_NOISE] degraded the last {na} replayed frame(s), sigma={dose}")
         return torch.cat([window[:, :-na], degraded], dim=1)
 
-    def _recache_with_replay(self, output, current_start_frame, cond, window,
-                             *, timestep_override=None):
+    def _recache_with_replay(self, output, current_start_frame, cond, window):
         """Refill the kv cache at a switch, with `window` in place of the true recent frames.
         `window=None` gives the plain recache."""
         blocks_env = env_str("REPLAY_PAST_BLOCKS")
-        sink0 = replay_position() == "sink0"
-        assert timestep_override is None or not (blocks_env or sink0), \
-            "MEM_ANCHOR_T declares the noise level of the slot the recache writes, so it is " \
-            "defined for the plain window, not for REPLAY_PAST_BLOCKS / REPLAY_PAST_POS=sink0"
-        if window is not None and blocks_env:
-            # Keep the replayed frames only on the listed blocks and a normal window elsewhere:
-            # does the anchor at the memory blocks alone bring the subject back? Both passes see
-            # the same frames at the same positions, so restoring k and v is exact.
-            keep = {int(b) for b in blocks_env.split(",") if b != ""}
-            self._recache_after_switch(output, current_start_frame, cond)
-            snap_kv = {bi: {kk: self.kv_cache1[bi][kk].detach().to("cpu", copy=True)
-                            for kk in ("k", "v")}
-                       for bi in range(self.num_transformer_blocks) if bi not in keep}
+        if window is None or not blocks_env:
             self._recache_after_switch(output, current_start_frame, cond, frames_override=window)
-            with torch.no_grad():
-                for bi, kv in snap_kv.items():
-                    self.kv_cache1[bi]["k"].copy_(kv["k"].to(self.kv_cache1[bi]["k"].device))
-                    self.kv_cache1[bi]["v"].copy_(kv["v"].to(self.kv_cache1[bi]["v"].device))
-            del snap_kv
-            log(f"[REPLAY_PAST_BLOCKS] replayed k/v kept only on blocks {sorted(keep)}, "
-                f"other blocks restored to the normal recache")
-        elif sink0 and window is not None:
-            # normal recache, so the window stays the true recent tail, then the anchor frame
-            # overwrites the sink slot, which is read forever and never evicted
-            self._recache_after_switch(output, current_start_frame, cond)
-            self._write_sink_anchor(window[:, -1:], cond)
-            log("[REPLAY_PAST] sink0: anchor frame written into the sink slot (persistent), "
-                "window = normal recent tail")
-        else:
-            self._recache_after_switch(output, current_start_frame, cond,
-                                       frames_override=window,
-                                       timestep_override=timestep_override)
+            return
+        # Keep the replayed frames only on the listed blocks and a normal window elsewhere:
+        # does the anchor at the memory blocks alone bring the subject back? Both passes see
+        # the same frames at the same positions, so restoring k and v is exact.
+        keep = {int(b) for b in blocks_env.split(",") if b != ""}
+        self._recache_after_switch(output, current_start_frame, cond)
+        snap_kv = {bi: {kk: self.kv_cache1[bi][kk].detach().to("cpu", copy=True)
+                        for kk in ("k", "v")}
+                   for bi in range(self.num_transformer_blocks) if bi not in keep}
+        self._recache_after_switch(output, current_start_frame, cond, frames_override=window)
+        with torch.no_grad():
+            for bi, kv in snap_kv.items():
+                self.kv_cache1[bi]["k"].copy_(kv["k"].to(self.kv_cache1[bi]["k"].device))
+                self.kv_cache1[bi]["v"].copy_(kv["v"].to(self.kv_cache1[bi]["v"].device))
+        log(f"[REPLAY_PAST_BLOCKS] replayed k/v kept only on blocks {sorted(keep)}, "
+            f"other blocks restored to the normal recache")

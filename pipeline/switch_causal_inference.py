@@ -12,22 +12,15 @@ import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from pipeline.causal_inference import CausalInferencePipeline  # reuse init utilities
-from pipeline.switch.memory_state import MemoryStateMixin
 from pipeline.switch.decoded_anchor import AnchorDecodeMixin
 from pipeline.switch.anchor_controls import AnchorControlsMixin
-from pipeline.switch.sdedit import SdeditMixin
-from pipeline.switch.sink import SinkMixin
-from pipeline.switch.composite import CompositeMixin
-from pipeline.switch.additive_kv import AdditiveKVMixin
-from pipeline.switch.frame_bank import FrameBankMixin
 from pipeline.switch.replay import ReplayPastMixin
 from pipeline.switch.schedule import two_switch_schedule
 from pipeline.switch.driver import ScheduleDriverMixin
 
 
-class SwitchCausalInferencePipeline(ScheduleDriverMixin, MemoryStateMixin, AnchorDecodeMixin, AnchorControlsMixin,
-                                    SdeditMixin, SinkMixin, CompositeMixin, AdditiveKVMixin,
-                                    FrameBankMixin, ReplayPastMixin, CausalInferencePipeline):
+class SwitchCausalInferencePipeline(ScheduleDriverMixin, AnchorDecodeMixin, AnchorControlsMixin,
+                                    ReplayPastMixin, CausalInferencePipeline):
     """Generate a video, switch prompt one or more times, and optionally feed a past
     subject back into the attention context at the return. Each way of feeding it back
     lives in its own module under pipeline/switch/."""
@@ -45,7 +38,7 @@ class SwitchCausalInferencePipeline(ScheduleDriverMixin, MemoryStateMixin, Ancho
         self.global_sink = getattr(args, "global_sink", False)
 
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict,
-                              frames_override=None, timestep_override=None):
+                              frames_override=None):
         if not self.global_sink:
             # reset kv cache
             for block_idx in range(self.num_transformer_blocks):
@@ -95,25 +88,6 @@ class SwitchCausalInferencePipeline(ScheduleDriverMixin, MemoryStateMixin, Ancho
 
         context_timestep = torch.ones([batch_size, num_recache_frames],
                                     device=device, dtype=torch.int64) * self.args.context_noise
-        # MEM_ANCHOR_T: the declared noise level is already per frame, so one slot can be
-        # declared noisy while the 11 true frames keep context_noise. None = off.
-        if timestep_override is not None:
-            # With uniform_timestep, the wrapper reduces the per-frame timestep to slot 0's,
-            # which would silently drop the declaration and turn this into plain noising.
-            assert not getattr(self.generator, "uniform_timestep", False), \
-                "MEM_ANCHOR_T needs a causal generator (uniform_timestep=False): otherwise the " \
-                "per-frame timestep is reduced to slot 0's and the declaration is lost"
-            assert timestep_override.shape[-1] == num_recache_frames, \
-                f"timestep_override has {timestep_override.shape[-1]} entries, recache needs " \
-                f"{num_recache_frames}"
-            context_timestep = timestep_override.to(device=device).round().to(torch.int64) \
-                .reshape(1, num_recache_frames).expand(batch_size, -1).contiguous()
-            _d = [(i, int(x)) for i, x in enumerate(context_timestep[0].tolist())
-                  if int(x) != int(self.args.context_noise)]
-            print(f"[MEM_ANCHOR_T] recache timesteps: {len(_d)} slot(s) declared off-baseline "
-                  f"{_d} (baseline {int(self.args.context_noise)}, {num_recache_frames} slots)",
-                  flush=True)
-
         self.generator.model.block_mask = block_mask
 
         with torch.no_grad():

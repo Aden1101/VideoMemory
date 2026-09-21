@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from pipeline.switch.noise import ANCHOR_LEVEL_SEED, ANCHOR_NOISE_SEED, mix_with_noise, private_noise
+from pipeline.switch.noise import ANCHOR_NOISE_SEED, mix_with_noise, private_noise
 from utils.env import env_float, env_int, env_str
 from utils.log import log
 
@@ -136,51 +136,3 @@ class AnchorControlsMixin:
             f"anchor std {float(frame.float().std()):.3f} -> spliced std "
             f"{float(out.float().std()):.3f}")
         return out
-
-    # ---- declaring the anchor's real noise level ------------------------------------------
-    # A splice declares the anchor as a clean frame (t = 0) although it is blurry and off the
-    # data manifold: the model reads it as a clean frame of its immediate past, and the current
-    # context absorbs it. Here the anchor is noised to a level t and that same t is declared
-    # for its slots, two steps that only make sense together. The anchor is then an ordinary
-    # noisy latent, which the model saw throughout training.
-    #
-    #   MEM_ANCHOR_T=0/unset   off, and every arm is unchanged
-    #   MEM_ANCHOR_T=t         t in (0, 1000], the level both applied and declared
-    #   MEM_ANCHOR_T_SEED=n    seed of that noise
-    @staticmethod
-    def _anchor_slots(n, kslots, slot_offset):
-        """[lo, hi): the slots of the recache window that the anchor occupies, in both
-        conventions of `_memdec_window`: the last k slots when slot_offset < 0, or those k
-        slots pushed `slot_offset` further into the past otherwise."""
-        if slot_offset < 0:
-            return n - kslots, n
-        lo = max(0, n - kslots - slot_offset)
-        return lo, lo + kslots
-
-    def _maybe_declare_anchor_noise(self, splice, n, kslots, slot_offset, current_start_frame):
-        """Returns (window, timestep_override). When the hook is off it returns the window object
-        itself and None, so anything already rendered stays reproducible. Draws from its own
-        generator, never from the global random stream."""
-        t = env_float("MEM_ANCHOR_T")
-        if t <= 0.0:
-            return splice, None
-        assert 0.0 < t <= 1000.0, f"MEM_ANCHOR_T must be in (0, 1000], got {t}"
-        assert splice is not None and splice.shape[1] == n, \
-            f"MEM_ANCHOR_T: window of {n} slots expected, got {None if splice is None else splice.shape[1]}"
-        lo, hi = self._anchor_slots(n, kslots, slot_offset)
-        part = splice[:, lo:hi]
-        dev = part.device
-        eps = private_noise(part, env_int("MEM_ANCHOR_T_SEED", ANCHOR_LEVEL_SEED) + int(current_start_frame))
-        tt = torch.ones([part.shape[0] * part.shape[1]], device=dev, dtype=torch.float32) * t
-        noised = self.scheduler.add_noise(part.flatten(0, 1).float(), eps.flatten(0, 1), tt) \
-            .unflatten(0, part.shape[:2]).to(part.dtype)
-        out = splice.clone()
-        out[:, lo:hi] = noised
-        ts = torch.full((n,), float(self.args.context_noise), dtype=torch.float32)
-        ts[lo:hi] = t
-        rel = float((noised.float() - part.float()).norm() / part.float().norm().clamp_min(1e-6))
-        assert rel > 1e-3, "MEM_ANCHOR_T fired but the anchor content did not change"
-        log(f"[MEM_ANCHOR_T] anchor slot(s) [{lo}, {hi}) of {n} NOISED to t={t:g} "
-            f"(sigma~{t / 1000:.3f}, rel-L2 {rel:.3f}) AND declared at t={t:g}; the {n - (hi - lo)} "
-            f"true frames keep t={int(self.args.context_noise)}")
-        return out, ts

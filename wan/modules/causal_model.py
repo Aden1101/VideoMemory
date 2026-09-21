@@ -24,7 +24,6 @@ import torch.distributed as dist
 
 from utils.debug_option import DEBUG
 import copy
-from wan.modules.additive_attention import AdditiveKVAttentionMixin
 from wan.modules.memory_inject import EvictionFeedMixin, MemoryInjectMixin, memory_cell_args
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
@@ -65,7 +64,7 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     return torch.stack(output).type_as(x)
 
 
-class CausalWanSelfAttention(AdditiveKVAttentionMixin, nn.Module):
+class CausalWanSelfAttention(nn.Module):
 
     def __init__(self,
                  dim,
@@ -434,10 +433,11 @@ class CausalWanSelfAttention(AdditiveKVAttentionMixin, nn.Module):
                     k_cat = k_sink
                     v_cat = v_sink
 
-                x = self._attend(
-                    roped_query, k_cat, v_cat, grid_sizes, freqs, frame_seqlen, v,
-                    window_frame=rope_start_f_k_local if (rope_enhance and local_budget > 0) else None,
-                    current_start_frame=current_start_frame, n_sink=k_sink.shape[1])
+                x = attention(
+                    roped_query,
+                    k_cat,
+                    v_cat
+                )
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
                 k_win = temp_k[:, window_start:local_end_index]
@@ -458,10 +458,7 @@ class CausalWanSelfAttention(AdditiveKVAttentionMixin, nn.Module):
                             start_frame=rope_start_f_k_win).type_as(v)
                     roped_query = causal_rope_apply(
                         q, grid_sizes, freqs, start_frame=rope_start_f).type_as(v)
-                x = self._attend(
-                    roped_query, k_win, v_win, grid_sizes, freqs, frame_seqlen, v,
-                    window_frame=rope_start_f_k_win if rope_enhance else None,
-                    current_start_frame=current_start_frame)
+                x = attention(roped_query, k_win, v_win)
 
         # output
         x = x.flatten(2)

@@ -1,12 +1,9 @@
 """Noise for the control arms, drawn apart from the rollout's random stream."""
 import torch
 
-# Default seeds of the private draws, each offset by the switch frame at its call site. The
-# anchor-noise control and the composite share one on purpose: both degrade the same anchor.
+# Default seeds of the private draws, each offset by the switch frame at its call site.
 ANCHOR_NOISE_SEED = 192837465
-ANCHOR_LEVEL_SEED = 77400241
 REPLAY_NOISE_SEED = 987654321
-SDEDIT_SEED = 5150241
 
 
 def private_noise(like, seed):

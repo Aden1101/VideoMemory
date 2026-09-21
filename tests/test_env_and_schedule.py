@@ -24,7 +24,6 @@ def _load(path, name):
 
 
 schedule = _load("pipeline/switch/schedule.py", "_schedule_under_test")
-routing = _load("pipeline/switch/routing.py", "_routing_under_test")
 
 
 # ---- reading the environment ---------------------------------------------------------------
@@ -100,8 +99,7 @@ def test_a_misspelt_arm_is_refused():
 def test_the_private_noise_seeds_are_the_ones_the_published_runs_used():
     source = open(os.path.join(ROOT, "pipeline", "switch", "noise.py")).read()
     seeds = dict(re.findall(r"^([A-Z_]+_SEED) = (\d+)$", source, re.M))
-    assert seeds == {"ANCHOR_NOISE_SEED": "192837465", "ANCHOR_LEVEL_SEED": "77400241",
-                     "REPLAY_NOISE_SEED": "987654321", "SDEDIT_SEED": "5150241"}, seeds
+    assert seeds == {"ANCHOR_NOISE_SEED": "192837465", "REPLAY_NOISE_SEED": "987654321"}, seeds
     # and no bare copy of them is left anywhere else (git grep exits 1 when it finds nothing)
     others = subprocess.run(["git", "grep", "-lE", "|".join(seeds.values()), "--", "*.py", ":!tests",
                              ":!pipeline/switch/noise.py"], cwd=ROOT, capture_output=True).stdout.decode().split()
@@ -164,39 +162,6 @@ def test_the_fixed_rollout_as_a_schedule():
     for sw, back in ((21, 42), (20, 40), (19, 20), (0, 3)):
         plan = schedule.parse_schedule(*two(sw, back, False, 63, 3)[:1], 2, two(sw, back, False, 63, 3)[1], 63, 3)
         assert plan.is_revisit[-1] == (plan.subject[0] == 0 and len(plan.subject) == 3)
-
-
-# ---- the frame bank's selection ------------------------------------------------------------
-def test_the_router_recalls_the_best_match_only_above_its_threshold():
-    bank = [{"seg": 0, "subject": 7}, {"seg": 1, "subject": 8}, {"seg": 2, "subject": 7}]
-    pick = lambda sims, **kw: routing.pick_banked(bank, sims, **{  # noqa: E731
-        "mode": "key", "subject": 7, "tie": "recent", "threshold": 0.9, **kw})
-    assert pick([0.95, 0.20, 0.50])["seg"] == 0
-    assert pick([0.85, 0.20, 0.50]) is None                              # best one under the threshold
-    assert pick([0.85, 0.20, 0.50], threshold=float("-inf"))["seg"] == 0   # a forced recall
-    assert pick([0.95, 0.20, 0.95])["seg"] == 2 and pick([0.95, 0.20, 0.95], tie="first")["seg"] == 0
-    assert pick([0.1, 0.99, 0.1], mode="truth")["seg"] == 2              # ground truth ignores the cosine
-    assert pick([0.1, 0.99, 0.1], mode="truth", subject=9) is None
-    assert routing.pick_banked([], [], mode="key", subject=7, tie="recent", threshold=float("-inf")) is None
-
-
-def test_the_selection_rule_against_a_flat_rewrite_on_random_banks():
-    import random
-    rng = random.Random(0)
-    for _ in range(5000):
-        n = rng.randint(0, 5)
-        bank = [{"seg": i, "subject": rng.randint(0, 2)} for i in range(n)]
-        sims = [rng.choice([0.5, 0.9, 0.9 + 5e-7, 0.95]) for _ in range(n)]
-        mode, tie = rng.choice(routing.ROUTING_MODES), rng.choice(routing.TIE_RULES)
-        threshold, subject = rng.choice([0.9, 0.93, float("-inf")]), rng.randint(0, 2)
-        if mode == "truth":
-            pool = [e for e in bank if e["subject"] == subject]
-        else:
-            best = max(sims) if bank else float("-inf")
-            pool = [e for e, s in zip(bank, sims) if s >= best - 1e-6] if best >= threshold else []
-        want = (pool[-1] if tie == "recent" else pool[0]) if pool else None
-        assert routing.pick_banked(bank, sims, mode=mode, subject=subject, tie=tie,
-                                   threshold=threshold) is want
 
 
 if __name__ == "__main__":

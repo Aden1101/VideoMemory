@@ -1,10 +1,8 @@
 """Rebuilding an image of the subject out of the memory state alone."""
-import math
 import os
 
 import torch
 
-from utils.env import env_int, env_str
 from utils.log import log
 
 
@@ -73,16 +71,10 @@ def _memdec_get_decoder(ckpt_path, device):
 class AnchorDecodeMixin:
     # ---- ways of feeding an anchor frame back at the return; each is off unless its
     # environment variable is set ----------------------------------------------------------
-    def _reset_early_decode(self):
-        """Per rollout: the frame MEM_DECODE_THRU decodes when the anchor chunk is evicted."""
-        self._thru_frame = None
-        self._thru_info = None
-
     def _memdec_frame(self, ckpt_path, cond_dict, out_dtype, out_device):
         """Decode one anchor latent frame out of the live memory states, with the decoder trained
-        offline for that. Kept as a single function so that decoding early (at eviction) and
-        decoding at the return go through exactly the same path: same op order, same dtypes,
-        same lazy load protected by fork_rng."""
+        offline for that. The lazy load of the decoder is protected by fork_rng, so it draws
+        nothing from the rollout's random stream."""
         dev = self._generator_device
         dec = _memdec_get_decoder(ckpt_path, dev)
         for bi in _MEMDEC_BLOCKS:
@@ -96,45 +88,6 @@ class AnchorDecodeMixin:
         with torch.no_grad():
             frame = dec(sts, cond=cond)
         return frame[:, 0:1].to(dtype=out_dtype, device=out_device), cond is not None
-
-    def _thru_maybe_decode(self, current_start_frame, cond_third, out_dtype, out_device):
-        """MEM_DECODE_THRU: decode the memory state at the moment the chunk
-        carrying the anchor frame is evicted (i.e. the write that stores it has just happened,
-        write age = 1, the decoder's best regime) and CACHE the frame; the return switch then
-        splices that frame instead of decoding a ~20-writes-old state. Isolates 'the write+read
-        channel at age 1' from 'the state's forgetting between the write and the revisit'.
-        Eviction arithmetic = the FIFO rule of EvictionFeedMixin._pop_evicted_chunks: chunk c is written window_chunks =
-        ceil(local_attn_size / num_frame_per_block) chunks after it was produced."""
-        if not env_int("MEM_DECODE_THRU"):
-            return
-        if self._thru_frame is not None or self._first_switch_frame is None:
-            return
-        _F = self.num_frame_per_block
-        assert isinstance(self.local_attn_size, int) and self.local_attn_size > 0, \
-            "MEM_DECODE_THRU needs local attention (the eviction FIFO)"
-        wc = max(1, math.ceil(self.local_attn_size / _F))
-        anchor_frame = self._first_switch_frame - 1
-        anchor_chunk = anchor_frame // _F
-        cur_chunk = current_start_frame // _F
-        if cur_chunk != anchor_chunk + wc:
-            return
-        ck = env_str("MEM_DECODE")
-        assert ck, "MEM_DECODE_THRU=1 requires MEM_DECODE=<AnchorFrameDecoder ckpt>"
-        self._thru_frame, cond_on = self._memdec_frame(ck, cond_third, out_dtype, out_device)
-        self._thru_info = {"anchor_frame": int(anchor_frame), "anchor_chunk": int(anchor_chunk),
-                           "evict_chunk": int(cur_chunk), "window_chunks": int(wc)}
-        log(f"[MEM_DECODE_THRU] anchor chunk {anchor_chunk} (frame {anchor_frame}) evicted "
-            f"and written at chunk {cur_chunk} (window_chunks {wc}), state decoded now "
-            f"(write age 1), frame cached for the return splice; "
-            f"cond={'ON' if cond_on else 'off'}")
-
-    def _early_decoded_frame(self):
-        """The anchor MEM_DECODE_THRU decoded when its chunk was evicted."""
-        assert self._thru_frame is not None, \
-            "MEM_DECODE_THRU: the anchor chunk was never evicted before the return switch " \
-            "(check the switch frames against local_attn_size)"
-        log(f"[MEM_DECODE_THRU] splicing the frame decoded at eviction {self._thru_info}")
-        return self._thru_frame
 
     @staticmethod
     def _memdec_window(output, current_start_frame, n, anchor, kslots, slot_offset):
