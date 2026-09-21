@@ -12,7 +12,8 @@ class MemoryRolloutMixin:
     def _init_memory_rollout(self, kwargs):
         """Read the two training options of the memory from the pipeline's keyword arguments:
         train_write, and the cache dropout with its anneal."""
-        # train_write=True: write under enable_grad + keep state graph so the write-path trains.
+        # train_write: run the memory's write with gradients and keep the graph of the state it
+        # produces, so that the parameters of the write are trained and not only those of the read
         self.train_write = kwargs.get("train_write", False)
         if self.train_write:
             from wan.modules.video_memory import VideoMemoryLayer
@@ -23,16 +24,15 @@ class MemoryRolloutMixin:
                         m.detach_state = False
             print("[train_write] enabled")
 
-        # cache dropout: with prob cache_dropout_prob, a whole rollout runs
-        # with a starved runtime sink (cache_dropout_sink frames, default 0) and the memory
-        # ON, so the memory is the only carrier of the early-video anchor. At 0.0, the
-        # default, the sink is never touched.
+        # cache dropout: with probability cache_dropout_prob, a whole rollout runs with its sink
+        # (the opening frames that attention keeps forever) cut down to cache_dropout_sink frames,
+        # 0 by default, and the memory on. The memory is then the only thing that still carries
+        # the start of the video. At probability 0, the default, the sink is never touched.
         self.cache_dropout_prob = float(kwargs.get("cache_dropout_prob", 0.0) or 0.0)
         self.cache_dropout_sink = int(kwargs.get("cache_dropout_sink", 0) or 0)
         self._cache_dropout_active = False
-        # linear anneal of the dropout prob from cache_dropout_prob (start) to
-        # cache_dropout_prob_end over cache_dropout_anneal_steps. When end is None or the anneal
-        # window is <= 0, the prob stays at the start value, which is the un-annealed behaviour.
+        # that probability goes linearly from cache_dropout_prob to cache_dropout_prob_end over
+        # cache_dropout_anneal_steps training steps; with no end value or no steps it stays put
         cd_end = kwargs.get("cache_dropout_prob_end", None)
         self.cache_dropout_prob_end = (float(cd_end) if cd_end is not None
                                        else self.cache_dropout_prob)
@@ -93,8 +93,7 @@ class MemoryRolloutMixin:
                   f"(memory must carry the anchor)", flush=True)
 
     def _write_context(self, requires_grad: bool = True):
-        # Only build the write graph when this chunk will actually be backpropped.
-        # On critic steps generate_chunk runs with requires_grad=False (chunk is detached,
-        # critic backward goes through fake_score only) -> building the clean-rerun graph
-        # under enable_grad there is pure waste and the dominant VRAM leak. Gate on requires_grad.
+        """The context the write pass runs in. Gradients only when the write is trained and this
+        chunk will be backpropagated: on the steps that train the critic the chunk is detached,
+        and a graph built for it would be the largest waste of GPU memory in the run."""
         return torch.enable_grad() if (self.train_write and requires_grad) else torch.no_grad()

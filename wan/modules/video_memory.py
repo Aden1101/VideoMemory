@@ -4,6 +4,12 @@ The read, the write gradient and the Muon update follow LaCT (Large Chunk Test-T
 Zhang et al.), whose reference implementation this adapts; the names of its functions are kept
 so the two can be compared side by side. What is ours is the causal chunk-by-chunk stepping,
 the renormalization back to the initial norms, the gated injection and the eviction feed.
+
+Words used below. The fast weights (w0, w1, w2) are the MLP's weights: one forward pass
+rewrites them, which is what "test-time training" means, while the optimizer trains everything
+else. Muon orthogonalises the write's gradient with a few Newton-Schulz iterations before it is
+applied. A chunk is the 3 latent frames generated in one go. The eviction feed hands the write
+the chunk that has just left the attention window instead of the current one.
 """
 import math
 from typing import Optional, Sequence
@@ -356,7 +362,7 @@ class VideoMemoryLayer(nn.Module):
         if self.gate_extra:
             self._build_gate_extra(dim)
 
-        # TTT fast weight dimensions
+        # fast-weight dimensions: input, output and hidden width of the MLP, per head
         di = self.head_dim
         do = self.head_dim
         dh = self.head_dim * inter_multi

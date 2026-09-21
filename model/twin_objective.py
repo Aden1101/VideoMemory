@@ -53,7 +53,7 @@ class TwinObjective:
 
 
 class TwinObjectiveMixin:
-    # ---- counterfactual-twin machinery: snapshot/restore everything one chunk mutates ----
+    # ---- building the twin: save everything a chunk changes, generate, put it back ----
     _DINO_MEAN = (0.485, 0.456, 0.406)
     _DINO_STD = (0.229, 0.224, 0.225)
 
@@ -235,7 +235,8 @@ class TwinObjectiveMixin:
         device = chunk.device
         id_loss = torch.zeros((), device=device)
         tv_loss = torch.zeros((), device=device)
-        # consistent keys every chunk (chunk-0 identity is perfect by construction -> cos=1, loss=0)
+        # the same keys for every chunk, so the logs line up: chunk 0 is its own reference, which
+        # is a cosine of 1 and a loss of 0
         log = {
             "identity_latent_motion": torch.zeros((), device=device),
             "identity_tv_loss": torch.zeros((), device=device),
@@ -243,16 +244,19 @@ class TwinObjectiveMixin:
             "identity_id_loss": torch.zeros((), device=device),
         }
 
-        # temporal-variance floor (anti-freeze): hinge on adjacent-latent motion; penalize only if frozen
+        # against freezing: a penalty only when the mean change between neighbouring latent frames
+        # falls under tv_motion_floor, and none above it
         if self.tv_loss_weight > 0.0 and chunk.shape[1] >= 2:
             motion = (chunk[:, 1:] - chunk[:, :-1]).abs().mean()
             tv_loss = F.relu(self.tv_motion_floor - motion)
             log["identity_latent_motion"] = motion.detach()
             log["identity_tv_loss"] = tv_loss.detach()
 
-        # frame-level identity: decode a few frames -> DINO -> cosine to the chunk-0 anchor, on later
-        # chunks only, with grad through decode -> gate -> read -> write (anchor cached in the rollout).
-        # Skip after a real prompt switch: the anchor is the pre-switch subject, penalizing the new one.
+        # identity: decode the last few frames of the chunk to pixels, embed them with DINO (a
+        # frozen image encoder), and take their cosine to the embedding of chunk 0, kept from the
+        # start of the video. The gradient flows back through the decoder to the memory's gate,
+        # read and write. Not after a prompt switch: chunk 0 then shows another subject, and
+        # the term would punish the new one for not looking like it.
         if (self.id_loss_weight > 0.0 and chunk_start_frame > 0 and self._id_anchor is not None
                 and not self.state.get("has_switched", False)):
             k = max(1, int(self.id_decode_frames))
@@ -264,7 +268,7 @@ class TwinObjectiveMixin:
             log["identity_id_loss"] = id_loss.detach()
         return id_loss, tv_loss, log
 
-    # ---- counterfactual, motion-gated, clamped identity advantage over the mem-OFF twin ----
+    # ---- the terms scored against the twin: the same chunk generated with the memory off ----
     def _motion_target_index(self, chunk_start_frame):
         """chunk_start (0, 21, 39, 57, ...) -> index (0, 1, 2, 3, ...) into the motion-target curve."""
         if chunk_start_frame <= 0:

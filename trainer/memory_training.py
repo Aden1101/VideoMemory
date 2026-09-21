@@ -2,8 +2,14 @@
 chunks, the snapshot that protects the fast-weight state from the backward recompute, the
 memory's own gradient clip and learning-rate schedule, its checkpointing and its logs.
 
-Mixed into Trainer. The DMD loop, the FSDP setup and the critic are upstream's and stay in
-trainer/distillation.py.
+Mixed into Trainer. The distillation loop (DMD: the generator is pushed towards a teacher's
+distribution, scored by a critic network), the sharding of the model across GPUs (FSDP) and
+the critic are upstream's and stay in trainer/distillation.py.
+
+Words used below. A chunk is the 3 latent frames generated in one go. The fast-weight state
+(w0, w1, w2) is what a memory cell rewrites during generation, as opposed to its parameters,
+which the optimizer trains. LoRA adapters are the small low-rank matrices added to the frozen
+backbone by the peft library; they are the only other thing trained. A rank is one GPU process.
 """
 import math
 import re
@@ -55,7 +61,8 @@ class MemoryTrainingMixin:
         return getattr(pipeline, "ttt_cache", None)
 
     def _vram_profile_tick(self):
-        """VRAM profiler hook"""
+        """Opt-in: after a few warm-up steps, measure the peak GPU memory over
+        config.profile_vram steps, print it and stop the run."""
         n = getattr(self.config, "profile_vram", 0)
         if not n:
             return
@@ -226,15 +233,14 @@ class MemoryTrainingMixin:
     def _unfreeze_memory_and_select_lora(self, config):
         """peft froze everything that is not a LoRA adapter, the memory included: make the memory
         trainable again, and freeze the adapters of the blocks below lora_unfreeze_from_block."""
-        # memory params are new, full-rank and trainable (excluded from LoRA targets).
-        # peft freezes every non-LoRA param, so we un-freeze them here.
         for n, p in self.model.generator.named_parameters():
             if "memory" in n:
                 p.requires_grad_(True)
 
-        # Selective LoRA unfreeze: only blocks >= lora_unfreeze_from_block (which consume the memory
-        # injection) stay trainable; earlier blocks' LoRA is frozen, dropping their grad + AdamW state
-        # (frees their VRAM). None = all LoRA trainable. Critic LoRA untouched.
+        # Only the blocks from lora_unfreeze_from_block on see the memory's injection, so only
+        # their adapters need to adapt to it. Freezing the earlier ones frees the GPU memory of
+        # their gradients and optimizer moments. None trains every adapter; the critic's adapters
+        # are not touched.
         unfreeze_from = getattr(config, "lora_unfreeze_from_block", None)
         if unfreeze_from is not None:
             import re as _re
@@ -258,14 +264,14 @@ class MemoryTrainingMixin:
     def _memory_modules_outside_fsdp(self):
         """The memory cells, to be left out of FSDP sharding, moved to the device and made
         identical on every rank. Empty on a single process."""
-        # fast weights (w0/w1/w2) are excluded from FSDP
+        # FSDP splits every parameter across the GPUs; the memory cells are kept whole on each
         mem_ignored = []
         if self.world_size > 1:
             mem_ignored = [cell for _, cell in self._memory_cells()]
             for m in mem_ignored:
                 m.to(device=self.device, dtype=self.dtype)
-            # memory is excluded from FSDP: sync the per-rank divergent init from rank 0 so all ranks
-            # share one memory (its grads are averaged before each optimizer step)
+            # each process initialised its own copy at random: copy rank 0's to the others, so
+            # that all train one memory (its gradients are averaged before each optimizer step)
             for m in mem_ignored:
                 for p in m.parameters():
                     dist.broadcast(p.data, src=0)
@@ -279,11 +285,11 @@ class MemoryTrainingMixin:
         gen = self.model.generator
         mem_params = [p for n, p in gen.named_parameters() if "memory" in n and p.requires_grad]
         other_params = [p for n, p in gen.named_parameters() if "memory" not in n and p.requires_grad]
-        # safety net
+        # the memory is recognised by "memory" in the parameter name, which a wrapper could rename
         assert mem_params or not any("memory" in n for n, _ in gen.named_parameters()), \
             "memory params exist but none landed in the optimizer group (name-match broke post-FSDP)"
         generator_param_groups = [{"params": other_params, "lr": config.lr}]  # LoRA adapters
-        if mem_params:  # no memory layers -> single group, strictly identical to baseline
+        if mem_params:  # without memory blocks there is one group, as in upstream
             generator_param_groups.append({"params": mem_params, "lr": getattr(config, "lr_mem", 1e-4)})
         self.mem_params = mem_params
         return generator_param_groups
@@ -335,10 +341,11 @@ class MemoryTrainingMixin:
         losses = []
         logs = []
         used = 0
-        # force a fresh sequence so the window always starts at frame 0 (chunk 0 sets the
-        # identity anchor, the grad tail lands in the same sequence).
-        # seed step: every train_seed_every steps also put chunk 0 in-graph so the fast-weight
-        # seed w0/w1/w2 (only reachable via init_state at chunk 0) receives gradient.
+        # Start a new video, so that the window begins at frame 0: chunk 0 is the identity
+        # reference of the identity loss and of the twin, and the chunks with gradient must belong
+        # to the same video. A seed step, every train_seed_every generator steps, also keeps the
+        # gradient of chunk 0: the initial value of the state (the parameters w0, w1, w2) only
+        # enters the computation there, so it gets a gradient on those steps alone.
         seed_every = int(getattr(self.config, "train_seed_every", 0))
         gen_idx = self.step // max(1, int(getattr(self.config, "dfake_gen_update_ratio", 1)))
         seed_step = seed_every > 0 and (gen_idx % seed_every == 0)   # every N-th generator step
@@ -346,15 +353,15 @@ class MemoryTrainingMixin:
         if getattr(self.config, "id_loss_weight", 0.0) > 0.0 or twin_on or seed_step:
             self.streaming_active = False
             self.start_new_sequence()
-        # seed steps also grad chunk 0 -> more grad chunks; normalize each per-chunk backward so
-        # the total gradient equals the normal path's mean(losses)/gas
+        # a seed step has one more chunk with gradient, and backpropagates each chunk on its
+        # own: dividing by n_grad makes their sum the mean that a normal step backpropagates
         n_grad = tail + (1 if (seed_step and horizon - tail > 0) else 0)
         for i in range(horizon):
             if i > 0 and not self.streaming_model.can_generate_more():
                 break
             used += 1
             with_grad = (i >= horizon - tail) or (seed_step and i == 0)   # +chunk 0 on seed steps
-            # build the mem-OFF counterfactual twin only for the last (grad-tail) chunk
+            # the twin, the same chunk generated with the memory off, is built for the last chunk only
             make_twin = (with_grad and i == horizon - 1 and twin_on)
             chunk, chunk_info = self.streaming_model.generate_next_chunk(
                 requires_grad=with_grad, detach_state=(i == horizon - tail),
@@ -364,11 +371,11 @@ class MemoryTrainingMixin:
                 loss, chunk_log = self.streaming_model.compute_generator_loss(
                     chunk=chunk, chunk_info=chunk_info)
                 logs.append(chunk_log)
-                if seed_step:   # per-chunk backward; sever the KV-cache grad link between chunks
+                if seed_step:   # one backward per chunk, so no gradient flows through the KV cache
                     snap = self._snapshot_ttt_state()
-                    torch.cuda.empty_cache()   # reclaim the ~800MB reserved-but-unallocated cache
-                                               # at the post-forward low-water mark, before chunk-0's
-                                               # backward peak (seed step only ~1/20). Fits the 4-GPU budget.
+                    # about 800 MB is reserved by the allocator and unused right after the
+                    # forward: hand it back before the backward of chunk 0, the peak of the step
+                    torch.cuda.empty_cache()
                     try:
                         (loss / (self.gradient_accumulation_steps * n_grad)).backward()
                     finally:
