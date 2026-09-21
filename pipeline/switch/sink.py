@@ -28,6 +28,9 @@ class SinkMixin:
                            getattr(cm.blocks[0].self_attn, "sink_size", 0)))
 
     def _maybe_sinkpurge(self, output, current_start_frame, cond_new, is_revisit):
+        """MEM_SINKPURGE: overwrite the sink slots with the last true frames of the current
+        scene, at revisits (1) or at every switch (2), and check that the sink changed while the
+        rolling window did not. Does nothing when the arm is off."""
         mode = env_int("MEM_SINKPURGE")
         if not mode or not (is_revisit or mode >= 2):
             return
@@ -37,7 +40,7 @@ class SinkMixin:
             and not env_int("REPLAY_PAST") and not self._fb_mode(), \
             "MEM_SINKPURGE is the control with neither a splice nor a memory: do not combine " \
             "it with a recall arm (MEM_DECODE / REPLAY_PAST / FRAMEBANK)"
-        assert getattr(self, "global_sink", False), \
+        assert self.global_sink, \
             "MEM_SINKPURGE targets the pinned (global) sink; global_sink is off in this config"
         k = self._sink_frames()
         assert k >= 1, "MEM_SINKPURGE: sink_size is 0, there is nothing pinned to purge"
@@ -64,41 +67,19 @@ class SinkMixin:
         lived, read by every future query, never evicted). Runs a 1-frame forward at
         current_start=0 with sink_recache_after_switch=True so the protected sink slots are
         legitimately rewritten (the flag exists for exactly this)."""
-        device = anchor_frames.device if anchor_frames.device.type == "cuda" \
-            else next(self.generator.parameters()).device
-        anchor_frames = anchor_frames.to(device)
-        B, nf = anchor_frames.shape[0], anchor_frames.shape[1]
+        if anchor_frames.device.type != "cuda":
+            anchor_frames = anchor_frames.to(self._generator_device)
+        nf = anchor_frames.shape[1]
         # The main cache is in rolled/recompute state: a forward at current_start=0 cannot
         # address the sink slots through the window arithmetic (empty write span). Instead:
         # prefill the anchor into a fresh temporary 1-frame cache (clean position-0 write),
         # then copy its k/v into the sink slots of the real cache (buffer layout [sink|window],
         # sink = first sink_tokens entries, stored UNroped under rope_enhance like any key).
-        _real = self.kv_cache1
-        self._initialize_kv_cache(batch_size=B, dtype=anchor_frames.dtype, device=device,
-                                  kv_cache_size_override=nf * self.frame_seq_length)
-        _tmp = self.kv_cache1
-        self.kv_cache1 = _real
-        block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
-            device=device, num_frames=nf, frame_seqlen=self.frame_seq_length,
-            num_frame_per_block=self.num_frame_per_block, local_attn_size=self.local_attn_size)
-        context_timestep = torch.ones([B, nf], device=device,
-                                      dtype=torch.int64) * self.args.context_noise
-        self.generator.model.block_mask = block_mask
+        tmp = self._prefill_scratch_cache(anchor_frames, conditional_dict)
         with torch.no_grad():
-            self.generator(
-                noisy_image_or_video=anchor_frames,
-                conditional_dict=conditional_dict,
-                timestep=context_timestep,
-                kv_cache=_tmp,
-                crossattn_cache=self.crossattn_cache,
-                current_start=0,
-                rope_enhance=self.rope_enhance,
-                ttt_cache=getattr(self, "ttt_cache", None),
-                ttt_update=False,
-            )
             n_tok = nf * self.frame_seq_length
             for bi in range(self.num_transformer_blocks):
-                self.kv_cache1[bi]["k"][:, :n_tok].copy_(_tmp[bi]["k"][:, :n_tok])
-                self.kv_cache1[bi]["v"][:, :n_tok].copy_(_tmp[bi]["v"][:, :n_tok])
-        del _tmp
+                self.kv_cache1[bi]["k"][:, :n_tok].copy_(tmp[bi]["k"][:, :n_tok])
+                self.kv_cache1[bi]["v"][:, :n_tok].copy_(tmp[bi]["v"][:, :n_tok])
+        del tmp
         self._reset_crossattn_cache()

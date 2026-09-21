@@ -54,8 +54,8 @@ def _memdec_get_decoder(ckpt_path, device):
         cond_hidden, cond_dim = (int(x) for x in sd["cond_in.weight"].shape)
     else:
         cond_dim, cond_hidden = 0, 512
-    _devs = [device] if device.type == "cuda" else []
-    with torch.random.fork_rng(devices=_devs):
+    devs = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devs):
         decoder = AnchorFrameDecoder(cond_dim=cond_dim, cond_hidden=cond_hidden)
         decoder.load_state_dict(sd, strict=True)
         decoder.eval().to(device=device, dtype=torch.float32)
@@ -72,24 +72,29 @@ def _memdec_get_decoder(ckpt_path, device):
 class AnchorDecodeMixin:
     # ---- ways of feeding an anchor frame back at the return; each is off unless its
     # environment variable is set ----------------------------------------------------------
+    def _reset_early_decode(self):
+        """Per rollout: the frame MEM_DECODE_THRU decodes when the anchor chunk is evicted."""
+        self._thru_frame = None
+        self._thru_info = None
+
     def _memdec_frame(self, ckpt_path, cond_dict, out_dtype, out_device):
         """Decode one anchor latent frame out of the live memory states, with the decoder trained
         offline for that. Kept as a single function so that decoding early (at eviction) and
         decoding at the return go through exactly the same path: same op order, same dtypes,
         same lazy load protected by fork_rng."""
-        _dev = next(self.generator.parameters()).device
-        _dec = _memdec_get_decoder(ckpt_path, _dev)
-        for _bi in _MEMDEC_BLOCKS:
-            assert self.ttt_cache[_bi].state is not None, \
-                f"MEM_DECODE: no live memory state on block {_bi}"
-        _sts = [tuple(t.detach().to(_dev, torch.float32)
-                      for t in self.ttt_cache[_bi].state) for _bi in _MEMDEC_BLOCKS]
-        _cond = None
-        if getattr(_dec, "cond_dim", 0):
-            _cond = _memdec_pooled_cond(cond_dict).to(_dev, torch.float32)[None]
+        dev = self._generator_device
+        dec = _memdec_get_decoder(ckpt_path, dev)
+        for bi in _MEMDEC_BLOCKS:
+            assert self.ttt_cache[bi].state is not None, \
+                f"MEM_DECODE: no live memory state on block {bi}"
+        sts = [tuple(t.detach().to(dev, torch.float32)
+                      for t in self.ttt_cache[bi].state) for bi in _MEMDEC_BLOCKS]
+        cond = None
+        if getattr(dec, "cond_dim", 0):
+            cond = _memdec_pooled_cond(cond_dict).to(dev, torch.float32)[None]
         with torch.no_grad():
-            _frame = _dec(_sts, cond=_cond)
-        return _frame[:, 0:1].to(dtype=out_dtype, device=out_device), _cond is not None
+            frame = dec(sts, cond=cond)
+        return frame[:, 0:1].to(dtype=out_dtype, device=out_device), cond is not None
 
     def _thru_maybe_decode(self, current_start_frame, cond_third, out_dtype, out_device):
         """MEM_DECODE_THRU: decode the memory state at the moment the chunk
@@ -97,7 +102,7 @@ class AnchorDecodeMixin:
         write age = 1, the decoder's best regime) and CACHE the frame; the return switch then
         splices that frame instead of decoding a ~20-writes-old state. Isolates 'the write+read
         channel at age 1' from 'the state's forgetting between the write and the revisit'.
-        Eviction arithmetic = causal_model.py's FIFO rule: chunk c is written window_chunks =
+        Eviction arithmetic = the FIFO rule of EvictionFeedMixin._pop_evicted_chunks: chunk c is written window_chunks =
         ceil(local_attn_size / num_frame_per_block) chunks after it was produced."""
         if not env_int("MEM_DECODE_THRU"):
             return
@@ -106,28 +111,52 @@ class AnchorDecodeMixin:
         _F = self.num_frame_per_block
         assert isinstance(self.local_attn_size, int) and self.local_attn_size > 0, \
             "MEM_DECODE_THRU needs local attention (the eviction FIFO)"
-        _wc = max(1, math.ceil(self.local_attn_size / _F))
-        _anchor_frame = self._first_switch_frame - 1
-        _anchor_chunk = _anchor_frame // _F
-        _cur_chunk = current_start_frame // _F
-        if _cur_chunk != _anchor_chunk + _wc:
+        wc = max(1, math.ceil(self.local_attn_size / _F))
+        anchor_frame = self._first_switch_frame - 1
+        anchor_chunk = anchor_frame // _F
+        cur_chunk = current_start_frame // _F
+        if cur_chunk != anchor_chunk + wc:
             return
-        _ck = env_str("MEM_DECODE")
-        assert _ck, "MEM_DECODE_THRU=1 requires MEM_DECODE=<AnchorFrameDecoder ckpt>"
-        self._thru_frame, _cond_on = self._memdec_frame(_ck, cond_third, out_dtype, out_device)
-        self._thru_info = {"anchor_frame": int(_anchor_frame), "anchor_chunk": int(_anchor_chunk),
-                           "evict_chunk": int(_cur_chunk), "window_chunks": int(_wc)}
-        print(f"[MEM_DECODE_THRU] anchor chunk {_anchor_chunk} (frame {_anchor_frame}) evicted "
-              f"and written at chunk {_cur_chunk} (window_chunks {_wc}), state decoded now "
+        ck = env_str("MEM_DECODE")
+        assert ck, "MEM_DECODE_THRU=1 requires MEM_DECODE=<AnchorFrameDecoder ckpt>"
+        self._thru_frame, cond_on = self._memdec_frame(ck, cond_third, out_dtype, out_device)
+        self._thru_info = {"anchor_frame": int(anchor_frame), "anchor_chunk": int(anchor_chunk),
+                           "evict_chunk": int(cur_chunk), "window_chunks": int(wc)}
+        print(f"[MEM_DECODE_THRU] anchor chunk {anchor_chunk} (frame {anchor_frame}) evicted "
+              f"and written at chunk {cur_chunk} (window_chunks {wc}), state decoded now "
               f"(write age 1), frame cached for the return splice; "
-              f"cond={'ON' if _cond_on else 'off'}", flush=True)
+              f"cond={'ON' if cond_on else 'off'}", flush=True)
+
+    def _single_anchor_window(self, output, current_start_frame, cond, ckpt):
+        """The recache window of the fixed A -> B -> A rollout: the anchor decoded from the memory
+        now, or under MEM_DECODE_THRU the one decoded when its chunk was evicted, appended after
+        the true recent frames. MEM_DECODE_SLOTS repeats it over the last k slots, which pushes B
+        out of the readable context k times faster."""
+        n = self._window_frames(current_start_frame)
+        if env_int("MEM_DECODE_THRU"):
+            assert self._thru_frame is not None, \
+                "MEM_DECODE_THRU: the anchor chunk was never evicted before the " \
+                "return switch (check switch indices / local_attn_size)"
+            frame, cond_on = self._thru_frame, None
+            print(f"[MEM_DECODE_THRU] splicing the frame decoded at eviction "
+                  f"{self._thru_info}", flush=True)
+        else:
+            frame, cond_on = self._memdec_frame(ckpt, cond, output.dtype, output.device)
+        kslots = max(1, env_int("MEM_DECODE_SLOTS", 1))
+        dump = env_str("MEM_DECODE_DUMP")
+        if dump:
+            torch.save(frame.detach().to("cpu", torch.float16), f"{dump}.f{current_start_frame}.pt")
+            print(f"[MEM_DECODE_DUMP] anchor latent saved -> {dump}.f{current_start_frame}.pt", flush=True)
+        print(f"[MEM_DECODE] decoded anchor spliced at recency ({kslots}/{n} slots), "
+              f"cond={'thru' if cond_on is None else ('ON' if cond_on else 'off')}", flush=True)
+        return self._memdec_window(output, current_start_frame, n, frame, kslots, slot_offset=-1)
 
     # Both drivers build their window here. `inference_schedule()` generalises `inference()`,
     # and the two are checked to produce bitwise identical latents on the single-switch
     # schedule, for every arm.
     @staticmethod
     def _memdec_window(output, current_start_frame, n, anchor, kslots, slot_offset):
-        """The 12-frame recache window carrying the recalled anchor.
+        """The recache window of n frames carrying the recalled anchor.
 
         Two conventions, because the original MEM_DECODE path built
             [output[cur - (n - k) : cur]] + [anchor] * k
@@ -137,7 +166,7 @@ class AnchorDecodeMixin:
         where the anchor replaces that most recent true frame. The first duplicates the recency,
         the second replaces it, so the two are not measuring the same thing. slot_offset >= 0
         selects the second:
-            slot_offset = 0  anchor at the recency slot, the 11 others = output[cur-12:cur-1],
+            slot_offset = 0  anchor at the recency slot, the n-1 others = output[cur-n:cur-1],
                              so the indices match the real-frame replay exactly
             slot_offset = j  the anchor is pushed j slots back and the true frames keep the
                              recency, so the model's immediate past stays real

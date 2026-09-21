@@ -23,6 +23,13 @@ class AdditiveKVMixin:
         assert cm is not None, "MEM_ADDITIVE_KV: no CausalWanModel found under the wrappers"
         return cm.blocks
 
+    def _reset_add_kv(self):
+        """Per rollout: nothing installed, an empty trace of the attention mass, and no extra
+        tokens left on the attention modules by a previous arm of the same process."""
+        self._add_installed = False
+        self._add_mass_log = []
+        self._clear_add_kv()
+
     def _clear_add_kv(self):
         """Called once per rollout, unconditionally: an additive channel installed by a previous
         arm of the same process must never leak into the next one."""
@@ -41,41 +48,17 @@ class AdditiveKVMixin:
         construction as _write_sink_anchor, except nothing is written into the real cache, the
         tokens are read at attention time only. Draws no RNG (the memzero pairing is preserved).
         """
-        device = next(self.generator.parameters()).device
-        anchor_frames = anchor_frames.to(device)
-        B, nf = anchor_frames.shape[0], anchor_frames.shape[1]
+        anchor_frames = anchor_frames.to(self._generator_device)
+        nf = anchor_frames.shape[1]
         blocks = self._add_blocks()
         for blk in blocks:
             blk.self_attn._add_kv = None            # the phantom pass itself must be clean
             blk.self_attn._add_capture = True
             blk.self_attn._add_captured = None
-        _real = self.kv_cache1
-        self._initialize_kv_cache(batch_size=B, dtype=anchor_frames.dtype, device=device,
-                                  kv_cache_size_override=nf * self.frame_seq_length)
-        _tmp = self.kv_cache1
-        self.kv_cache1 = _real
-        block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
-            device=device, num_frames=nf, frame_seqlen=self.frame_seq_length,
-            num_frame_per_block=self.num_frame_per_block, local_attn_size=self.local_attn_size)
-        context_timestep = torch.ones([B, nf], device=device,
-                                      dtype=torch.int64) * self.args.context_noise
-        self.generator.model.block_mask = block_mask
-        with torch.no_grad():
-            self.generator(
-                noisy_image_or_video=anchor_frames,
-                conditional_dict=conditional_dict,
-                timestep=context_timestep,
-                kv_cache=_tmp,
-                crossattn_cache=self.crossattn_cache,
-                current_start=0,
-                rope_enhance=self.rope_enhance,
-                ttt_cache=getattr(self, "ttt_cache", None),
-                ttt_update=False,
-            )
-        del _tmp
+        self._prefill_scratch_cache(anchor_frames, conditional_dict)    # the blocks capture k/v as it runs
         gain = env_float("MEM_ADD_GAIN", 1)
-        _p = (os.environ.get("MEM_ADD_POS", "") or "").strip().lower()
-        pos = -1 if _p in ("", "auto") else int(_p)
+        p = (os.environ.get("MEM_ADD_POS", "") or "").strip().lower()
+        pos = -1 if p in ("", "auto") else int(p)
         n_tok = nf * self.frame_seq_length
         for bi, blk in enumerate(blocks):
             sa = blk.self_attn
@@ -94,13 +77,13 @@ class AdditiveKVMixin:
         print(f"[MEM_ADDITIVE_KV] anchor frame installed as {n_tok} EXTRA k/v tokens on "
               f"{len(blocks)} blocks (gain={gain}, rope band "
               f"{'auto (one frame before the window)' if pos < 0 else pos}); the local window "
-              f"keeps its 12 TRUE frames, nothing evicted", flush=True)
+              f"keeps its {self.local_attn_size} true frames, nothing evicted", flush=True)
 
     def _add_mass_report(self):
         """Mean attention mass the anchor tokens took, per block, the anti-inertia tripwire of
         the design plan (a channel that reads 0 % is dead by construction)."""
         cm = _find_causal_model(self.generator.model)
-        if cm is None or not getattr(self, "_add_installed", False):
+        if cm is None or not self._add_installed:
             return None
         return {bi: float(getattr(blk.self_attn, "_add_mass", float("nan")))
                 for bi, blk in enumerate(cm.blocks)}
@@ -110,7 +93,7 @@ class AdditiveKVMixin:
         block, at the last forward. `window` = everything in the context that is not the sink
         (the prompt cache, when active, is counted there). None unless MEM_ADD_MASS_SRC=1."""
         cm = _find_causal_model(self.generator.model)
-        if cm is None or not getattr(self, "_add_installed", False):
+        if cm is None or not self._add_installed:
             return None
         out = {}
         for bi, blk in enumerate(cm.blocks):

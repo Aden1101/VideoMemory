@@ -21,6 +21,7 @@ import os
 
 import torch
 
+from pipeline.switch.noise import private_noise
 from utils.env import env_float, env_int, env_str
 
 
@@ -45,14 +46,14 @@ class ReplayPastMixin:
             pos = n - 1 - min(slot_k, n - 1)
             window[:, pos:pos + 1] = self._anchor_content(output, a_end - 1, a_end)
             print(f"[REPLAY_PAST] anchor at window slot {pos}/{n} "
-                  f"({slot_k} frames before most-recent)")
+                  f"({slot_k} frames before most-recent)", flush=True)
         elif 0 < nf < n:
             if os.environ.get("REPLAY_PAST_POS", "") == "head":
                 window = torch.cat([
                     self._anchor_content(output, a_end - nf, a_end),
                     output[:, current_start_frame - (n - nf):current_start_frame]], dim=1)
                 print(f"[REPLAY_PAST] first {nf}/{n} window slots from the first appearance "
-                      f"[{a_end - nf}, {a_end}), rest = recent tail")
+                      f"[{a_end - nf}, {a_end}), rest = recent tail", flush=True)
             else:
                 tail = self._anchor_content(output, a_end - nf, a_end)
                 if composite:
@@ -60,11 +61,11 @@ class ReplayPastMixin:
                 window = torch.cat([
                     output[:, current_start_frame - n:current_start_frame - nf], tail], dim=1)
                 print(f"[REPLAY_PAST] last {nf}/{n} window slots from the first appearance "
-                      f"[{a_end - nf}, {a_end}), rest = true recent tail")
+                      f"[{a_end - nf}, {a_end}), rest = true recent tail", flush=True)
         else:
             window = self._anchor_content(output, a_end - n, a_end)
             print(f"[REPLAY_PAST] recaching frames [{a_end - n}, {a_end}) of the first "
-                  f"appearance at positions [{current_start_frame - n}, {current_start_frame})")
+                  f"appearance at positions [{current_start_frame - n}, {current_start_frame})", flush=True)
         return window
 
     def _degrade_replay_window(self, window, current_start_frame):
@@ -76,13 +77,10 @@ class ReplayPastMixin:
             return window
         nf_env = env_int("REPLAY_PAST_FRAMES")
         na = nf_env if 0 < nf_env < window.shape[1] else window.shape[1]
-        g = torch.Generator(device=window.device)
-        g.manual_seed(987654321 + current_start_frame)
         part = window[:, -na:]
-        eps = torch.randn(part.shape, generator=g, device=part.device,
-                          dtype=torch.float32).to(part.dtype)
+        eps = private_noise(part, 987654321 + current_start_frame).to(part.dtype)
         degraded = ((1.0 - dose ** 2) ** 0.5) * part + dose * eps
-        print(f"[REPLAY_PAST_NOISE] degraded the last {na} replayed frame(s), sigma={dose}")
+        print(f"[REPLAY_PAST_NOISE] degraded the last {na} replayed frame(s), sigma={dose}", flush=True)
         return torch.cat([window[:, :-na], degraded], dim=1)
 
     def _recache_with_replay(self, output, current_start_frame, cond, window,
@@ -110,14 +108,14 @@ class ReplayPastMixin:
                     self.kv_cache1[bi]["v"].copy_(kv["v"].to(self.kv_cache1[bi]["v"].device))
             del snap_kv
             print(f"[REPLAY_PAST_BLOCKS] replayed k/v kept only on blocks {sorted(keep)}, "
-                  f"other blocks restored to the normal recache")
+                  f"other blocks restored to the normal recache", flush=True)
         elif sink0 and window is not None:
             # normal recache, so the window stays the true recent tail, then the anchor frame
             # overwrites the sink slot, which is read forever and never evicted
             self._recache_after_switch(output, current_start_frame, cond)
             self._write_sink_anchor(window[:, -1:], cond)
             print("[REPLAY_PAST] sink0: anchor frame written into the sink slot (persistent), "
-                  "window = normal recent tail")
+                  "window = normal recent tail", flush=True)
         else:
             self._recache_after_switch(output, current_start_frame, cond,
                                        frames_override=window,

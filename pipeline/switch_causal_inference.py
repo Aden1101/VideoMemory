@@ -14,7 +14,7 @@ import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
-from utils.env import env_float, env_int, env_str
+from utils.env import env_int, env_on, env_str
 from pipeline.causal_inference import CausalInferencePipeline  # reuse init utilities
 from wan.modules.video_memory import TTTBlockCache
 from pipeline.switch.memory_state import MemoryStateMixin, _memwriter_sync
@@ -26,9 +26,16 @@ from pipeline.switch.composite import CompositeMixin
 from pipeline.switch.additive_kv import AdditiveKVMixin
 from pipeline.switch.frame_bank import FrameBankMixin
 from pipeline.switch.replay import ReplayPastMixin
+from pipeline.switch.schedule import parse_schedule
+from pipeline.switch.driver import ScheduleDriverMixin
 
 
-class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorControlsMixin,
+# arms that only inference_schedule() implements; inference() refuses to run with one of them on
+_SCHEDULE_ONLY_ARMS = ("MEM_DECODE_COMPOSITE", "MEM_ADDITIVE_KV", "MEM_ANCHOR_T", "MEM_SDEDIT",
+                       "MEM_SINKPURGE", "MEM_DECODE_NOISE", "MEM_DECODE_SRC")
+
+
+class SwitchCausalInferencePipeline(ScheduleDriverMixin, MemoryStateMixin, AnchorDecodeMixin, AnchorControlsMixin,
                                     SdeditMixin, SinkMixin, CompositeMixin, AdditiveKVMixin,
                                     FrameBankMixin, ReplayPastMixin, CausalInferencePipeline):
     """Generate a video, switch prompt one or more times, and optionally feed a past
@@ -46,127 +53,6 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
-
-    def _reset_crossattn_cache(self):
-        """Forget the cached text keys and values, so the next forward cross-attends afresh."""
-        for blk in self.crossattn_cache:
-            blk["k"].zero_()
-            blk["v"].zero_()
-            blk["is_init"] = False
-
-    def _window_frames(self, current_start_frame):
-        """How many past frames the attention context holds when generation reaches
-        `current_start_frame`: all of them under global attention, else the local window."""
-        if self.local_attn_size == -1:
-            return current_start_frame
-        return min(self.local_attn_size, current_start_frame)
-
-    def _begin_rollout(self, noise, low_memory, first_switch_frame=None):
-        """Everything both drivers do before the first chunk: free the text encoder, allocate
-        the output, size and clear the caches, and reset the per-rollout memory state.
-        Returns the output tensor."""
-        batch_size, num_output_frames, num_channels, height, width = noise.shape
-        if low_memory:
-            gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
-            move_model_to_device_with_memory_preservation(
-                self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation
-            )
-        # the output lives on the CPU in low-memory mode, to leave the GPU to the model
-        output_device = torch.device('cpu') if low_memory else noise.device
-        output = torch.zeros([batch_size, num_output_frames, num_channels, height, width],
-                             device=output_device, dtype=noise.dtype)
-
-        local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
-        if local_attn_cfg != -1:
-            kv_cache_size = local_attn_cfg * self.frame_seq_length
-            kv_policy = f"int->local, size={local_attn_cfg}"
-        else:
-            kv_cache_size = num_output_frames * self.frame_seq_length
-            kv_policy = "global (-1)"
-        print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, "
-              f"frame_seq_length: {self.frame_seq_length}, "
-              f"num_output_frames: {num_output_frames})")
-        self._initialize_kv_cache(batch_size, dtype=noise.dtype, device=noise.device,
-                                  kv_cache_size_override=kv_cache_size)
-        self._initialize_crossattn_cache(batch_size=batch_size, dtype=noise.dtype,
-                                         device=noise.device)
-
-        # fast-weight memory state, fresh per sequence
-        self.ttt_cache = [TTTBlockCache() for _ in range(self.num_transformer_blocks)]
-        # MEM_WRITER: overlay the offline-trained write parameters on the memory cells before
-        # the first write of this rollout. Default off = no-op; consumes no random draw, so the
-        # paired arms keep identical noise streams.
-        _memwriter_sync(self.generator.model)
-
-        self._switch_global_frame = None
-        self._first_switch_frame = first_switch_frame
-        self._ttt_snap_A = None
-        self._ttt_snap_by_prompt = {}
-        self._thru_frame = None          # MEM_DECODE_THRU cache, per rollout
-        self._thru_info = None
-        self._comp_applied = 0           # MEM_DECODE_COMPOSITE bookkeeping, per rollout
-        self._comp_gate_now = 1.0
-        self._add_installed = False
-        self._add_mass_log = []          # attention mass per source, per chunk, per block
-        self._clear_add_kv()             # no additive channel may survive from a previous arm
-        self._fb_reset()
-        self.generator.model.local_attn_size = self.local_attn_size
-        print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
-        self._set_all_modules_max_attention_size(self.local_attn_size)
-        return output
-
-    def _denoise_chunk(self, noise, output, cond, current_start_frame, num_input_frames,
-                       current_num_frames):
-        """Generate one chunk under `cond` and write it into `output`.
-
-        Runs the sampler's denoising steps on the chunk's slice of `noise`, then re-runs the
-        result once at the context noise level, which is the pass that refreshes the kv cache
-        and performs the memory write for this chunk.
-        """
-        batch_size = noise.shape[0]
-        noisy_input = noise[:, current_start_frame - num_input_frames:
-                            current_start_frame + current_num_frames - num_input_frames]
-        for index, current_timestep in enumerate(self.denoising_step_list):
-            timestep = torch.ones([batch_size, current_num_frames], device=noise.device,
-                                  dtype=torch.int64) * current_timestep
-            _, denoised_pred = self.generator(
-                noisy_image_or_video=noisy_input,
-                conditional_dict=cond,
-                timestep=timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-                rope_enhance=self.rope_enhance,
-                ttt_cache=self.ttt_cache,
-                ttt_update=False,
-                switch_global_frame=self._switch_global_frame,
-            )
-            if index < len(self.denoising_step_list) - 1:
-                next_timestep = self.denoising_step_list[index + 1]
-                noisy_input = self.scheduler.add_noise(
-                    denoised_pred.flatten(0, 1),
-                    torch.randn_like(denoised_pred.flatten(0, 1)),
-                    next_timestep * torch.ones([batch_size * current_num_frames],
-                                               device=noise.device, dtype=torch.long),
-                ).unflatten(0, denoised_pred.shape[:2])
-
-        output[:, current_start_frame:
-               current_start_frame + current_num_frames] = denoised_pred.to(output.device)
-
-        # rerun with clean context noise: this is the pass that updates the cache and writes
-        # to the memory
-        self.generator(
-            noisy_image_or_video=denoised_pred,
-            conditional_dict=cond,
-            timestep=torch.ones_like(timestep) * self.args.context_noise,
-            kv_cache=self.kv_cache1,
-            crossattn_cache=self.crossattn_cache,
-            current_start=current_start_frame * self.frame_seq_length,
-            rope_enhance=self.rope_enhance,
-            ttt_cache=self.ttt_cache,
-            ttt_update=True,
-            switch_global_frame=self._switch_global_frame,
-        )
 
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict,
                               frames_override=None, timestep_override=None):
@@ -289,23 +175,11 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
-        assert not env_int("MEM_DECODE_COMPOSITE"), \
-            "MEM_DECODE_COMPOSITE is implemented in the N-switch driver only, " \
-            "run it through inference_schedule()"
-        assert not env_int("MEM_ADDITIVE_KV"), \
-            "MEM_ADDITIVE_KV is implemented in the N-switch driver only, " \
-            "run it through inference_schedule()"
-        assert env_int("MEM_DECODE_SLOT_OFFSET", -1) < 0, \
-            "MEM_DECODE_SLOT_OFFSET is implemented in the N-switch driver only"
-        assert env_float("MEM_ANCHOR_T") <= 0.0, \
-            "MEM_ANCHOR_T is implemented in the N-switch driver only, " \
-            "run it through inference_schedule()"
-        assert env_float("MEM_SDEDIT") <= 0.0 \
-            and not env_int("MEM_SINKPURGE"), \
-            "MEM_SDEDIT / MEM_SINKPURGE are implemented in the N-switch driver only"
-        assert env_float("MEM_DECODE_NOISE") <= 0.0 \
-            and not env_str("MEM_DECODE_SRC"), \
-            "MEM_DECODE_NOISE / MEM_DECODE_SRC are implemented in the N-switch driver only"
+        schedule_only = [name for name in _SCHEDULE_ONLY_ARMS if env_on(name)]
+        if env_int("MEM_DECODE_SLOT_OFFSET", -1) >= 0:
+            schedule_only.append("MEM_DECODE_SLOT_OFFSET")
+        assert not schedule_only, \
+            f"{schedule_only} exist in the N-switch driver only, run them through inference_schedule()"
 
         # Encode both prompts upfront
         cond_first = self.text_encoder(text_prompts=text_prompts_first)
@@ -351,36 +225,8 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
                 _dec_ckpt = env_str("MEM_DECODE")
                 if _dec_ckpt:
                     assert _splice is None, "MEM_DECODE and REPLAY_PAST are mutually exclusive"
-                    _n = self._window_frames(current_start_frame)
-                    if env_int("MEM_DECODE_THRU"):
-                        # the frame was already decoded at the eviction of the anchor
-                        # chunk (write age 1); nothing is decoded here.
-                        assert self._thru_frame is not None, \
-                            "MEM_DECODE_THRU: the anchor chunk was never evicted before the " \
-                            "return switch (check switch indices / local_attn_size)"
-                        _frame, _cond_on = self._thru_frame, None
-                        print(f"[MEM_DECODE_THRU] splicing the frame decoded at eviction "
-                              f"{self._thru_info}", flush=True)
-                    else:
-                        _frame, _cond_on = self._memdec_frame(_dec_ckpt, cond_third,
-                                                              output.dtype, output.device)
-                    _cond = _cond_on
-                    # MEM_DECODE_SLOTS (default 1): repeat the decoded anchor over the last k
-                    # window slots, evicts B from the readable context k times faster (window-
-                    # mixing fix; multi-slot anchors keep the same re-identification score).
-                    _kslots = max(1, env_int("MEM_DECODE_SLOTS", 1))
-                    # MEM_DECODE_DUMP (debug/eye-check): save the decoded anchor latent so it
-                    # can be VAE-decoded and inspected (is the anchor clean-A or an A/B fusion?)
-                    _dump = env_str("MEM_DECODE_DUMP")
-                    if _dump:
-                        torch.save(_frame.detach().to("cpu", torch.float16),
-                                   f"{_dump}.f{current_start_frame}.pt")
-                        print(f"[MEM_DECODE_DUMP] anchor latent saved -> {_dump}.f{current_start_frame}.pt")
-                    _splice = self._memdec_window(output, current_start_frame, _n, _frame,
-                                                  _kslots, slot_offset=-1)
-                    print(f"[MEM_DECODE] decoded anchor spliced at recency ({_kslots}/{_n} slots), "
-                          f"cond={'thru' if _cond is None else ('ON' if _cond else 'off')}",
-                          flush=True)
+                    _splice = self._single_anchor_window(output, current_start_frame, cond_third,
+                                                         _dec_ckpt)
                 self._recache_with_replay(output, current_start_frame, cond_third, _splice)
                 cond_in_use = cond_third
                 using_third = True
@@ -414,295 +260,6 @@ class SwitchCausalInferencePipeline(MemoryStateMixin, AnchorDecodeMixin, AnchorC
 
         # Standard decoding (to_cpu mirrors causal_inference.py: stack decoded chunks in RAM
         # instead of VRAM for long videos)
-        video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False, to_cpu=low_memory)
-        video = (video * 0.5 + 0.5).clamp(0, 1)
-
-        if return_latents:
-            return video, output
-        return video
-
-    def _switch_recache(self, output, current_start_frame, cond_new, *, a_end=None,
-                        seg_idx=None, prompt_idx=None, is_revisit=False, subject=None,
-                        cond_prev=None):
-        """Cache surgery at one schedule boundary.
-
-        is_revisit=False -> plain switch: no recall hook fires and, with FRAMEBANK
-        off, the call is byte-identical to the first switch of `inference()`.
-        is_revisit=True  -> the entering prompt has been seen before: the recall hooks fire.
-        `a_end` = end latent frame (exclusive) of the segment where the entering subject first
-        appeared, i.e. the anchor frame is `a_end - 1`. In the fixed A->B->A rollout of `inference()` that is
-        `self._first_switch_frame`, so this is a strict generalization of the block in
-        `inference()` (same statements, same order, same tensors).
-
-        Note on FRAMEBANK: its router runs at every transition, revisit or not, Echo-Forcing
-        is never told which switch is a revisit, so a false recall on a fresh scene
-        is a real failure mode of the baseline and must be measurable, not hidden.
-        """
-        assert not env_int("MEM_DECODE_THRU"), \
-            "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
-            "eviction arithmetic assumes the single anchor of the A->B->A rollout, run it through inference()"
-        _splice = None
-        _ts_over = None                  # MEM_ANCHOR_T: per-slot declared timestep of the recache
-        _comp_before = getattr(self, "_comp_applied", 0)
-        if is_revisit:
-            assert a_end is not None and a_end >= 1, "revisit without a first-appearance segment"
-            # MEM_EPISODIC: restore the state snapshotted when this subject was last left.
-            _snaps = getattr(self, "_ttt_snap_by_prompt", None) or {}
-            _sk = prompt_idx if subject is None else subject
-            if env_int("MEM_EPISODIC") and _snaps.get(_sk):
-                self._restore_ttt(_snaps[_sk])
-                print(f"[MEM_EPISODIC] restored the memory state of subject {_sk} at frame "
-                      f"{current_start_frame}")
-            self._dump_anchor(output, a_end)
-            if env_int("MEM_COMP_PROMPT_GATE"):
-                self._comp_gate_from_prompts(cond_new, cond_prev)
-        # ---- MEM_ADDITIVE_KV: the anchor enters as extra k/v tokens, no splice ----------------
-        _addk = bool(is_revisit and env_int("MEM_ADDITIVE_KV"))
-        if _addk:
-            assert not env_int("REPLAY_PAST") and not self._fb_mode(), \
-                "MEM_ADDITIVE_KV is the channel that evicts nothing: do not combine it with a " \
-                "splice arm (REPLAY_PAST / FRAMEBANK)"
-            _ck = env_str("MEM_DECODE")
-            if _ck:                       # the decoded anchor, additive
-                _content, _ = self._memdec_frame(_ck, cond_new, output.dtype, output.device)
-            else:                         # the true anchor frame, additive
-                _content = self._anchor_content(output, a_end - 1, a_end)
-            self._install_add_kv(_content, cond_new)
-        if is_revisit:
-            _splice = self._build_replay_window(output, current_start_frame, a_end,
-                                                composite=True)
-        _splice = self._degrade_replay_window(_splice, current_start_frame)
-        # ---- FRAMEBANK (Echo-Forcing-style real-content recall), routes at every switch ------
-        if self._fb_mode():
-            assert _splice is None and not env_str("MEM_DECODE"), \
-                "FRAMEBANK, REPLAY_PAST and MEM_DECODE are mutually exclusive"
-            _n = self._window_frames(current_start_frame)
-            # FRAMEBANK_GT: take the moment of the recall from the schedule rather than from
-            # the router, so every arm brings its frame back at exactly the same instant and
-            # only the content differs. The router still runs and its decision is logged.
-            _gt = bool(env_int("FRAMEBANK_GT"))
-            _fb_frame, _ = self._fb_select(seg_idx, prompt_idx, cond_new, subject=subject,
-                                           force=(bool(is_revisit) if _gt else None))
-            if _gt and not is_revisit:
-                _fb_frame = None
-            if _fb_frame is not None:
-                # same placement as the real-frame arm: the recalled frame takes
-                # the most-recent window slot, the rest of the window stays the true recent tail.
-                _splice = torch.cat(
-                    [output[:, current_start_frame - _n:current_start_frame - 1],
-                     _fb_frame.to(dtype=output.dtype, device=output.device)], dim=1)
-                print(f"[FRAMEBANK] recalled frame spliced at recency (1/{_n} slots)", flush=True)
-        # ---- when the decoded anchor fires --------------------------------------------------
-        # By default the schedule says when a subject is revisited, which is correct but is a
-        # signal the frame-bank baseline does not get. MEM_DECODE_ROUTED=1 uses that baseline's
-        # own router instead, so the two arms differ only by what they bring back.
-        _fires = is_revisit
-        if env_int("MEM_DECODE_ROUTED"):
-            assert not self._fb_mode(), \
-                "MEM_DECODE_ROUTED and FRAMEBANK are mutually exclusive (one router, one arm)"
-            _, _rev = self._fb_select(seg_idx, prompt_idx, cond_new, subject=subject, mode="key")
-            _fires = bool(_rev["recalled"])
-            print(f"[MEM_DECODE_ROUTED] segment {seg_idx}: router says "
-                  f"{'REVISIT -> splice' if _fires else 'fresh scene -> no splice'} "
-                  f"(ground truth was {'revisit' if is_revisit else 'fresh'})", flush=True)
-        _dec_ckpt = env_str("MEM_DECODE") if (_fires and not _addk) else ""
-        if _dec_ckpt:
-            assert _splice is None, "MEM_DECODE and REPLAY_PAST are mutually exclusive"
-            _n = self._window_frames(current_start_frame)
-            _frame, _cond_on = self._memdec_frame(_dec_ckpt, cond_new, output.dtype, output.device)
-            _cond = _cond_on
-            _kslots = max(1, env_int("MEM_DECODE_SLOTS", 1))
-            _dump = env_str("MEM_DECODE_DUMP")
-            if _dump:
-                # another run may be reading this file at the same moment, so write to .tmp and
-                # rename: torch.save alone leaves a window where the file is truncated.
-                _dp = f"{_dump}.f{current_start_frame}.pt"
-                torch.save(_frame.detach().to("cpu", torch.float16), _dp + ".tmp")
-                os.replace(_dp + ".tmp", _dp)
-                print(f"[MEM_DECODE_DUMP] anchor latent saved -> {_dp}")
-            # the controls run after the dump, so the dumped anchor stays the raw decoder
-            # output that another run reads back, and before the composite, so they compose.
-            _frame = self._maybe_wrong_anchor(_frame)
-            _frame = self._maybe_noise_anchor(_frame, output, current_start_frame, _n)
-            # sharpen the anchor with the model's own prior, after the content controls on
-            # purpose: sharpening a wrong anchor is then the exact twin of sharpening the right one.
-            _frame = self._maybe_sdedit(_frame, cond_new, current_start_frame)
-            # keep only the subject region of the anchor, take the border from the current scene
-            _frame = self._maybe_composite(_frame, output, current_start_frame)
-            _soff = env_int("MEM_DECODE_SLOT_OFFSET", -1)
-            _splice = self._memdec_window(output, current_start_frame, _n, _frame, _kslots, _soff)
-            # MEM_ANCHOR_T: stop lying about the anchor's noise level. Off by default, and it
-            # returns the window object itself then, so every arm on disk is unchanged.
-            _splice, _ts_over = self._maybe_declare_anchor_noise(
-                _splice, _n, _kslots, _soff, current_start_frame)
-            print(f"[MEM_DECODE] decoded anchor spliced ({_kslots}/{_n} slots, window convention "
-                  f"{'recency duplicated' if _soff < 0 else f'slot_offset={_soff}'}"
-                  f"), cond={'thru' if _cond is None else ('ON' if _cond else 'off')}", flush=True)
-        if env_int("MEM_DECODE_COMPOSITE") and _splice is not None:
-            assert getattr(self, "_comp_applied", 0) > _comp_before, \
-                "MEM_DECODE_COMPOSITE=1 but the splice built at this switch carries no " \
-                "composited anchor, unsupported placement (SLOT / POS=head / full window / " \
-                "FRAMEBANK content)"
-        self._recache_with_replay(output, current_start_frame, cond_new, _splice,
-                                  timestep_override=_ts_over)
-        # MEM_SINKPURGE: after the recache, so it rewrites the sink slots of the
-        # cache the return will actually read. No-op unless the hook is on (default off).
-        self._maybe_sinkpurge(output, current_start_frame, cond_new, is_revisit)
-
-    def inference_schedule(
-        self,
-        noise: torch.Tensor,
-        *,
-        prompts: List[str],
-        schedule: List,
-        subjects: Optional[List[int]] = None,
-        return_latents: bool = False,
-        low_memory: bool = False,
-    ):
-        """N-switch generation.
-
-        Prompts  : the distinct prompt strings, indexed by the schedule.
-        schedule : [(start_frame, prompt_idx), ...], strictly increasing start frames, the first
-                   one 0, every start frame a multiple of num_frame_per_block. A segment whose
-                   subject already appeared earlier is a revisit: the recall hooks fire and the
-                   anchor is taken from the segment of that subject's first appearance.
-        subjects : optional ground-truth identity per segment (same length as schedule).
-                   Defaults to the prompt indices, i.e. "same prompt string = same subject".
-                   Give it explicitly when a revisit is described by a paraphrase: then the
-                   conditioning differs but the subject (hence the re-ID reference and the
-                   frame-bank ceiling) is the same, and the router has a real matching job.
-
-        Equivalence with `inference()`: schedule [(0, 0), (sw1, 1), (sw2, 0)] with prompts [A, B] reproduces
-        `inference(noise, text_prompts_first=[A], text_prompts_second=[B], switch_frame_index=sw1,
-        second_switch_frame_index=sw2)` exactly. The text encoder is called once per
-        schedule entry, in schedule order, which is the call sequence of `inference()` (A, B, A).
-        """
-        batch_size, num_output_frames, num_channels, height, width = noise.shape
-        assert num_output_frames % self.num_frame_per_block == 0
-        num_blocks = num_output_frames // self.num_frame_per_block
-
-        assert not env_int("MEM_DECODE_THRU"), \
-            "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
-            "eviction arithmetic assumes the single anchor of the A->B->A rollout, run it through inference()"
-        schedule = [(int(f), int(p)) for f, p in schedule]
-        assert schedule and schedule[0][0] == 0, "schedule must start at frame 0"
-        for i, (f, p) in enumerate(schedule):
-            assert 0 <= p < len(prompts), f"schedule[{i}] prompt index {p} out of range"
-            assert f % self.num_frame_per_block == 0, \
-                f"schedule[{i}] start frame {f} is not a multiple of {self.num_frame_per_block}"
-            if i:
-                assert f > schedule[i - 1][0], "schedule start frames must be strictly increasing"
-        assert schedule[-1][0] < num_output_frames, "last segment is empty"
-        seg_prompt = [p for _, p in schedule]
-        seg_subj = [int(x) for x in (subjects if subjects is not None else seg_prompt)]
-        assert len(seg_subj) == len(schedule), \
-            f"subjects has {len(seg_subj)} entries for {len(schedule)} segments"
-        # first appearance of each subject + the end frame of that segment (= anchor frame + 1)
-        seg_end = [schedule[i + 1][0] for i in range(len(schedule) - 1)] + [num_output_frames]
-        first_app = {}
-        for i, s in enumerate(seg_subj):
-            first_app.setdefault(s, i)
-        is_revisit = [i > 0 and first_app[s] < i for i, s in enumerate(seg_subj)]
-        print(f"[schedule] {len(schedule)} segments, {len(prompts)} distinct prompts, subjects "
-              f"{seg_subj}, revisits at segments "
-              f"{[i for i, r in enumerate(is_revisit) if r]}", flush=True)
-        for i, (f, p) in enumerate(schedule):
-            print(f"[schedule]   seg{i}: frames [{f}, {seg_end[i]})  prompt{p} subject{seg_subj[i]}"
-                  f"{'  REVISIT of seg' + str(first_app[seg_subj[i]]) if is_revisit[i] else ''}"
-                  f"  '{prompts[p][:60]}'", flush=True)
-
-        # one text-encoder call per schedule entry, in schedule order, as `inference()` does.
-        conds = [self.text_encoder(text_prompts=[prompts[p]]) for _, p in schedule]
-
-        output = self._begin_rollout(
-            noise, low_memory,
-            first_switch_frame=schedule[1][0] if len(schedule) > 1 else None)
-        current_start_frame = 0
-        num_input_frames = 0
-
-        all_num_frames = [self.num_frame_per_block] * num_blocks
-
-        seg = 0
-        for current_num_frames in all_num_frames:
-            if seg + 1 < len(schedule) and current_start_frame >= schedule[seg + 1][0]:
-                prev_seg, seg = seg, seg + 1
-                # FRAMEBANK 'preserve': the segment that just ended enters the scene pool
-                # (before the recall, so the just-left scene is in the bank and excluded as the
-                # adjacent one, exactly Echo-Forcing's routing rule).
-                self._fb_store(output, current_start_frame, prev_seg, seg_prompt[prev_seg],
-                               conds[prev_seg], subject=seg_subj[prev_seg])
-                # MEM_EPISODIC: freeze the state of a first appearance that will be revisited.
-                if env_int("MEM_EPISODIC") \
-                        and first_app[seg_subj[prev_seg]] == prev_seg \
-                        and seg_subj[prev_seg] in seg_subj[prev_seg + 1:]:
-                    self._ttt_snap_by_prompt[seg_subj[prev_seg]] = self._snapshot_ttt()
-                    print(f"[MEM_EPISODIC] snapshotted the state of subject "
-                          f"{seg_subj[prev_seg]} at frame {current_start_frame}")
-                self._switch_recache(
-                    output, current_start_frame, conds[seg],
-                    a_end=seg_end[first_app[seg_subj[seg]]],
-                    seg_idx=seg, prompt_idx=seg_prompt[seg], subject=seg_subj[seg],
-                    is_revisit=is_revisit[seg], cond_prev=conds[prev_seg])
-                self._switch_global_frame = current_start_frame
-                print(f"[schedule] switch to segment {seg} (prompt {seg_prompt[seg]}) at frame "
-                      f"{current_start_frame}", flush=True)
-            cond_in_use = conds[seg]
-
-            self._denoise_chunk(noise, output, cond_in_use, current_start_frame,
-                                num_input_frames, current_num_frames)
-
-            # Trace of the attention mass per source, one point per generated chunk and per
-            # block. Without MEM_ADD_MASS_SRC=1 the report is None and nothing is accumulated,
-            # so this costs nothing and changes no output.
-            if getattr(self, "_add_installed", False):
-                _src = self._add_mass_src_report()
-                if _src is not None:
-                    self._add_mass_log.append({"frame": int(current_start_frame),
-                                               "segment": int(seg), "per_block": _src})
-
-            current_start_frame += current_num_frames
-
-        # MEM_ADDITIVE_KV tripwire: how much attention mass did the extra tokens actually take on
-        # the last forward? A channel read at ~0 % is dead by construction, not by content.
-        _mass = self._add_mass_report()
-        if _mass:
-            _v = [m for m in _mass.values() if m == m]
-            print(f"[MEM_ADDITIVE_KV] attention mass of the anchor tokens on the last forward: "
-                  f"mean {sum(_v) / max(1, len(_v)):.4f}, min {min(_v):.4f}, max {max(_v):.4f} "
-                  f"| per block " + " ".join(f"{b}:{m:.3f}" for b, m in sorted(_mass.items())),
-                  flush=True)
-        # Attention mass per source [sink | window | anchor]: summary, plus a full dump
-        # (block x step) when MEM_ADD_MASS_DUMP names a file.
-        _log = getattr(self, "_add_mass_log", None)
-        if _log:
-            _post = [e for e in _log if e["frame"] > (self._switch_global_frame or 0)]
-            _use = _post or _log
-            _agg = {k: sum(b[k] for e in _use for b in e["per_block"].values())
-                    / max(1, sum(len(e["per_block"]) for e in _use))
-                    for k in ("sink", "window", "anchor")}
-            _ntok = next(iter(_use[-1]["per_block"].values()))["n_tok"]
-            print(f"[MEM_ADD_MASS_SRC] attention mass per source after the return "
-                  f"({len(_use)} steps x {len(_use[-1]['per_block'])} blocks): "
-                  f"sink {_agg['sink']:.4f} | window {_agg['window']:.4f} | "
-                  f"anchor {_agg['anchor']:.4f}   (tokens {_ntok} = sink/window/anchor, "
-                  f"uniform share of the anchor "
-                  f"{_ntok[2] / max(1, sum(_ntok)):.4f})", flush=True)
-            _dump = env_str("MEM_ADD_MASS_DUMP")
-            if _dump:
-                os.makedirs(os.path.dirname(_dump) or ".", exist_ok=True)
-                with open(_dump, "w") as _f:
-                    json.dump({"summary_after_return": _agg, "n_tok": _ntok, "steps": _log}, _f)
-                print(f"[MEM_ADD_MASS_SRC] full trace -> {_dump}", flush=True)
-
-        # the generation loop is over and nothing reads these caches again, so release them
-        # (~3.5 GB) right before the VAE decode, the biggest allocation of the rollout.
-        if low_memory:
-            import gc
-            self.kv_cache1 = None
-            self.crossattn_cache = None
-            self._clear_add_kv()
-            gc.collect()
-            torch.cuda.empty_cache()
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False, to_cpu=low_memory)
         video = (video * 0.5 + 0.5).clamp(0, 1)
 

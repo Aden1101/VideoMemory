@@ -111,6 +111,12 @@ def _memwriter_sync(model):
 
 
 class MemoryStateMixin:
+    def _reset_memory_slots(self):
+        """Per rollout: the memory state frozen at the first switch (A -> B -> A driver) and the
+        one kept per subject (N-switch driver), both used by MEM_EPISODIC."""
+        self._ttt_snap_A = None
+        self._ttt_snap_by_prompt = {}
+
     def _snapshot_ttt(self):
         """Freeze the memory as it stands: the fast weights, the queue of evicted chunks waiting
         to be written, and the injection smoothing buffers. Used to give the memory one slot per

@@ -40,36 +40,29 @@ class SdeditMixin:
         this backbone, trained and cached with num_frame_per_block = 3, where frames inside a
         block attend to each other. So the anchor is replicated to a native-size block and the
         middle frame is read back. MEM_SDEDIT_FRAMES=1 is kept as the control that shows it."""
-        dev = next(self.generator.parameters()).device
+        dev = self._generator_device
         assert frame.shape[1] == 1, \
             f"MEM_SDEDIT sharpens ONE latent frame, got {frame.shape[1]}"
         nf = env_int("MEM_SDEDIT_FRAMES") or self.num_frame_per_block
         x0 = frame.to(device=dev, dtype=torch.bfloat16).repeat(1, nf, 1, 1, 1)
         B = x0.shape[0]
-        _g = torch.Generator(device=dev)
-        _g.manual_seed(env_int("MEM_SDEDIT_SEED", 5150241)
+        g = torch.Generator(device=dev)
+        g.manual_seed(env_int("MEM_SDEDIT_SEED", 5150241)
                        + int(current_start_frame))
         steps = self._sdedit_steps(sigma)
 
         def _renoise(x, t):
-            e = torch.randn(x.shape, generator=_g, device=dev, dtype=torch.float32).to(x.dtype)
+            e = torch.randn(x.shape, generator=g, device=dev, dtype=torch.float32).to(x.dtype)
             tt = torch.ones([x.shape[0] * x.shape[1]], device=dev, dtype=torch.float32) * t
             return self.scheduler.add_noise(x.flatten(0, 1), e.flatten(0, 1), tt) \
                        .unflatten(0, x.shape[:2])
 
         xt = _renoise(x0, steps[0])
-        _real = self.kv_cache1
-        self._initialize_kv_cache(batch_size=B, dtype=x0.dtype, device=dev,
-                                  kv_cache_size_override=nf * self.frame_seq_length)
-        _tmp = self.kv_cache1
-        self.kv_cache1 = _real                     # the real cache is never touched here
-        self.generator.model.block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
-            device=dev, num_frames=nf, frame_seqlen=self.frame_seq_length,
-            num_frame_per_block=self.num_frame_per_block, local_attn_size=self.local_attn_size)
+        tmp = self._scratch_kv_cache(B, nf, x0.dtype, dev)
         self._reset_crossattn_cache()     # the return prompt, freshly cross-attended
         with torch.no_grad():
             for i, t in enumerate(steps):
-                for c in _tmp:                     # every call is an independent 1-frame denoise
+                for c in tmp:                     # every call is an independent 1-frame denoise
                     c["k"].zero_()
                     c["v"].zero_()
                     c["global_end_index"].zero_()
@@ -78,21 +71,21 @@ class SdeditMixin:
                     noisy_image_or_video=xt,
                     conditional_dict=cond,
                     timestep=torch.ones([B, nf], device=dev, dtype=torch.float32) * t,
-                    kv_cache=_tmp,
+                    kv_cache=tmp,
                     crossattn_cache=self.crossattn_cache,
                     current_start=0,
                     rope_enhance=self.rope_enhance,
-                    ttt_cache=getattr(self, "ttt_cache", None),
+                    ttt_cache=self.ttt_cache,
                     ttt_update=False,
                 )
                 if i + 1 < len(steps):
                     xt = _renoise(x0_pred, steps[i + 1])
-        del _tmp
+        del tmp
         self._reset_crossattn_cache()     # nothing of the phantom pass may survive
         # the middle frame of the block: frames inside a block attend to each other, and latent
         # frame 0 of a Wan clip is the odd one out (1 pixel frame vs 4 for the others).
-        _pick = nf // 2
-        return x0_pred[:, _pick:_pick + 1].to(dtype=frame.dtype, device=frame.device)
+        pick = nf // 2
+        return x0_pred[:, pick:pick + 1].to(dtype=frame.dtype, device=frame.device)
 
     @staticmethod
     def _lat_hf(x):
@@ -105,6 +98,8 @@ class SdeditMixin:
         return float(F.conv2d(v, k, padding=1).abs().mean())
 
     def _maybe_sdedit(self, frame, cond, current_start_frame):
+        """MEM_SDEDIT=s: the anchor sharpened by _sdedit_frame, with how far it moved and how
+        much high-frequency content it gained logged. `frame` when off."""
         s = env_float("MEM_SDEDIT")
         if s <= 0.0:
             return frame

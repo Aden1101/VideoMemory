@@ -26,9 +26,8 @@ class FrameBankMixin:
     def _route_on(self):
         """Is the Echo-Forcing ROUTER (bank + cosine decision) needed at all this rollout?
         True for the framebank arms (which also splice the banked frame) and for
-        MEM_DECODE_ROUTED, which borrows the router's decision only. Default
-        off on both counts => `_fb_store`/`_fb_select` stay no-ops and every existing arm is
-        byte-identical."""
+        MEM_DECODE_ROUTED, which borrows the router's decision only. With both
+        off, `_fb_store` and `_fb_select` do nothing."""
         return bool(self._fb_mode()) or bool(env_int("MEM_DECODE_ROUTED"))
 
     def _fb_reset(self):
@@ -65,14 +64,14 @@ class FrameBankMixin:
     def _fb_select(self, seg_idx, prompt_idx, cond, subject=None, mode=None, force=None):
         """Scene lifecycle 'recall'. Returns (frame or None, event dict). The event dict logs
         every candidate similarity and whether the pick was the right subject -> the error
-        analysis of the selection (easy at bank size 1-2 in S1/S2, 2-4 in S3/S4).
+        analysis of the selection (the bank holds one to four entries in the schedules used).
 
         `mode` overrides FRAMEBANK: MEM_DECODE_ROUTED calls this with mode='key' to obtain the
         routing decision ('is the entering prompt a revisit of a non-adjacent banked scene?')
-        while FRAMEBANK stays off and the recalled frame is thrown away, same QUAND as the
-        framebank arm, a different QUOI.
+        while FRAMEBANK stays off and the recalled frame is thrown away: the same moment as the
+        framebank arm, a different content.
 
-        `force` (FRAMEBANK_GT, pilote 'texte insuffisant' 2026-08-03) replaces the router's
+        `force` (FRAMEBANK_GT) replaces the router's
         decision by the schedule's ground-truth revisit flag, without touching the selection:
         force=True recalls the argmax candidate even below tau, force=False recalls nothing.
         Default None = the published behaviour, bitwise. Why: with an impoverished return prompt
@@ -96,46 +95,43 @@ class FrameBankMixin:
               "candidates": [{"seg": e["seg"], "prompt_idx": e["prompt_idx"],
                               "subject": e["subject"], "end_frame": e["end_frame"], "sim": s}
                              for e, s in zip(cands, sims)]}
-        pick = None
+        if mode not in ("truth", "key"):
+            raise ValueError(f"FRAMEBANK={mode!r} (expected ''|'key'|'truth')")
+
+        def choose(threshold):
+            """The banked entry this mode selects, or None. `threshold` only binds the cosine
+            router; the forced recall passes -inf to take the argmax whatever its score."""
+            if mode == "truth":
+                pool = [e for e in cands if e["subject"] == subj]
+            else:
+                smax = max(sims) if cands else float("-inf")
+                pool = [e for e, s in zip(cands, sims) if s >= smax - 1e-6] if smax >= threshold else []
+            return (pool[-1] if tie == "recent" else pool[0]) if pool else None
+
+        def chosen(prefix, pick, fields):
+            """What the event log keeps of a selection: whether one was made, which entry, and
+            whether it shows the right subject."""
+            out = {f"{prefix}recalled": pick is not None,
+                   f"{prefix}correct": bool(pick is not None and pick["subject"] == subj)}
+            out.update({f"{prefix}chosen_{f}": None if pick is None else int(pick[f]) for f in fields})
+            return out
+
+        pick = choose(tau)
         if mode == "truth":
-            ok = [e for e in cands if e["subject"] == subj]
-            if ok:
-                pick = ok[-1] if tie == "recent" else ok[0]
             ev["rule"] = "ground-truth subject identity (bank ceiling)"
-        elif mode == "key":
-            if cands:
-                smax = max(sims)
-                best = [e for e, s in zip(cands, sims) if s >= smax - 1e-6]
-                ev["s_max"] = smax
-                if smax >= tau:
-                    pick = best[-1] if tie == "recent" else best[0]
-            ev["rule"] = f"argmax cosine over non-adjacent scenes, recall iff s_max >= {tau}"
         else:
-            raise AssertionError(f"FRAMEBANK={mode!r} (expected ''|'key'|'truth')")
+            if cands:
+                ev["s_max"] = max(sims)
+            ev["rule"] = f"argmax cosine over non-adjacent scenes, recall iff s_max >= {tau}"
         if force is not None:
             # what the router would have done is kept as is, it is a result of its own
-            ev["router_recalled"] = pick is not None
-            ev["router_chosen_seg"] = None if pick is None else int(pick["seg"])
-            ev["router_chosen_subject"] = None if pick is None else int(pick["subject"])
-            ev["router_correct"] = bool(pick is not None and pick["subject"] == subj)
+            ev.update(chosen("router_", pick, ("seg", "subject")))
             ev["forced"] = bool(force)
             ev["rule"] += " | FRAMEBANK_GT: the moment comes from the schedule, the selection "
             ev["rule"] += ("stays the router's (argmax even below tau)" if mode == "key"
                            else "stays the ground-truth one")
-            pick = None
-            if force and cands:
-                if mode == "truth":
-                    ok = [e for e in cands if e["subject"] == subj]
-                    pick = (ok[-1] if tie == "recent" else ok[0]) if ok else None
-                else:
-                    smax = max(sims)
-                    best = [e for e, s in zip(cands, sims) if s >= smax - 1e-6]
-                    pick = best[-1] if tie == "recent" else best[0]
-        ev["recalled"] = pick is not None
-        ev["chosen_seg"] = None if pick is None else int(pick["seg"])
-        ev["chosen_prompt_idx"] = None if pick is None else int(pick["prompt_idx"])
-        ev["chosen_subject"] = None if pick is None else int(pick["subject"])
-        ev["correct"] = bool(pick is not None and pick["subject"] == subj)
+            pick = choose(float("-inf")) if force else None
+        ev.update(chosen("", pick, ("seg", "prompt_idx", "subject")))
         self._fb_events.append(ev)
         print(f"[FRAMEBANK] recall @segment {seg_idx} (prompt {prompt_idx}, subject {subj}): " +
               " ".join(f"seg{c['seg']}(p{c['prompt_idx']}):{c['sim']:.4f}" for c in ev["candidates"])

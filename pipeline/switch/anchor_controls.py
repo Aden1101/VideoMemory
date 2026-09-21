@@ -3,6 +3,7 @@ import os
 
 import torch
 
+from pipeline.switch.noise import private_noise
 from utils.env import env_float, env_int, env_str
 
 
@@ -21,10 +22,10 @@ class AnchorControlsMixin:
         which sits beyond a 32-pixel blur. sigma=0 is a pure encode-decode round trip, so it
         measures what the round trip alone costs."""
         import torchvision.transforms.functional as TVF
-        _dev = next(self.generator.parameters()).device
+        dev = self._generator_device
         assert lat.shape[1] == 1, \
             f"ANCHOR_BLUR_SIGMA supports ONE latent frame (VAE temporal compression), got {lat.shape[1]}"
-        px = self.vae.decode_to_pixel(lat.to(device=_dev, dtype=torch.bfloat16),
+        px = self.vae.decode_to_pixel(lat.to(device=dev, dtype=torch.bfloat16),
                                       use_cache=False)          # (B,1,3,H,W) in [-1,1]
         if sigma > 0:
             k = int(6 * sigma) | 1                              # odd kernel ~ +-3 sigma
@@ -40,7 +41,7 @@ class AnchorControlsMixin:
         ANCHOR_FROM_FILE replaces it with a latent frame loaded from disk:
         the original-A anchor of ANOTHER SEED of the same prompt pair: same prompt, same scene
         grammar, same sharpness, wrong instance. ANCHOR_BLUR_SIGMA blurs
-        the true frame instead. Both are off by default => byte-identical to every existing arm."""
+        the true frame instead. With both off, the true frame is returned as it is."""
         real = output[:, lo:hi]
         src = env_str("ANCHOR_FROM_FILE")
         sig = env_str("ANCHOR_BLUR_SIGMA")
@@ -93,6 +94,8 @@ class AnchorControlsMixin:
     #   MEM_DECODE_SRC=path    use the anchor decoded from ANOTHER video's memory: same decoder,
     #                          same fidelity, same statistics, wrong content.
     def _maybe_wrong_anchor(self, frame):
+        """MEM_DECODE_SRC: the anchor decoded from another video's memory instead of this one,
+        with its cosine and relative distance to the right one logged. `frame` when off."""
         src = env_str("MEM_DECODE_SRC")
         if not src:
             return frame
@@ -112,6 +115,8 @@ class AnchorControlsMixin:
         return out
 
     def _maybe_noise_anchor(self, frame, output, current_start_frame, n):
+        """MEM_DECODE_NOISE=s: mix the anchor with noise drawn at the per-channel mean and
+        standard deviation of the n true window frames, keeping its RMS. `frame` when off."""
         s = env_float("MEM_DECODE_NOISE")
         if s <= 0.0:
             return frame
@@ -121,12 +126,8 @@ class AnchorControlsMixin:
             device=frame.device, dtype=torch.float32)
         mu = ref.mean(dim=(0, 1, 3, 4), keepdim=True)      # per latent channel (dim 2)
         sd = ref.std(dim=(0, 1, 3, 4), keepdim=True)
-        _g = torch.Generator(device=frame.device)
-        # per-cell seed (injected by the driver) so the 24 paired cells do not all share one
-        # noise realization; + the switch frame so a scenario with 2 revisits draws twice.
-        _g.manual_seed(env_int("MEM_DECODE_NOISE_SEED", 192837465)
-                       + current_start_frame)
-        eps = torch.randn(frame.shape, generator=_g, device=frame.device, dtype=torch.float32)
+        # MEM_DECODE_NOISE_SEED is set per run, so paired runs do not all share one realisation
+        eps = private_noise(frame, env_int("MEM_DECODE_NOISE_SEED", 192837465) + current_start_frame)
         noise = mu + sd * eps
         out = (((1.0 - s ** 2) ** 0.5) * frame.float() + s * noise).to(frame.dtype)
         print(f"[MEM_DECODE_NOISE] anchor content REPLACED by noise calibrated on the {ref.shape[1]} "
@@ -169,10 +170,7 @@ class AnchorControlsMixin:
         lo, hi = self._anchor_slots(n, kslots, slot_offset)
         part = splice[:, lo:hi]
         dev = part.device
-        _g = torch.Generator(device=dev)
-        _g.manual_seed(env_int("MEM_ANCHOR_T_SEED", 77400241)
-                       + int(current_start_frame))
-        eps = torch.randn(part.shape, generator=_g, device=dev, dtype=torch.float32)
+        eps = private_noise(part, env_int("MEM_ANCHOR_T_SEED", 77400241) + int(current_start_frame))
         tt = torch.ones([part.shape[0] * part.shape[1]], device=dev, dtype=torch.float32) * t
         noised = self.scheduler.add_noise(part.flatten(0, 1).float(), eps.flatten(0, 1), tt) \
             .unflatten(0, part.shape[:2]).to(part.dtype)
@@ -180,9 +178,9 @@ class AnchorControlsMixin:
         out[:, lo:hi] = noised
         ts = torch.full((n,), float(self.args.context_noise), dtype=torch.float32)
         ts[lo:hi] = t
-        _rel = float((noised.float() - part.float()).norm() / part.float().norm().clamp_min(1e-6))
-        assert _rel > 1e-3, "MEM_ANCHOR_T fired but the anchor content did not change"
+        rel = float((noised.float() - part.float()).norm() / part.float().norm().clamp_min(1e-6))
+        assert rel > 1e-3, "MEM_ANCHOR_T fired but the anchor content did not change"
         print(f"[MEM_ANCHOR_T] anchor slot(s) [{lo}, {hi}) of {n} NOISED to t={t:g} "
-              f"(sigma~{t / 1000:.3f}, rel-L2 {_rel:.3f}) AND declared at t={t:g}; the {n - (hi - lo)} "
+              f"(sigma~{t / 1000:.3f}, rel-L2 {rel:.3f}) AND declared at t={t:g}; the {n - (hi - lo)} "
               f"true frames keep t={int(self.args.context_noise)}", flush=True)
         return out, ts
