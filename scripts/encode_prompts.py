@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def read_prompts(path):
+    """The prompts of a .txt file, one per line, or of a .jsonl file, whose lines hold either
+    one prompt object or a {"prompts": [...]} list."""
     if path.endswith(".jsonl"):
         out = []
         with open(path, encoding="utf8") as f:
@@ -41,6 +43,12 @@ def read_prompts(path):
     # silent cache miss on every run.
     with open(path, encoding="utf-8") as f:
         return [l.rstrip() for l in f if l.strip()]
+
+
+def cache_summary(cache_dir):
+    from utils import prompt_cache
+    st = prompt_cache.stats(cache_dir)
+    return f"cache {st['dir']}: {st['n']} prompts, {st['bytes'] / 1e6:.0f} MB"
 
 
 def main():
@@ -61,8 +69,7 @@ def main():
     from utils import prompt_cache
 
     if a.stats:
-        st = prompt_cache.stats(a.cache_dir)
-        print(f"cache {st['dir']}: {st['n']} prompts, {st['bytes']/1e6:.0f} MB")
+        print(cache_summary(a.cache_dir))
         return 0
 
     prompts = list(a.prompt)
@@ -73,20 +80,14 @@ def main():
     if not prompts:
         ap.error("nothing to encode: give --file or --prompt")
 
-    # de-duplicate while preserving order, so the log reads in file order
-    seen, uniq = set(), []
-    for p in prompts:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
+    uniq = list(dict.fromkeys(prompts))          # de-duplicated, still in file order
     import torch                                 # imported here, after argparse
     want = getattr(torch, a.dtype)
     todo = [p for p in uniq if not prompt_cache.has(p, a.cache_dir, want)]
     print(f"{len(prompts)} prompts read, {len(uniq)} unique, {len(uniq)-len(todo)} already cached, "
           f"{len(todo)} to encode", flush=True)
     if not todo:
-        st = prompt_cache.stats(a.cache_dir)
-        print(f"nothing to do. cache: {st['n']} prompts, {st['bytes']/1e6:.0f} MB")
+        print(f"nothing to do. {cache_summary(a.cache_dir)}")
         return 0
 
     from utils.device import describe
@@ -110,8 +111,7 @@ def main():
             print(f"  {done}/{len(todo)}  ({el/done:.1f} s/prompt, ~"
                   f"{el/done*(len(todo)-done)/60:.1f} min left)", flush=True)
 
-    st = prompt_cache.stats(a.cache_dir)
-    print(f"\ncache {st['dir']}: {st['n']} prompts, {st['bytes']/1e6:.0f} MB")
+    print(f"\n{cache_summary(a.cache_dir)}")
     print("pass 1 done. Launch pass 2 with AF_LAZY_TEXT_ENCODER=1.")
     return 0
 

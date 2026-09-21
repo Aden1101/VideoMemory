@@ -19,7 +19,6 @@ auto_resume: false
 logdir: ckpt/runs/run2_write_evicted_chunk
 use_wandb: true
 wandb_project: anchor-forcing-memory
-wandb_name: run2_write_evicted_chunk
 ema_weight: 0.99
 ema_start_step: 200
 generator_ckpt: ckpt/base.pt

@@ -31,12 +31,14 @@ from pipeline.interactive_causal_inference import (
     InteractiveCausalInferencePipeline,
 )
 from utils.dataset import MultiTextDataset
+from utils.env import check_arm_variables
 
 
 # ----------------------------- Argument parsing -----------------------------
 parser = argparse.ArgumentParser("Interactive causal inference")
 parser.add_argument("--config_path", type=str, help="Path to the config file")
 args = parser.parse_args()
+check_arm_variables()    # a misspelt MEM_* variable stops the run here, not mid-way
 
 config = OmegaConf.load(args.config_path)
 

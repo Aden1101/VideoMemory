@@ -14,7 +14,7 @@ from wan.modules.video_memory import RMSNorm, swiglu_apply
 
 
 class FrameMixerBlock(nn.Module):
-    """Spatial mixer block, the fix for the checkerboard pattern.
+    """Spatial mixer block: what keeps the decoded frame free of a 2x2 checkerboard.
 
     Without it the decoder is strictly per token: each of the 30x52 queries reads the state on
     its own and the head expands it into a 2x2 latent patch, so nothing forces two neighbouring
@@ -78,10 +78,8 @@ class AnchorFrameDecoder(nn.Module):
         (B, 1, 16, 60, 104) follows CausalWanModel.unpatchify: token dim = (ph, pw, c), tokens
         in (h, w) row-major order.
 
-    Parameter count with the defaults (dim=1536, num_blocks=3, grid 30x52, fuse_hidden=3072):
-    queries 3*1560*1536 = 7,188,480; grid embedding (30+52)*1536 = 125,952; the six norms
-    6*1536 = 9,216; fusion 4608->3072->1536 with biases = 18,878,976; output LayerNorm 3,072;
-    head 1536->64 with bias = 98,368. Total about 26.3M, under the 40M budget.
+    About 26.3M parameters with the defaults, most of them in the fusion MLP (18.9M) and the
+    query tables (7.2M); 33.1M with the conditioning, 37.9M with the mixer on top.
 
     Optional conditioning: cond_dim > 0 adds LayerNorm(cond_dim) -> Linear(cond_dim,
     cond_hidden) -> GELU -> Linear(cond_hidden, num_blocks*2*dim), producing a per-block
@@ -93,15 +91,13 @@ class AnchorFrameDecoder(nn.Module):
     strict=False, the only missing keys being the inert cond modules. cond_dim = 0, the default,
     creates no conditioning module at all. The input LayerNorm makes the conditioning robust to
     the scale of the pooled embedding, which varies with prompt length because T5 averages over
-    zero-padded positions. Extra parameters at cond_dim=4096, cond_hidden=512: 6,833,664, for a
-    total of 33.1M.
+    zero-padded positions.
 
     Optional spatial mixer: mixer=True inserts `mixer_blocks` FrameMixerBlock between the
     per-token fusion and the head, the only place in the module where two neighbouring patches
     can talk to each other. Each is the identity at initialisation, so a checkpoint trained
     without the mixer warm-starts with strict=False and `mixer.*` are the only missing keys.
-    mixer=False, the default, creates no module. Extra parameters at dim=1536,
-    mixer_hidden=768, 2 blocks: 4,756,992, for a total of 37.9M.
+    mixer=False, the default, creates no module.
     """
 
     def __init__(
@@ -149,9 +145,7 @@ class AnchorFrameDecoder(nn.Module):
         nn.init.zeros_(self.head.weight)   # null frame at init, never xavier noise
         nn.init.zeros_(self.head.bias)
 
-        # optional conditioning of the read queries; cond_dim == 0 creates no module, so the
-        # unconditioned decoder keeps exactly the same state_dict
-        # spatial mixer, identity at init; no module created when mixer=False
+        # spatial mixer, the identity at init; mixer=False creates no module
         self.use_mixer = bool(mixer)
         if self.use_mixer:
             assert mixer_blocks > 0, "mixer=True with mixer_blocks=0"
@@ -159,6 +153,8 @@ class AnchorFrameDecoder(nn.Module):
                 FrameMixerBlock(dim, mixer_hidden, kernel=mixer_kernel)
                 for _ in range(mixer_blocks)])
 
+        # conditioning of the read queries; cond_dim == 0 creates no module, so the
+        # unconditioned decoder keeps exactly the same state_dict
         self.cond_dim = cond_dim
         self.cond_hidden = cond_hidden
         if cond_dim > 0:
@@ -182,63 +178,60 @@ class AnchorFrameDecoder(nn.Module):
         return u.unsqueeze(1)  # (B, 1, 16, 60, 104)
 
     def forward(self, states, cond=None):
-        """States: sequence of num_blocks (w0, w1, w2) tuples (memory_layers order).
-        cond: optional pooled prompt embedding, (B, cond_dim) or (cond_dim,), the FiLM
-        condition ("retrieve what matches this description"). Requires cond_dim > 0.
-        cond=None with cond_dim > 0 runs the unconditioned read path (no FiLM applied),
-        which at init is also the exact conditioned output (zero-init FiLM).
-        Returns the decoded latent frame (B, 1, z_dim, grid_h*patch_h, grid_w*patch_w)."""
+        """states: one (w0, w1, w2) tuple per memory block, in memory_layers order.
+        cond: the pooled prompt embedding, (B, cond_dim) or (cond_dim,), "retrieve what matches
+        this description"; it needs a decoder built with cond_dim > 0. With cond=None such a
+        decoder reads unconditioned, which at initialisation is also what the conditioned read
+        gives. Returns the latent frame (B, 1, z_dim, grid_h * patch_h, grid_w * patch_w)."""
         assert len(states) == self.num_blocks, \
             f"expected {self.num_blocks} block states, got {len(states)}"
-        pos = (self.pos_row[:, None, :] + self.pos_col[None, :, :]).reshape(self.m, self.dim)
         dtype = self.queries.dtype
-        film = None
-        if cond is not None:
-            assert self.cond_dim > 0, \
-                "cond passed to an UNconditioned decoder (built with cond_dim=0)"
-            if cond.dim() == 1:  # unbatched (cond_dim,) convenience -> (1, cond_dim)
-                cond = cond[None]
-            assert cond.dim() == 2 and cond.shape[-1] == self.cond_dim, \
-                f"cond {tuple(cond.shape)} != (B, {self.cond_dim})"
-            if self.detach_states:  # the conditioning is data, like the states
-                cond = cond.detach()
-            f = self.cond_out(F.gelu(self.cond_in(self.cond_norm(cond.to(dtype)))))
-            film = f.view(f.shape[0], self.num_blocks, 2, self.dim)  # (Bc, nb, {scale,shift}, dim)
-        B = None
-        reads = []
-        for b, st in enumerate(states):
-            assert st is not None and len(st) == 3, f"block {b}: state must be a (w0, w1, w2) tuple"
-            w0, w1, w2 = st
-            if w0.dim() == 2:  # unbatched (di, dh) convenience -> (1, di, dh)
-                w0, w1, w2 = w0[None], w1[None], w2[None]
-            if self.detach_states:
-                w0, w1, w2 = w0.detach(), w1.detach(), w2.detach()
-            assert w0.shape[-2:] == (self.dim, self.dh), \
-                f"block {b}: w0 {tuple(w0.shape)} != (*, {self.dim}, {self.dh})"
-            assert w1.shape[-2:] == (self.dh, self.dim), \
-                f"block {b}: w1 {tuple(w1.shape)} != (*, {self.dh}, {self.dim})"
-            assert w2.shape[-2:] == (self.dim, self.dh), \
-                f"block {b}: w2 {tuple(w2.shape)} != (*, {self.dim}, {self.dh})"
-            if B is None:
-                B = w0.shape[0]
-            assert w0.shape[0] == B and w1.shape[0] == B and w2.shape[0] == B, \
-                f"block {b}: inconsistent state batch (expected leading axis B*nh with nh=1)"
-            w0, w1, w2 = w0.to(dtype), w1.to(dtype), w2.to(dtype)
-            q = self.q_norms[b](self.queries[b] + pos)              # (m, dim)
-            q = q.unsqueeze(0).expand(B, -1, -1)                    # (B, m, dim)
+        pos = (self.pos_row[:, None, :] + self.pos_col[None, :, :]).reshape(self.m, self.dim)
+        film = self._film(cond, dtype)
+        B, reads = None, []
+        for b, state in enumerate(states):
+            w0, w1, w2 = self._checked_state(b, state, B)
+            B = w0.shape[0]
+            q = self.q_norms[b](self.queries[b] + pos).unsqueeze(0).expand(B, -1, -1)   # (B, m, dim)
             if film is not None:
                 fb = film.expand(B, -1, -1, -1) if film.shape[0] == 1 else film
                 assert fb.shape[0] == B, \
                     f"cond batch {film.shape[0]} != state batch {B} (and not broadcastable)"
-                # FiLM after the q_norm so the modulation is not renormalized away; at the
-                # zero-init means scale = shift = 0, so this is q*1 + 0 == q exactly
+                # after the norm, so the modulation is not normalised away; scale = shift = 0
+                # at initialisation, which leaves q exactly as it is
                 q = q * (1.0 + fb[:, b, 0].unsqueeze(1)) + fb[:, b, 1].unsqueeze(1)
-            r = swiglu_apply(q, w0, w1, w2)                         # read: (B, m, dim)
-            reads.append(self.read_norms[b](r))
-        h = torch.cat(reads, dim=-1)                                # (B, m, 3*dim)
-        h = self.fuse2(F.gelu(self.fuse1(h)))
-        if getattr(self, "use_mixer", False):                       # inter-token spatial
-            for blk in self.mixer:                                  # mixing, identity at init
-                h = blk(h, self.grid_h, self.grid_w)
-        tok = self.head(self.out_norm(h))                           # (B, m, 64), == 0 at init
-        return self._unpatchify(tok)
+            reads.append(self.read_norms[b](swiglu_apply(q, w0.to(dtype), w1.to(dtype), w2.to(dtype))))
+        h = self.fuse2(F.gelu(self.fuse1(torch.cat(reads, dim=-1))))        # (B, m, dim), per token
+        if self.use_mixer:                                                  # the only cross-token step
+            for block in self.mixer:
+                h = block(h, self.grid_h, self.grid_w)
+        return self._unpatchify(self.head(self.out_norm(h)))                # exactly 0 at initialisation
+
+    def _film(self, cond, dtype):
+        """cond -> (Bc, num_blocks, 2, dim), a (scale, shift) pair per block, or None."""
+        if cond is None:
+            return None
+        assert self.cond_dim > 0, "cond passed to an UNconditioned decoder (built with cond_dim=0)"
+        if cond.dim() == 1:
+            cond = cond[None]
+        assert cond.dim() == 2 and cond.shape[-1] == self.cond_dim, \
+            f"cond {tuple(cond.shape)} != (B, {self.cond_dim})"
+        if self.detach_states:          # the conditioning is data, like the states
+            cond = cond.detach()
+        f = self.cond_out(F.gelu(self.cond_in(self.cond_norm(cond.to(dtype)))))
+        return f.view(f.shape[0], self.num_blocks, 2, self.dim)
+
+    def _checked_state(self, b, state, B):
+        """One block's (w0, w1, w2), batched, detached if asked, with its shapes checked against
+        the cell's and its batch against the blocks already read (B, None for the first)."""
+        assert state is not None and len(state) == 3, f"block {b}: state must be a (w0, w1, w2) tuple"
+        weights = [w[None] if w.dim() == 2 else w for w in state]           # unbatched -> (1, ., .)
+        if self.detach_states:
+            weights = [w.detach() for w in weights]
+        expected = ((self.dim, self.dh), (self.dh, self.dim), (self.dim, self.dh))
+        for name, w, shape in zip(("w0", "w1", "w2"), weights, expected):
+            assert w.shape[-2:] == shape, f"block {b}: {name} {tuple(w.shape)} != (*, {shape[0]}, {shape[1]})"
+        batch = weights[0].shape[0] if B is None else B
+        assert all(w.shape[0] == batch for w in weights), \
+            f"block {b}: inconsistent state batch (expected leading axis B*nh with nh=1)"
+        return weights

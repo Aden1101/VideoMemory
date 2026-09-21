@@ -5,6 +5,8 @@ unmodified model, on the same prompts and the same seed. `scripts/make_figure.py
 directly, so `assets/motion_identity.png` is regenerated from measurements and never from a
 hand-copied table.
 
+`python scripts/results_index.py` prints the same numbers as JSON, one row per table.
+
 One directory per run, named like the config it was trained with in `configs/runs/`:
 
 | directory | figure panel |
@@ -26,6 +28,20 @@ Three directories are controls on a single checkpoint, and the figure leaves the
 | `run1_…/eval_sink1` | step 1250 again, with one sink frame instead of three |
 | `run1_…/eval_R1` | step 1250 again, with `MEM_REJECT_STREAM=1` on the memory-active arm: the part of the injection parallel to the residual stream is removed. The memory-zeroed arm is identical to `eval1250`, as it should be. It is a different arm, not a repeat measurement |
 | `run2_…/eval1000_msc05` | step 1000 again, with `MEM_STREAM_SCALE=0.5` on the memory-active arm at inference |
+
+## How a table is made
+
+Four steps on one checkpoint, six held-out prompts, seed 42, 240 latent frames:
+
+1. generate with the memory active;
+2. generate again with `MEM_ZERO_ALL=1`, same config, which zeroes the injection and nothing else;
+3. run VBench (subject consistency, background consistency, dynamic degree) on both, and on
+   the unmodified model's videos, which are generated once and reused;
+4. `python scripts/eval_metrics.py`, which adds the DINO first-to-last identity, the lag-1 and
+   lag-2 motion and the paired distances, and writes `metrics.txt`.
+
+The driver that chained these on the cluster is not included. `tests/test_eval_report.py` reads
+every table back and checks that the script's report and decision code write it again.
 
 ## What is and is not comparable
 
@@ -53,6 +69,11 @@ whether the memory changes the output at all (`delta(memon, memzero)` against a 
 and then whether any VBench or drift number differs from `stock`. `ACTIVE-POSITIVE` does not
 mean the memory helps, and the verdicts are not part of this project's conclusion. They are
 left in because the tables are kept exactly as the script wrote them.
+
+The tables call the thresholds pre-registered. Git cannot show that: they enter this
+repository's history in the same commit as the first tables (`33e0878`, 2026-08-13). They have
+not changed since, and every table prints the ones it used. The French words in the verdict
+line are the script's own, kept for the same reason as the verdicts.
 
 The evaluation script wrote a hardcoded run name and step into every header it produced. Those
 labels were wrong and have been rewritten from the directory they sit in; no measurement was

@@ -199,6 +199,13 @@ class WanVAEWrapper(torch.nn.Module):
         return output
 
 
+def _plain(options):
+    """Config values as plain Python, so the model's saved config stays JSON: a list option
+    arrives from OmegaConf as a ListConfig."""
+    return {k: (v if isinstance(v, (bool, int, float, str, type(None))) else list(v))
+            for k, v in options.items()}
+
+
 class WanDiffusionWrapper(torch.nn.Module):
     def __init__(
             self,
@@ -209,23 +216,13 @@ class WanDiffusionWrapper(torch.nn.Module):
             sink_size=0,
             use_gan=False,
             memory_layers=(),
-            gate_init=0.1,
-            ckpt_write=False,
-            gate_extra=None,
-            use_decay=False,
-            decay_init=0.95,
-            bounded_gate=False,
-            single_norm=False,
-            bounded_mod=False,
-            rel_norm=False,
-            dc_remove=False,
-            muon_update_steps=5,
             mem_stream_scale=0.0,
             ema_alpha=0.0,
             eviction_feed=False,
-            mem_state_type="swiglu",   # or "linear_delta": matrix state, training-free delta rule
-            mem_linear_beta=0.5
+            **memory_kwargs
     ):
+        """`memory_kwargs` collects every other key of the config's `model_kwargs`: the options
+        of the memory cell, checked by wan.modules.memory_inject.memory_cell_args."""
         super().__init__()
         # 修改为模型路径，方便修改
         if is_causal:
@@ -234,12 +231,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             # missing memory keys keep their __init__ initialization (Kaiming + gate 0)
             self.model = CausalWanModel.from_pretrained(
                 model_name, local_attn_size=local_attn_size, sink_size=sink_size,
-                memory_layers=memory_layers, gate_init=gate_init, ckpt_write=ckpt_write,
-                gate_extra=gate_extra, use_decay=use_decay, decay_init=decay_init,
-                bounded_gate=bounded_gate, single_norm=single_norm, bounded_mod=bounded_mod, rel_norm=rel_norm, dc_remove=dc_remove, muon_update_steps=muon_update_steps,
+                memory_layers=memory_layers, memory_kwargs=_plain(memory_kwargs),
                 mem_stream_scale=mem_stream_scale, ema_alpha=ema_alpha,
                 eviction_feed=eviction_feed,
-                mem_state_type=mem_state_type, mem_linear_beta=mem_linear_beta,
                 low_cpu_mem_usage=False, device_map=None)
         else:
             self.model = WanModel.from_pretrained(model_name)

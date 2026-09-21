@@ -7,6 +7,7 @@
 # No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
 #
 # SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass, fields
 import os
 import time
 import random
@@ -19,10 +20,11 @@ from utils.debug_option import DEBUG, LOG_GPU_MEMORY, MY_VISUAL_DEBUG
 from utils.memory import log_gpu_memory
 from pipeline.streaming_switch_training import StreamingSwitchTrainingPipeline
 import torch.nn.functional as F
+from model.twin_objective import TwinObjectiveMixin
 
 
 
-class StreamingTrainingModel:
+class StreamingTrainingModel(TwinObjectiveMixin):
     """
     A model wrapper specifically for streaming/serialized training.
 
@@ -82,66 +84,7 @@ class StreamingTrainingModel:
         # Text-dropout (identity signal): prob of generating a chunk with null text so the
         # model must rely on memory/history for the subject. 0.0 = off (default = unchanged).
         self.text_dropout_prob = getattr(config, "text_dropout_prob", 0.0)
-        # identity + anti-freeze objective terms; all weights 0.0 => unchanged.
-        # id term: decode a few frames, DINO-embed, cosine to the chunk-0 anchor (grad flows through the decoder).
-        self.id_loss_weight = getattr(config, "id_loss_weight", 0.0)
-        self.id_decode_frames = getattr(config, "id_decode_frames", 2)   # latent frames decoded (grad) / chunk
-        # Differentiable temporal-variance floor (anti-freeze): hinge on adjacent-latent motion.
-        self.tv_loss_weight = getattr(config, "tv_loss_weight", 0.0)
-        self.tv_motion_floor = getattr(config, "tv_motion_floor", 0.0)   # latent-diff floor; 0 => inactive
-        # counterfactual-advantage objective (all defaults 0/off leave the baseline unchanged).
-        # Rewards the memory only for beating its own motion-valid mem-OFF twin on identity:
-        #   L = -w_adv * g * clamp(cos_ON - cos_CF, -neg, +pos) + w_rel*(log m_ON - log m_CF)^2
-        #       + w_ext * relu(log(frac*m_stock) - log m_ON)^2
-        self.adv_loss_weight = getattr(config, "adv_loss_weight", 0.0)   # bonus mode only (default OFF)
-        self.adv_clamp_pos = getattr(config, "adv_clamp_pos", 0.05)      # reward saturates here (cos units)
-        self.adv_clamp_neg = getattr(config, "adv_clamp_neg", 0.20)      # do-no-harm side stays linear 4x deeper
-        self.adv_gate_sigma = getattr(config, "adv_gate_sigma", 0.405)   # ln(1.5): log-motion validity band
-        self.adv_floor_frac = getattr(config, "adv_floor_frac", 0.5)     # ext floor fires below frac*stock motion
-        self.mm_rel_weight = getattr(config, "mm_rel_weight", 0.0)       # two-sided log-motion match to the twin
-        self.mm_ext_weight = getattr(config, "mm_ext_weight", 0.0)       # one-sided log floor vs stock-AF curve
-        # do-no-harm hinge (identity may not be worse than the twin; nothing pays for beating it):
-        self.dnh_weight = getattr(config, "dnh_weight", 0.0)
-        self.dnh_deadband = getattr(config, "dnh_deadband", 0.01)        # cos units of tolerated noise
-        # activity floor: the injection's causal AC-dose (real-vs-twin latent difference, global
-        # per-channel mean removed so a DC/style bias cannot satisfy it) must stay >= act_floor.
-        # relu => zero gradient once satisfied: a floor, never a maximizer.
-        self.act_weight = getattr(config, "act_weight", 0.0)
-        self.act_floor = getattr(config, "act_floor", 0.05)              # relative AC-dose target (calibrate)
-        # anti-flicker (every default leaves the objective as it is without them):
-        #  - motion_lag2: use the flicker-blind lag-2 motion statistic in mm_rel/mm_ext + the dose,
-        #    so frame-rate shimmer cannot counterfeit motion credit (removes the flicker payer).
-        #  - dose_tmean_remove: also subtract the per-site temporal mean in the AC-dose, so a static
-        #    overlay (wallpaper) earns zero dose (escalation named in the docstring).
-        #  - flick_weight/flick_deadband: latent second-temporal-difference hinge vs the twin (tripwire).
-        self.motion_lag2 = bool(getattr(config, "motion_lag2", False))
-        self.dose_tmean_remove = bool(getattr(config, "dose_tmean_remove", False))
-        self.flick_weight = getattr(config, "flick_weight", 0.0)
-        self.flick_deadband = getattr(config, "flick_deadband", 0.25)    # relative to the twin's roughness
-        self._twin_anchor_on = (self.adv_loss_weight > 0.0 or self.dnh_weight > 0.0)
-        self._twin_on = (self._twin_anchor_on or self.act_weight > 0.0
-                       or self.mm_rel_weight > 0.0 or self.mm_ext_weight > 0.0
-                       or self.flick_weight > 0.0)
-        # every twin term is computed next to the identity anchor of chunk 0, which is only
-        # built when an identity term is on; without it the whole objective returns zero
-        if self._twin_on and not self._twin_anchor_on and self.id_loss_weight <= 0.0:
-            raise ValueError("act_weight, mm_rel_weight, mm_ext_weight and flick_weight need "
-                             "dnh_weight, adv_loss_weight or id_loss_weight > 0: the twin "
-                             "objective returns zero without the identity anchor those build")
-        self._motion_targets = None                                      # {sha1(prompt)[:16]: [m_c0..], "_global": [..]}
-        _mt_path = getattr(config, "motion_target_path", None)
-        if _mt_path and self._twin_on:
-            import json as _json
-            with open(_mt_path) as _f:
-                self._motion_targets = _json.load(_f)
-            if (not dist.is_initialized() or dist.get_rank() == 0):
-                print(f"[StreamingTrain-Model] twin objective on: w_adv={self.adv_loss_weight} "
-                      f"w_dnh={self.dnh_weight} (deadband {self.dnh_deadband}) "
-                      f"w_act={self.act_weight} (floor {self.act_floor}) "
-                      f"w_rel={self.mm_rel_weight} w_ext={self.mm_ext_weight} floor_frac={self.adv_floor_frac} "
-                      f"gate_sigma={self.adv_gate_sigma} targets={_mt_path} ({len(self._motion_targets)} keys)")
-        self._dino = None                                                # lazy frozen DINOv2
-        self._id_anchor = None                                           # per-sequence chunk-0 subject anchor
+        self._init_twin_objective(config)
         if dist.get_rank() == 0:
             print(f"[StreamingTrain-Model] use_prompt_cache={self.use_prompt_cache}. use_gan={self.use_gan}. use_decouple_dmd={self.use_decouple_dmd}. text_dropout_prob={self.text_dropout_prob}")
             print(f"[StreamingTrain-Model] id/tv terms: id_loss_weight={self.id_loss_weight} id_decode_frames={self.id_decode_frames} tv_loss_weight={self.tv_loss_weight} tv_motion_floor={self.tv_motion_floor}")
@@ -561,56 +504,6 @@ class StreamingTrainingModel:
 
         return can_generate
 
-    # ---- counterfactual-twin machinery: snapshot/restore everything one chunk mutates ----
-    def _twin_snapshot(self):
-        """Clone every piece of state a chunk generation mutates (KV / cross-attn / flow / prompt
-        caches, fast-weight state, RNG streams, switch flag) so a mem-OFF twin of the same chunk can
-        be generated and then fully undone. Tensor clones go to CPU to spare VRAM. Completeness is
-        validated empirically by TWIN_SELFTEST=1 (twin with memory ON must equal the real chunk
-        bitwise)."""
-        import random as _pyrand
-        p = self.inference_pipeline
-        tensors = []
-
-        def _walk(obj):
-            if torch.is_tensor(obj):
-                tensors.append((obj, obj.detach().to("cpu", copy=True)))
-            elif isinstance(obj, dict):
-                for v in obj.values():
-                    _walk(v)
-            elif isinstance(obj, (list, tuple)):
-                for v in obj:
-                    _walk(v)
-
-        for c in (getattr(p, "kv_cache1", None), getattr(p, "crossattn_cache", None),
-                  getattr(p, "flow_cache", None), getattr(p, "prompt_cache", None)):
-            if c is not None:
-                _walk(c)
-        # fast weights, injection EMA buffers and eviction FIFO: the twin's writes to any of
-        # them would leak into the real rollout and break the counterfactual
-        ttt = [c.snapshot() for c in p.ttt_cache] if getattr(p, "ttt_cache", None) else None
-        return {
-            "tensors": tensors, "ttt": ttt,
-            "has_switched": self.state.get("has_switched", False),
-            "rng_cpu": torch.get_rng_state(),
-            "rng_cuda": torch.cuda.get_rng_state(self.device),
-            "rng_py": _pyrand.getstate(),
-        }
-
-    def _twin_restore(self, snap):
-        import random as _pyrand
-        p = self.inference_pipeline
-        with torch.no_grad():
-            for ref, saved in snap["tensors"]:
-                ref.copy_(saved.to(ref.device))
-        if snap["ttt"] is not None and getattr(p, "ttt_cache", None):
-            for c, s in zip(p.ttt_cache, snap["ttt"]):
-                c.restore(s)
-        self.state["has_switched"] = snap["has_switched"]
-        torch.set_rng_state(snap["rng_cpu"])
-        torch.cuda.set_rng_state(snap["rng_cuda"], self.device)
-        _pyrand.setstate(snap["rng_py"])
-
     def generate_next_chunk(self, requires_grad: bool = True, detach_state: bool = True, keep_last_write_grad: bool = False, make_twin: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Generate the next chunk, supporting overlap to ensure temporal continuity.
@@ -693,36 +586,9 @@ class StreamingTrainingModel:
             dtype=self.dtype
         )
 
-        # ---- counterfactual mem-OFF twin (advantage objective) ----
-        # Same pre-chunk state, same noise, same RNG stream, injection zeroed -> the only difference
-        # vs the real chunk is the memory's injection during this chunk. Generated first, then every
-        # mutated state is restored, so the real rollout below is bit-identical to a no-twin run.
-        # Self-check: TWIN_SELFTEST=1 keeps the memory on in the twin and
-        # the code below asserts twin == real, which validates snapshot completeness + RNG pairing.
         twin_new_frames = None
         if make_twin and self.state.get("previous_frames") is not None:
-            _selftest = os.environ.get("TWIN_SELFTEST", "0") == "1"
-            _snap = self._twin_snapshot()
-            _prev_mz = os.environ.get("MEM_ZERO_ALL")
-            if not _selftest:
-                os.environ["MEM_ZERO_ALL"] = "1"
-            try:
-                with torch.no_grad():
-                    twin_new_frames, _, _ = self._generate_chunk(
-                        noise_chunk=noise_chunk,
-                        chunk_start_frame=current_length,
-                        requires_grad=False,
-                        detach_state=True,
-                        keep_last_write_grad=False,
-                    )
-                twin_new_frames = twin_new_frames.detach()
-            finally:
-                if _prev_mz is None:
-                    os.environ.pop("MEM_ZERO_ALL", None)
-                else:
-                    os.environ["MEM_ZERO_ALL"] = _prev_mz
-                self._twin_restore(_snap)
-                del _snap
+            twin_new_frames = self._generate_twin(noise_chunk, current_length)
 
         # Generate new frames - note chunk_start_frame should consider overlap
         generated_new_frames, denoised_timestep_from, denoised_timestep_to = self._generate_chunk(
@@ -733,10 +599,7 @@ class StreamingTrainingModel:
             keep_last_write_grad=keep_last_write_grad,
         )
 
-        if twin_new_frames is not None and os.environ.get("TWIN_SELFTEST", "0") == "1":
-            _diff = (generated_new_frames.detach() - twin_new_frames).abs().max().item()
-            print(f"[E3-TWIN-SELFTEST] rank{dist.get_rank() if dist.is_initialized() else 0} "
-                  f"max|real - twin(mem ON)| = {_diff:.3e} (MUST be 0.0)", flush=True)
+        self._twin_selftest(generated_new_frames, twin_new_frames)
 
         # Build the full chunk for loss computation
         if previous_frames is not None:
@@ -822,271 +685,6 @@ class StreamingTrainingModel:
             print(f"[StreamingTrain-Model] current_training_chunk: ({self.state['current_length'] - new_frames_to_generate} -> {self.state['current_length']})/{self.state['temp_max_length']}")
         return full_chunk, info
     
-    # ---- frame-level identity anchor + temporal-variance floor ----
-    _DINO_MEAN = (0.485, 0.456, 0.406)
-    _DINO_STD = (0.229, 0.224, 0.225)
-
-    def _get_dino(self):
-        """Lazily load a frozen DINOv2-ViT-B/14 (offline from the torch.hub cache)."""
-        if self._dino is None:
-            hub = os.path.expanduser("~/.cache/torch/hub")
-            torch.hub.set_dir(hub)
-            local = os.path.join(hub, "facebookresearch_dinov2_main")
-            m = torch.hub.load(local, "dinov2_vitb14", source="local", pretrained=True)
-            m.eval().to(self.device)
-            for p in m.parameters():
-                p.requires_grad_(False)
-            self._dino = m
-            if (not dist.is_initialized() or dist.get_rank() == 0):
-                print("[StreamingTrain-Model] loaded frozen DINOv2-vitb14 for identity loss")
-        return self._dino
-
-    def _dino_embed_pixels(self, pixels):
-        """Pixels [B,T,C,H,W] in [-1,1] -> L2-normalized DINO CLS embeddings [B*T, D] (fp32)."""
-        dino = self._get_dino()
-        b, t, c, h, w = pixels.shape
-        x = pixels.reshape(b * t, c, h, w).float()
-        x = (x * 0.5 + 0.5).clamp(0, 1)                       # [-1,1] -> [0,1]
-        x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
-        mean = torch.tensor(self._DINO_MEAN, device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor(self._DINO_STD, device=x.device).view(1, 3, 1, 1)
-        x = (x - mean) / std
-        f = dino(x)                                           # [B*T, D] CLS embedding
-        return F.normalize(f, dim=-1)
-
-    # -----------------------------------------------------------------------------------------
-    # The extra loss terms, and why the runs this repo presents have all of them off.
-    #
-    # Eight were built, in three generations, each closing the channel the previous one left
-    # open. Every one is a hinge with a deadband rather than a maximiser: an unbounded "be more
-    # active" term is always satisfied by the cheapest route, which is noise or a constant bias.
-    #
-    #   id, tv            identity to the chunk-0 anchor, and a floor on latent motion. Used by
-    #                     the first generation of runs, then dropped: the identity term is a
-    #                     freeze ally, since the cheapest way to keep a face is to stop moving,
-    #                     and the motion floor is subsumed by the mm terms below.
-    #   dnh, act,         do-no-harm on identity; a floor on how much the injection changes the
-    #   mm_rel, mm_ext    frame; a two-sided motion match to the twin; and an absolute floor
-    #                     against the unmodified model's own motion curve, which is what catches
-    #                     a twin that froze too. Used by the second generation of runs.
-    #   flick,            a second-temporal-difference hinge against the twin, plus two switches,
-    #   motion_lag2,      added after the model learned to counterfeit motion with frame-rate
-    #   dose_tmean_remove shimmer and to satisfy the activity floor with a static overlay. Each
-    #                     switch closes one of those two routes.
-    #   adv               a clamped reward for beating the twin on identity. Written, bounded,
-    #                     gated on motion validity, and never enabled in any run of this project:
-    #                     it was judged a freeze risk. adv_floor_frac is still used, by mm_ext.
-    #
-    # The four runs behind the README figure turn all of this off and keep DMD alone, because the
-    # stack fought the distillation and swept the model between freezing and flickering. With
-    # every twin weight at 0, _twin_on is false and the trainer never even builds the twin
-    # (make_twin in trainer/distillation.py), so none of the code below runs.
-    # -----------------------------------------------------------------------------------------
-    def _set_id_anchor(self, chunk):
-        """Cache the chunk-0 subject identity anchor (no grad), called from the rollout on the first
-        chunk. Uses the head frames (highest prompt fidelity, last to degrade under collapse) so the
-        anchor is a real subject; supervised chunks compare their tail frames, so id_cos=1.0 becomes a
-        genuine static-video alarm instead of a vacuous garbage-vs-garbage fixed point."""
-        if self.id_loss_weight <= 0.0 and not self._twin_anchor_on:
-            return
-        k = max(1, int(self.id_decode_frames))
-        with torch.no_grad():
-            px = self.base_model.vae.decode_to_pixel(chunk[:, :k, ...], use_cache=False)  # head, pre-collapse
-            emb = self._dino_embed_pixels(px)
-            self._id_anchor = F.normalize(emb.mean(0, keepdim=True), dim=-1).detach()
-
-    def _compute_identity_tv_loss(self, chunk, chunk_start_frame, gradient_mask):
-        """Frame-level identity anchor loss + temporal-variance floor. Returns (id_loss, tv_loss, log).
-        All log values are 0-dim tensors present on every chunk (chunk-0 defaults) so merge_dict_list
-        (which keys off the first chunk's dict) keeps them and stacks them across chunks."""
-        device = chunk.device
-        id_loss = torch.zeros((), device=device)
-        tv_loss = torch.zeros((), device=device)
-        # consistent keys every chunk (chunk-0 identity is perfect by construction -> cos=1, loss=0)
-        log = {
-            "e1_latent_motion": torch.zeros((), device=device),
-            "e1_tv_loss": torch.zeros((), device=device),
-            "e1_id_cos": torch.ones((), device=device),
-            "e1_id_loss": torch.zeros((), device=device),
-        }
-
-        # temporal-variance floor (anti-freeze): hinge on adjacent-latent motion; penalize only if frozen
-        if self.tv_loss_weight > 0.0 and chunk.shape[1] >= 2:
-            motion = (chunk[:, 1:] - chunk[:, :-1]).abs().mean()
-            tv_loss = F.relu(self.tv_motion_floor - motion)
-            log["e1_latent_motion"] = motion.detach()
-            log["e1_tv_loss"] = tv_loss.detach()
-
-        # frame-level identity: decode a few frames -> DINO -> cosine to the chunk-0 anchor, on later
-        # chunks only, with grad through decode -> gate -> read -> write (anchor cached in the rollout).
-        # Skip after a real prompt switch: the anchor is the pre-switch subject, penalizing the new one.
-        if (self.id_loss_weight > 0.0 and chunk_start_frame > 0 and self._id_anchor is not None
-                and not self.state.get("has_switched", False)):
-            k = max(1, int(self.id_decode_frames))
-            px = self.base_model.vae.decode_to_pixel(chunk[:, -k:, ...], use_cache=False)
-            emb = self._dino_embed_pixels(px)
-            cos = (emb * self._id_anchor).sum(-1)            # [k]
-            id_loss = (1.0 - cos).mean()
-            log["e1_id_cos"] = cos.mean().detach()
-            log["e1_id_loss"] = id_loss.detach()
-        return id_loss, tv_loss, log
-
-    # ---- counterfactual, motion-gated, clamped identity advantage over the mem-OFF twin ----
-    def _motion_target_index(self, chunk_start_frame):
-        """chunk_start (0, 21, 39, 57, ...) -> index (0, 1, 2, 3, ...) into the motion-target curve."""
-        if chunk_start_frame <= 0:
-            return 0
-        return (chunk_start_frame - self.chunk_size) // self.min_new_frame + 1
-
-    def _get_motion_target(self, chunk_start_frame):
-        """Per-prompt (fallback: _global) stock-AF latent-motion target for this chunk position.
-        Keys = sha1(prompt.strip())[:16]; the trainer stores the prompt in state["current_prompt"]."""
-        if self._motion_targets is None:
-            return None
-        import hashlib
-        p = self.state.get("current_prompt")
-        key = hashlib.sha1(p.strip().encode()).hexdigest()[:16] if isinstance(p, str) else None
-        curve = self._motion_targets.get(key) if key else None
-        if curve is None:
-            curve = self._motion_targets.get("_global")
-        if not curve:
-            return None
-        i = min(self._motion_target_index(chunk_start_frame), len(curve) - 1)
-        return torch.tensor(float(curve[i]), device=self.device)
-
-    def _compute_advantage_loss(self, chunk, chunk_info):
-        """Twin objective: clean + active + do-no-harm + dynamic, via the mem-OFF counterfactual twin.
-            L = w_dnh * relu(cos_CF - cos_ON - deadband)            (do-no-harm identity hinge)
-              + w_act * relu(act_floor - D_ac)                      (activity floor: not inert)
-              + w_rel * (log m_ON - log m_CF)^2                     (motion two-sided vs twin)
-              + w_ext * relu(log(frac * m_stock) - log m_ON)^2      (anti-co-freeze vs stock curve)
-              [ - w_adv * g * clamp(cos_ON - cos_CF, -neg, +pos)    bonus mode only, default OFF ]
-        with D_ac = RMS((c_ON - c_CF) - per-channel-mean) / RMS_ac(c_CF): the injection's causal
-        dose, DC/global-style component removed.
-        Anti-degeneracy structure (each blocked in-construction, not by tuning):
-        - The twin is no-grad and shares history + KV + noise: the only differential lever is the
-          memory injection during this chunk; nothing can be earned by degrading the baseline, and
-          the paired design cancels prompt/noise variance.
-        - nothing pays for identity self-similarity (no id_loss, reward off): freeze has
-          no payer, and mm_rel/mm_ext punish it; a frozen chunk also zeroes the dnh hinge trivially,
-          so freeze buys nothing that neutrality does not already buy, at strictly higher mm cost.
-        - The activity floor is a RELU: zero gradient once D_ac >= act_floor -> a floor, never a
-          maximizer -> no runaway (contrast: rel_norm alone pins a fixed dose at every chunk;
-          here the floor only forbids ~zero dose, the envelope bounds it above, and D_ac's mean
-          removal forbids satisfying it with the resurrected DC bias).
-        - Under the box {identity not-worse, motion matched, DMD on-manifold, dose >= floor}, the
-          cheapest admissible behavior is an active-but-neutral content/detail difference: active by
-          construction, harmless by constraint. Wallpaper (static texture watermark) is the residual
-          gaming channel -> judged at eval (visual + dcfrac), escalation = temporal-mean removal in D_ac.
-        - Decoded frames are position-randomized in the tail so the read cannot position-lock.
-        Returns (loss, log). All log keys present on every chunk (merge_dict_list keys off chunk 0)."""
-        device = chunk.device
-        _z = lambda: torch.zeros((), device=device)
-        log = {
-            "twin_adv_loss": _z(), "twin_adv_raw": _z(), "twin_gate": _z(),
-            "twin_dnh": _z(), "twin_act": _z(), "twin_dose": _z(),
-            "twin_mm_rel": _z(), "twin_mm_ext": _z(), "twin_flick": _z(),
-            "twin_cos_on": torch.ones((), device=device), "twin_cos_cf": torch.ones((), device=device),
-            "twin_motion_on": _z(), "twin_motion_cf": _z(), "twin_motion_tgt": _z(),
-            "twin_active": _z(), "twin_oom_skip": _z(),
-        }
-        twin = chunk_info.get("twin_new_frames")
-        chunk_start_frame = chunk_info["chunk_start_frame"]
-        if twin is None or chunk_start_frame <= 0 or self._id_anchor is None:
-            return _z(), log
-        eps = 1e-6
-        ov = int(chunk_info.get("overlap_frames_used", 0))
-        new_real = chunk[:, ov:]                        # newly generated frames only (grad); twin spans
-        # the same global frames and is decode-comparable (no first-frame re-encode contamination)
-        # lag-2 (frame-rate-blind) motion statistic: frame-rate alternation contributes ~0 to a
-        # lag-2 delta while smooth motion contributes fully, so the memory cannot counterfeit
-        # motion credit with shimmer. Falls back to the first difference when the flag is off or the
-        # chunk is too short for a lag-2 window. (motion_targets.json must be regenerated to match.)
-        if getattr(self, "motion_lag2", False) and new_real.shape[1] >= 3:
-            m_on = (new_real[:, 2:] - new_real[:, :-2]).abs().mean() * 0.5
-            with torch.no_grad():
-                m_cf = (twin[:, 2:] - twin[:, :-2]).abs().mean() * 0.5
-        else:
-            m_on = (new_real[:, 1:] - new_real[:, :-1]).abs().mean()
-            with torch.no_grad():
-                m_cf = (twin[:, 1:] - twin[:, :-1]).abs().mean()
-        m_tgt = self._get_motion_target(chunk_start_frame)
-        # (1) two-sided motion match to the twin: the injection may not change motion either way
-        mm_rel = (torch.log(m_on + eps) - torch.log(m_cf + eps)) ** 2
-        # (2) absolute anti-co-freeze floor vs the external stock-AF curve (catches a co-frozen twin)
-        if m_tgt is not None:
-            mm_ext = F.relu(torch.log(self.adv_floor_frac * m_tgt + eps) - torch.log(m_on + eps)) ** 2
-        else:
-            mm_ext = _z()
-        # (3) activity floor on the injection's causal AC-dose (be measurably non-inert)
-        d = new_real - twin                                             # [B, T, C, H, W]
-        d_ac = d - d.mean(dim=(1, 3, 4), keepdim=True)                  # remove global per-channel bias
-        with torch.no_grad():
-            cf_ac = twin - twin.mean(dim=(1, 3, 4), keepdim=True)
-            if getattr(self, "dose_tmean_remove", False):
-                cf_ac = cf_ac - cf_ac.mean(dim=1, keepdim=True)         # match the per-site temporal removal
-            cf_rms = cf_ac.float().pow(2).mean().sqrt().clamp_min(eps)
-        # also remove the per-site temporal mean so a static overlay (wallpaper) earns zero dose;
-        # only a slow, state-evolving, spatially-structured change can satisfy the floor.
-        if getattr(self, "dose_tmean_remove", False):
-            d_ac = d_ac - d_ac.mean(dim=1, keepdim=True)                # per (B,C,H,W) site temporal mean
-        dose = d_ac.float().pow(2).mean().sqrt() / cf_rms
-        act = F.relu(self.act_floor - dose)
-        # (3b) anti-flicker tripwire: penalize the per-site second-temporal-difference roughness the
-        # injection adds beyond the mem-OFF twin. One-sided hinge, paired (real acceleration in the twin
-        # is priced in), relative to the twin's own roughness. D2 (not D1) maximizes on frame-rate
-        # alternation while smooth constant-velocity motion contributes ~0. Latent-space (covers all new
-        # frames, free); the EMA low-pass should make this structurally ~0 -> a rise flags conversion of
-        # slow injection into fast output downstream (a reportable finding), hence "tripwire" weight.
-        if self.flick_weight > 0.0 and new_real.shape[1] >= 3:
-            d2_on = new_real[:, 2:] - 2 * new_real[:, 1:-1] + new_real[:, :-2]
-            r_on = d2_on.float().pow(2).mean(dim=2).clamp_min(1e-12).sqrt()               # [B, T-2, H, W] per-site
-            with torch.no_grad():
-                d2_cf = twin[:, 2:] - 2 * twin[:, 1:-1] + twin[:, :-2]
-                r_cf = d2_cf.float().pow(2).mean(dim=2).clamp_min(1e-12).sqrt()
-                r_ref = r_cf.mean().clamp_min(eps)
-            flick = F.relu(r_on - r_cf - self.flick_deadband * r_ref).mean() / r_ref
-        else:
-            flick = _z()
-        # (4) paired identity terms on decoded frames, position-randomized in the tail
-        k = max(1, int(self.id_decode_frames))
-        span = min(6, new_real.shape[1])
-        off = int(torch.randint(0, max(1, span - k + 1), (1,)).item())
-        s0, s1 = new_real.shape[1] - off - k, new_real.shape[1] - off
-        px_on = self.base_model.vae.decode_to_pixel(new_real[:, s0:s1], use_cache=False)
-        cos_on = (self._dino_embed_pixels(px_on) * self._id_anchor).sum(-1).mean()
-        with torch.no_grad():
-            px_cf = self.base_model.vae.decode_to_pixel(twin[:, s0:s1], use_cache=False)
-            cos_cf = (self._dino_embed_pixels(px_cf) * self._id_anchor).sum(-1).mean()
-        A = cos_on - cos_cf
-        # do-no-harm hinge: fires only when the injection makes identity worse than mem-OFF (beyond
-        # the noise deadband); no gate needed, under freeze it is zero, and the mm terms own freeze.
-        dnh = F.relu(-A - self.dnh_deadband)
-        # bonus-mode clamped reward (off by default): motion-validity gate detached, never a lever
-        with torch.no_grad():
-            ref = m_tgt if m_tgt is not None else m_cf
-            gate = torch.exp(-((torch.log(m_on.detach() + eps) - torch.log(ref + eps)) ** 2)
-                             / (2.0 * self.adv_gate_sigma ** 2))
-        adv = gate * torch.clamp(A, min=-self.adv_clamp_neg, max=self.adv_clamp_pos)
-        loss = (self.dnh_weight * dnh
-                + self.act_weight * act
-                + self.mm_rel_weight * mm_rel
-                + self.mm_ext_weight * mm_ext
-                + self.flick_weight * flick
-                + self.adv_loss_weight * (-adv))
-        log.update({
-            "twin_adv_loss": (self.adv_loss_weight * (-adv)).detach(),
-            "twin_adv_raw": A.detach(), "twin_gate": gate.detach(),
-            "twin_dnh": dnh.detach(), "twin_act": act.detach(), "twin_dose": dose.detach(),
-            "twin_mm_rel": mm_rel.detach(), "twin_mm_ext": mm_ext.detach(),
-            "twin_flick": flick.detach(),
-            "twin_cos_on": cos_on.detach(), "twin_cos_cf": cos_cf.detach(),
-            "twin_motion_on": m_on.detach(), "twin_motion_cf": m_cf.detach(),
-            "twin_motion_tgt": (m_tgt.detach() if m_tgt is not None else m_cf.detach()),
-            "twin_active": torch.ones((), device=device),
-        })
-        return loss, log
-
     def compute_generator_loss(self,
         chunk: torch.Tensor,
         chunk_info: Dict[str, Any]
@@ -1149,24 +747,24 @@ class StreamingTrainingModel:
         ###### identity + temporal-variance objective ######
         if self.id_loss_weight > 0.0 or self.tv_loss_weight > 0.0:
             try:
-                id_loss, tv_loss, e1_log = self._compute_identity_tv_loss(
-                    chunk, chunk_start_frame, gradient_mask)
+                id_loss, tv_loss, identity_log = self._compute_identity_tv_loss(
+                    chunk, chunk_start_frame)
                 dmd_loss = dmd_loss + self.id_loss_weight * id_loss + self.tv_loss_weight * tv_loss
-                dmd_log_dict.update(e1_log)
+                dmd_log_dict.update(identity_log)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 # keep the log keys present so merge_dict_list (keyed off chunk 0) does not raise
                 dmd_log_dict.update({
-                    "e1_latent_motion": torch.zeros((), device=self.device),
-                    "e1_tv_loss": torch.zeros((), device=self.device),
-                    "e1_id_cos": torch.ones((), device=self.device),
-                    "e1_id_loss": torch.zeros((), device=self.device),
+                    "identity_latent_motion": torch.zeros((), device=self.device),
+                    "identity_tv_loss": torch.zeros((), device=self.device),
+                    "identity_id_cos": torch.ones((), device=self.device),
+                    "identity_id_loss": torch.zeros((), device=self.device),
                 })
                 if (not dist.is_initialized() or dist.get_rank() == 0):
                     print("[StreamingTrain-Model] identity/tv loss OOM, skipped this step")
 
         ###### counterfactual objective (do-no-harm + activity floor + motion match) ######
-        if self._twin_on:
+        if self.twin.on:
             try:
                 adv_loss, twin_log = self._compute_advantage_loss(chunk, chunk_info)
                 dmd_loss = dmd_loss + adv_loss

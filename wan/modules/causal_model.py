@@ -24,6 +24,7 @@ import torch.distributed as dist
 
 from utils.debug_option import DEBUG
 import copy
+from wan.modules.memory_inject import EvictionFeedMixin, MemoryInjectMixin, memory_cell_args
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -80,8 +81,8 @@ class CausalWanSelfAttention(nn.Module):
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         # cache dropout: all sink reads in forward() go through this runtime-overridable
-        # attribute (CausalWanModel.set_runtime_sink_size). Defaults to the config sink_size
-        # => byte-identical unless a dropout rollout overrides it.
+        # attribute (CausalWanModel.set_runtime_sink_size). It is the config sink_size unless
+        # a cache-dropout rollout overrides it.
         self._sink_runtime = int(sink_size)
         self.qk_norm = qk_norm
         self.eps = eps
@@ -101,58 +102,6 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-
-    # Recall an anchor frame by ADDING key/value tokens rather than evicting a true frame for
-    # it: they sit in the free RoPE band between the sink and the window. Installed by the
-    # pipeline as `self._add_kv`; absent, nothing below runs.
-    #
-    # The gain g is an exact softmax reweighting, not an interpolation. With Z the softmax
-    # denominators, the merged output is
-    #     out = (Z_ctx * out_ctx + g * Z_anc * out_anc) / (Z_ctx + g * Z_anc)
-    # which is attention over [context ; anchor] with the anchor logits shifted by log g, so
-    # g = 1 is plain concatenation. alpha = g*Z_anc/(Z_ctx + g*Z_anc) is also the attention mass
-    # the anchor actually takes, so the check comes out of the same computation.
-    @staticmethod
-    def _sdpa_lse(q, k, v):
-        """(B,H,L,D) half tensors -> (out, logsumexp) from the flash kernel (LSE natural log,
-        fp32, shape (B,H,L)). PyTorch >= 2.2 returns the true LSE of the scaled scores."""
-        out, lse = torch.ops.aten._scaled_dot_product_flash_attention(
-            q.contiguous(), k.contiguous(), v.contiguous(), 0.0, False, False)[:2]
-        return out, lse
-
-    def _additive_attention(self, roped_query, k_ctx, v_ctx, grid_sizes, freqs, frame_seqlen,
-                            auto_pos, v_ref, n_sink=0):
-        k_raw, v_add = self._add_kv
-        pos = int(getattr(self, "_add_pos", -1))
-        pos = int(auto_pos) if pos < 0 else pos
-        gain = float(getattr(self, "_add_gain", 1.0))
-        g_add = copy.deepcopy(grid_sizes)
-        g_add[:, 0] = k_raw.shape[1] // frame_seqlen
-        k_add = causal_rope_apply(k_raw, g_add, freqs, start_frame=pos).type_as(v_ref)
-        v_add = v_add.type_as(v_ref)
-        q = roped_query.transpose(1, 2)
-        out_ctx, lse_ctx = self._sdpa_lse(q, k_ctx.transpose(1, 2), v_ctx.transpose(1, 2))
-        out_add, lse_add = self._sdpa_lse(q, k_add.transpose(1, 2), v_add.transpose(1, 2))
-        alpha = torch.sigmoid(math.log(max(gain, 1e-12)) + (lse_add - lse_ctx).float())  # (B,H,L)
-        out = ((1.0 - alpha).unsqueeze(-1) * out_ctx.float()
-               + alpha.unsqueeze(-1) * out_add.float())
-        self._add_mass = float(alpha.mean())
-        self._add_last_pos = pos
-        # attention mass per source [sink | window | anchor], exact rather than approximate:
-        # the log-sum-exp of a concatenation is the logaddexp of the parts, so the three
-        # fractions sum to 1. Costs two more attention calls, only when the flag is set.
-        if int(os.environ.get("MEM_ADD_MASS_SRC", "0") or 0) and 0 < n_sink < k_ctx.shape[1]:
-            ks, vs = k_ctx[:, :n_sink], v_ctx[:, :n_sink]
-            kw, vw = k_ctx[:, n_sink:], v_ctx[:, n_sink:]
-            _, lse_s = self._sdpa_lse(q, ks.transpose(1, 2), vs.transpose(1, 2))
-            _, lse_w = self._sdpa_lse(q, kw.transpose(1, 2), vw.transpose(1, 2))
-            lg = math.log(max(gain, 1e-12))
-            tot = torch.logaddexp(lse_ctx.float(), lg + lse_add.float())
-            self._add_mass_src = (float(torch.exp(lse_s.float() - tot).mean()),
-                                  float(torch.exp(lse_w.float() - tot).mean()),
-                                  float(torch.exp(lg + lse_add.float() - tot).mean()))
-            self._add_ntok_src = (int(n_sink), int(k_ctx.shape[1] - n_sink), int(k_add.shape[1]))
-        return out.to(roped_query.dtype).transpose(1, 2)
 
     def forward(
         self,
@@ -484,21 +433,11 @@ class CausalWanSelfAttention(nn.Module):
                     k_cat = k_sink
                     v_cat = v_sink
 
-                if getattr(self, "_add_kv", None) is None:
-                    x = attention(
-                        roped_query,
-                        k_cat,
-                        v_cat
-                    )
-                else:
-                    # MEM_ADDITIVE_KV: the anchor tokens live in the free RoPE band just before
-                    # the local window (sink = [0, sink_runtime), window = [rope_start_f_k_local,
-                    # 21) under rope_enhance), so the default "auto" position is one frame before
-                    # the window and nothing in the cache moves.
-                    _auto = (max(0, rope_start_f_k_local - 1) if (rope_enhance and local_budget > 0)
-                             else max(0, current_start_frame - max(self.local_attn_size, 1) - 1))
-                    x = self._additive_attention(roped_query, k_cat, v_cat, grid_sizes, freqs,
-                                                 frame_seqlen, _auto, v, n_sink=k_sink.shape[1])
+                x = attention(
+                    roped_query,
+                    k_cat,
+                    v_cat
+                )
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
                 k_win = temp_k[:, window_start:local_end_index]
@@ -519,17 +458,7 @@ class CausalWanSelfAttention(nn.Module):
                             start_frame=rope_start_f_k_win).type_as(v)
                     roped_query = causal_rope_apply(
                         q, grid_sizes, freqs, start_frame=rope_start_f).type_as(v)
-                if getattr(self, "_add_kv", None) is None:
-                    x = attention(
-                        roped_query,
-                        k_win,
-                        v_win
-                    )
-                else:
-                    _auto = (max(0, rope_start_f_k_win - 1) if rope_enhance
-                             else max(0, current_start_frame - max(self.local_attn_size, 1) - 1))
-                    x = self._additive_attention(roped_query, k_win, v_win, grid_sizes, freqs,
-                                                 frame_seqlen, _auto, v)
+                x = attention(roped_query, k_win, v_win)
 
         # output
         x = x.flatten(2)
@@ -542,7 +471,7 @@ class CausalWanSelfAttention(nn.Module):
             return x
 
 
-class CausalWanAttentionBlock(nn.Module):
+class CausalWanAttentionBlock(MemoryInjectMixin, nn.Module):
 
     def __init__(self,
                  cross_attn_type,
@@ -555,29 +484,16 @@ class CausalWanAttentionBlock(nn.Module):
                  cross_attn_norm=False,
                  eps=1e-6,
                  use_memory=False,
-                 gate_init=0.1,
-                 ckpt_write=False,
-                 gate_extra=None,
-                 use_decay=False,
-                 decay_init=0.95,
-                 bounded_gate=False,
-                 single_norm=False,
-                 bounded_mod=False,
-                 rel_norm=False,
-                 dc_remove=False,
-                 muon_update_steps=5,
+                 memory_kwargs=None,
                  mem_stream_scale=0.0,
                  ema_alpha=0.0,
-                 eviction_feed=False,
-                 mem_state_type="swiglu",
-                 mem_linear_beta=0.5):
+                 eviction_feed=False):
         super().__init__()
         self.dim = dim
         self.mem_stream_scale = mem_stream_scale
-        # anti-flicker: causal temporal EMA on the injection (0.0 = off, unchanged baseline).
+        # causal exponential average of the injection over chunks, against flicker; 0.0 = off
         self.ema_alpha = float(ema_alpha or 0.0)
-        # eviction feed: memory writes the evicted chunk instead of the current one
-        # (False = byte-identical baseline).
+        # the memory writes the chunk that left the attention window, not the current one
         self.eviction_feed = bool(eviction_feed)
         self.ffn_dim = ffn_dim
         self.num_heads = num_heads
@@ -605,113 +521,12 @@ class CausalWanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-        # parallel memory branch (None = unchanged baseline block)
+        # the memory branch, parallel to the block; None leaves the block as upstream's
         # mem_state_type picks the state inside the cell: "swiglu" is the trained fast-weight
         # MLP, "linear_delta" a single matrix W written by a training-free delta rule. Only the
         # read/write core differs; the gate, the modulation and the injection are shared.
         self.memory = VideoMemoryLayer(dim=dim, num_heads=1, inter_multi=4,
-                                       g_init=gate_init, checkpoint_write=ckpt_write,
-                                       gate_extra=gate_extra, use_decay=use_decay,
-                                       decay_init=decay_init, bounded_gate=bounded_gate,
-                                       single_norm=single_norm, bounded_mod=bounded_mod, rel_norm=rel_norm, dc_remove=dc_remove,
-                                       muon_update_steps=muon_update_steps,
-                                       state_type=mem_state_type,
-                                       linear_beta=mem_linear_beta) if use_memory else None
-
-    def _memory_inject(self, x, h, *, ttt_cache, ttt_state, ttt_update, mem_x_write,
-                       mem_ema_key, mem_ema_prev, context, denoising_step,
-                       switch_global_frame, current_start, num_frames, frame_seqlen):
-        """Read the memory, guard the result, add it to the residual stream, store the new
-        state. Returns x unchanged when this block has no memory branch."""
-        if self.memory is None or ttt_cache is None:
-            return x
-        # ttt_state = state snapshot taken outside the gradient-checkpoint region:
-        # checkpoint saves these tensors, so the backward recompute reads the same state
-        state_in = ttt_state if ttt_state is not None else ttt_cache.state
-        # build the optional per-token gate_extra signals: denoising_step from the timestep t,
-        # frames_since_switch from the global frame index vs the switch.
-        mem_ds, mem_fss = None, None
-        gx = getattr(self.memory, "gate_extra", None)
-        if gx:
-            B = x.shape[0]
-            if "denoising_step" in gx and denoising_step is not None:
-                ds = denoising_step.float()
-                if ds.dim() == 1:                       # [B] -> [B, F]
-                    ds = ds[:, None].expand(B, num_frames)
-                elif ds.shape[1] != num_frames:
-                    ds = ds[:, :1].expand(B, num_frames)
-                mem_ds = ds.repeat_interleave(frame_seqlen, dim=1)          # (B, L)
-            if "frames_since_switch" in gx:
-                csf = current_start // frame_seqlen                          # chunk start frame
-                gf = csf + torch.arange(num_frames, device=x.device)         # global frame idx
-                if switch_global_frame is None:
-                    fss = gf.float()                                         # no switch -> since start
-                else:
-                    fss = torch.where(gf >= switch_global_frame,
-                                      gf - switch_global_frame, gf).float()  # resets to 0 at switch
-                mem_fss = fss[None, :].expand(B, num_frames).repeat_interleave(frame_seqlen, dim=1)
-        if self.eviction_feed and ttt_update:
-            # the memory writes the chunk that just left the attention window, not the current
-            # one whose k/v the cache still holds. Nothing evicted yet means no write at all.
-            # The append here is re-done by backward recompute, which the trainer's snapshot
-            # and restore undoes.
-            _cur_chunk = int(current_start) // (frame_seqlen * num_frames)
-            ttt_cache.fifo.append((_cur_chunk, h.detach()))
-            _mem_do_update, _mem_xw = mem_x_write is not None, mem_x_write
-        else:
-            _mem_do_update, _mem_xw = ttt_update, None
-        mem_out, new_state = self.memory.step(
-            h, state=state_in, do_update=_mem_do_update, x_write=_mem_xw,  # h = norm1(x_in)
-            prompt_emb=context,
-            denoising_step=mem_ds, frames_since_switch=mem_fss,
-            num_frames=num_frames)
-        # on the write pass the injection only feeds the detached clean cache, so detach it:
-        # otherwise every frozen block downstream builds a ~15 GB backward graph for nothing.
-        # The write gradient reaches the memory through new_state, not through x.
-        _mz_all = int(os.environ.get("MEM_ZERO_ALL", "0"))
-        if _mz_all != 0:                    # any nonzero value zeroes the injection on every frame
-            if not globals().get("_MZ_ANNOUNCED"):   # print once/process so mem-OFF arms are auditable
-                print(f"[MEM_ZERO_ALL={_mz_all}] memory injection zeroed, mem-OFF ablation arm", flush=True)
-                globals()["_MZ_ANNOUNCED"] = True
-            mem_out = mem_out * 0.0
-        # bound the injection to a fraction of the local residual stream, so it cannot pile up
-        # into an artifact over a long rollout. Measured on x, not h, since h is normalised;
-        # and detached, so the memory cannot inflate the stream to earn a bigger injection.
-        _ss = os.environ.get("MEM_STREAM_SCALE", "")
-        _ss = float(_ss) if _ss != "" else float(getattr(self, "mem_stream_scale", 0.0) or 0.0)
-        if _ss > 0.0:
-            _srms = x.detach().float().pow(2).mean(dim=-1, keepdim=True).add(1e-8).sqrt()
-            self.memory.dbg_inj_stream = (
-                (mem_out.detach().float().pow(2).mean(-1, keepdim=True).sqrt() * _ss).mean()
-                / _srms.mean().clamp_min(1e-8))
-            mem_out = mem_out * (_ss * _srms).to(mem_out.dtype)
-        # smooth the injection over time to damp flicker. The previous buffer is read outside
-        # the checkpointed region and passed in, so backward recompute reuses the same value.
-        # Skipped on write passes, and under the mem-OFF twin, where zero must stay zero.
-        _alpha = float(getattr(self, "ema_alpha", 0.0) or 0.0)
-        if (_alpha > 0.0 and not ttt_update and _mz_all == 0
-                and mem_ema_key is not None and ttt_cache is not None):
-            if mem_ema_prev is not None and mem_ema_prev.shape == mem_out.shape:
-                mem_out = _alpha * mem_out + (1.0 - _alpha) * mem_ema_prev.to(device=mem_out.device, dtype=mem_out.dtype)
-            # first observation at this key: mem_out passes through unchanged (EMA seed)
-            # CPU-offload the persistent EMA buffer (~165MB/GPU) so the seed-step fits 4 GPUs;
-            # the bf16 round trip between CPU and GPU is exact.
-            ttt_cache.ema[mem_ema_key] = mem_out.detach().to("cpu", non_blocking=True)
-        # MEM_REJECT_STREAM=1, a control arm (results/run1_write_current_chunk/eval_R1): remove,
-        # per token, the component of the injection parallel to the residual stream x. That
-        # component is "more of what is already there", the part suspected of damping motion;
-        # only the orthogonal remainder is injected. No renormalisation afterwards, so a read
-        # that is entirely self-similar injects nearly nothing.
-        if int(os.environ.get("MEM_REJECT_STREAM", "0")) != 0:
-            _xh = x.detach().float()
-            _xh = _xh / _xh.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            _m = mem_out.float()
-            mem_out = (_m - (_m * _xh).sum(-1, keepdim=True) * _xh).to(mem_out.dtype)
-        x = x + (mem_out.detach() if ttt_update else mem_out)
-        if ttt_update:
-            # attribute write on a TTTBlockCache object (not a dict key!):this mutation survives the call stack.
-            ttt_cache.state = new_state
-        return x
+                                       **memory_cell_args(memory_kwargs)) if use_memory else None
 
     def forward(
         self,
@@ -831,7 +646,7 @@ class CausalHead(nn.Module):
         return x
 
 
-class CausalWanModel(ModelMixin, ConfigMixin):
+class CausalWanModel(EvictionFeedMixin, ModelMixin, ConfigMixin):
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
     """
@@ -861,22 +676,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  cross_attn_norm=True,
                  eps=1e-6,
                  memory_layers=(),
-                 gate_init=0.1,
-                 ckpt_write=False,
-                 gate_extra=None,
-                 use_decay=False,
-                 decay_init=0.95,
-                 bounded_gate=False,
-                 single_norm=False,
-                 bounded_mod=False,
-                 rel_norm=False,
-                 dc_remove=False,
-                 muon_update_steps=5,
+                 memory_kwargs=None,
                  mem_stream_scale=0.0,
                  ema_alpha=0.0,
-                 eviction_feed=False,
-                 mem_state_type="swiglu",
-                 mem_linear_beta=0.5):
+                 eviction_feed=False):
         r"""
         Initialize the diffusion model backbone.
 
@@ -951,18 +754,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         # which blocks get a memory branch
         MEMORY_LAYERS = {int(x) for x in memory_layers}
+        memory_cell_args(memory_kwargs)   # reject a misspelt option even when no block has a memory
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                     local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
                                     use_memory=(i in MEMORY_LAYERS),
-                                    gate_init=gate_init, ckpt_write=ckpt_write,
-                                    gate_extra=gate_extra, use_decay=use_decay,
-                                    decay_init=decay_init, bounded_gate=bounded_gate,
-                                    single_norm=single_norm, bounded_mod=bounded_mod, rel_norm=rel_norm, dc_remove=dc_remove,
-                                    muon_update_steps=muon_update_steps, mem_stream_scale=mem_stream_scale,
-                                    ema_alpha=ema_alpha, eviction_feed=eviction_feed,
-                                    mem_state_type=mem_state_type,
-                                    mem_linear_beta=mem_linear_beta)
+                                    memory_kwargs=memory_kwargs,
+                                    mem_stream_scale=mem_stream_scale,
+                                    ema_alpha=ema_alpha, eviction_feed=eviction_feed)
             for i in range(num_layers)
         ])
         # anti-flicker: gate the (host-syncing) EMA-key computation in _forward_inference on
@@ -1010,7 +809,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     def set_runtime_sink_size(self, sink_size=None):
         """Cache dropout: override the attention sink at runtime on every self-attn
-        module. None restores the config sink_size (byte-identical default). Walks
+        module. None restores the config sink_size. Walks
         self.modules() so FSDP-wrapped children are reached too."""
         for m in self.modules():
             if hasattr(m, "_sink_runtime") and hasattr(m, "sink_size"):
@@ -1418,47 +1217,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             if _mem_ema_key is None or ttt_cache is None or ttt_cache[bi] is None:
                 return None
             return ttt_cache[bi].ema.get(_mem_ema_key)
-        # ---- eviction feed (off by default) --------------------------------------------------
-        # Pop the just-evicted chunk here, outside the checkpointed block, and hand it to the
-        # block as an argument so backward recompute reuses the same tensor. A simple FIFO delay,
-        # not token-exact eviction: a chunk counts as evicted window_chunks after it was written,
-        # and the sink chunks, pinned in the cache forever, are never fed to the memory.
-        _mem_x_write = {}
-        if self.eviction_feed and ttt_update and ttt_cache is not None:
-            _F = int(grid_sizes[0][0].item())
-            _fsl = int(math.prod(grid_sizes[0][1:]).item())
-            _law = self.local_attn_size
-            if not isinstance(_law, int):
-                _vals = ([int(v) for v in _law if int(v) != -1]
-                         if hasattr(_law, "__iter__") else [int(_law)])
-                _law = max(_vals) if _vals else -1
-            assert _law > 0, "eviction_feed requires local attention (local_attn_size > 0)"
-            if _F > 0:
-                _wc = max(1, math.ceil(_law / _F))                              # window_chunks
-                _sk = int(getattr(self.blocks[0].self_attn, "_sink_runtime", 0))
-                _sc = math.ceil(_sk / _F)                                       # sink_chunks
-                _cur = int(current_start) // (_fsl * _F)                        # global chunk idx
-                _dbg = int(os.environ.get("MEM_EVICT_DEBUG", "0"))
-                for _bi, _blk in enumerate(self.blocks):
-                    if getattr(_blk, "memory", None) is None or ttt_cache[_bi] is None:
-                        continue
-                    _fifo = ttt_cache[_bi].fifo
-                    _popped = None
-                    if len(_fifo) >= _wc:      # pre-append pop == append-then-pop(len > wc)
-                        _popped, _hev = _fifo.pop(0)
-                        if _popped >= _sc:     # past the sink -> genuinely evicted from KV
-                            _mem_x_write[_bi] = _hev
-                        # else: sink chunk, pinned in the KV cache forever -> never written
-                    if _dbg:
-                        if not hasattr(self, "_evict_dbg"):
-                            self._evict_dbg = []
-                        self._evict_dbg.append(
-                            {"block": _bi, "chunk": _cur, "popped": _popped,
-                             "wrote": _bi in _mem_x_write,
-                             "window_chunks": _wc, "sink_chunks": _sc})
-                        print(f"[evict-feed] chunk={_cur} block={_bi} popped={_popped} "
-                              f"wrote={_bi in _mem_x_write} window_chunks={_wc} sink_chunks={_sc}",
-                              flush=True)
+        _mem_x_write = self._pop_evicted_chunks(ttt_cache, ttt_update, grid_sizes, current_start)
         for block_index, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:  # 计算梯度的step
                 kwargs.update(

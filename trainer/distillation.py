@@ -41,9 +41,10 @@ from utils.debug_option import DEBUG, LOG_GPU_MEMORY, MY_VISUAL_DEBUG
 import time
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from trainer.memory_training import MemoryTrainingMixin, load_without_memory_keys
 
 
-class Trainer:
+class Trainer(MemoryTrainingMixin):
     
     def __init__(self, config):
         self.config = config
@@ -131,20 +132,13 @@ class Trainer:
                 if "generator" in base_checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {base_checkpoint_path}")
-                    # strict=False: the base checkpoint predates the memory branch; only acceptable missing keys are memory params
-                    result = self.model.generator.load_state_dict(base_checkpoint["generator"], strict=False)
-                    non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
-                    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
-                    assert not result.unexpected_keys, f"Unexpected keys: {list(result.unexpected_keys)[:5]}"
+                    result = load_without_memory_keys(self.model.generator, base_checkpoint["generator"])
                     if self.is_main_process:
                         print(f"Generator weights loaded successfully ({len(result.missing_keys)} memory keys kept at init)")
                 elif "model" in base_checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {base_checkpoint_path}")
-                    result = self.model.generator.load_state_dict(base_checkpoint["model"], strict=False)
-                    non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
-                    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
-                    assert not result.unexpected_keys, f"Unexpected keys: {list(result.unexpected_keys)[:5]}"
+                    result = load_without_memory_keys(self.model.generator, base_checkpoint["model"])
                     if self.is_main_process:
                         print(f"Generator weights loaded successfully ({len(result.missing_keys)} memory keys kept at init)")
                 else:
@@ -287,49 +281,8 @@ class Trainer:
                 if self.is_main_process:
                     print("No LoRA checkpoint to load, starting from scratch")
 
-        # memory params are new, full-rank and trainable (excluded from LoRA targets).
-        # peft freezes every non-LoRA param, so we un-freeze them here.
-        for n, p in self.model.generator.named_parameters():
-            if "memory" in n:
-                p.requires_grad_(True)
-
-        # Selective LoRA unfreeze: only blocks >= lora_unfreeze_from_block (which consume the memory
-        # injection) stay trainable; earlier blocks' LoRA is frozen, dropping their grad + AdamW state
-        # (frees their VRAM). None = all LoRA trainable. Critic LoRA untouched.
-        _unfreeze_from = getattr(config, "lora_unfreeze_from_block", None)
-        if _unfreeze_from is not None:
-            import re as _re
-            _frozen_blocks, _kept_blocks, _kept = set(), set(), 0
-            for n, p in self.model.generator.named_parameters():
-                if "memory" in n or not p.requires_grad:
-                    continue
-                _m = _re.search(r"blocks\.(\d+)\.", n)
-                if _m is None or int(_m.group(1)) < int(_unfreeze_from):
-                    p.requires_grad_(False)
-                    if _m is not None:
-                        _frozen_blocks.add(int(_m.group(1)))
-                else:
-                    _kept += 1
-                    _kept_blocks.add(int(_m.group(1)))
-            if self.is_main_process:
-                print(f"[selective LoRA] unfreeze from block {_unfreeze_from}: "
-                      f"froze LoRA of blocks {sorted(_frozen_blocks)}, "
-                      f"kept {_kept} trainable LoRA tensors across blocks {sorted(_kept_blocks)}")
-
-        # fast weights (w0/w1/w2) are excluded from FSDP
-        mem_ignored = []
-        if self.world_size > 1:
-            mem_ignored = [m for m in self.model.generator.modules()
-                           if type(m).__name__ == "VideoMemoryLayer"]
-            for m in mem_ignored:
-                m.to(device=self.device, dtype=self.dtype)
-            # memory is excluded from FSDP: sync the per-rank divergent init from rank 0 so all ranks
-            # share one memory (its grads are averaged before each optimizer step)
-            for m in mem_ignored:
-                for _p in m.parameters():
-                    dist.broadcast(_p.data, src=0)
-                for _b in m.buffers():
-                    dist.broadcast(_b.data, src=0)
+        self._unfreeze_memory_and_select_lora(config)
+        mem_ignored = self._memory_modules_outside_fsdp()
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -410,32 +363,13 @@ class Trainer:
         
         
         # Step 4: Initialize the optimizer
-        # memory params (full-rank, excluded from LoRA, un-frozen before the FSDP wrap), get their own LR group.  
-        gen = self.model.generator
-        mem_params = [p for n, p in gen.named_parameters() if "memory" in n and p.requires_grad]
-        other_params = [p for n, p in gen.named_parameters() if "memory" not in n and p.requires_grad]
-        # safety net
-        assert mem_params or not any("memory" in n for n, _ in gen.named_parameters()), \
-            "memory params exist but none landed in the optimizer group (name-match broke post-FSDP)"
-        generator_param_groups = [{"params": other_params, "lr": config.lr}]  # LoRA adapters
-        if mem_params:  # no memory layers -> single group, strictly identical to baseline
-            generator_param_groups.append({"params": mem_params, "lr": getattr(config, "lr_mem", 1e-4)})
+        generator_param_groups = self._generator_param_groups(config)
         self.generator_optimizer = torch.optim.AdamW(
             generator_param_groups,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
-        # handles for (C) explicit mem-grad clip and (B) cosine lr schedule.
-        # mem params are FSDP-ignored, so generator.clip_grad_norm_() (an FSDP method) skips
-        # them and this is the only clip they get. Default is effectively off (1e9).
-        self.mem_params = mem_params
-        self.max_grad_norm_mem = float(getattr(config, "max_grad_norm_mem", 1e9))
-        # per-group base lrs [LoRA, (mem)]; the cosine multiplier is applied to these each step.
-        self._base_lrs = [g["lr"] for g in self.generator_optimizer.param_groups]
-        # lr_decay_start defaults beyond max_iters => schedule never fires => lr constant (byte-identical).
-        self._lr_decay_start = int(getattr(config, "lr_decay_start", 10**9))
-        self._lr_floor_frac = float(getattr(config, "lr_floor_frac", 1.0))       # LoRA group floor
-        self._lr_mem_floor_frac = float(getattr(config, "lr_mem_floor_frac", 1.0))  # mem group floor
+        self._init_memory_clip_and_schedule(config)
 
         self.critic_optimizer = torch.optim.AdamW(
             [param for param in self.model.fake_score.parameters()
@@ -546,18 +480,11 @@ class Trainer:
                 if "generator" in checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {checkpoint_path}")
-                    # tolerate checkpoints that predate the memory branch
-                    result = self.model.generator.load_state_dict(checkpoint["generator"], strict=False)
-                    non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
-                    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
-                    assert not result.unexpected_keys, f"Unexpected keys: {list(result.unexpected_keys)[:5]}"
+                    result = load_without_memory_keys(self.model.generator, checkpoint["generator"])
                 elif "model" in checkpoint:
                     if self.is_main_process:
                         print(f"Loading pretrained generator from {checkpoint_path}")
-                    result = self.model.generator.load_state_dict(checkpoint["model"], strict=False)
-                    non_memory_missing = [k for k in result.missing_keys if "memory" not in k]
-                    assert not non_memory_missing, f"Missing non-memory keys: {non_memory_missing[:5]}"
-                    assert not result.unexpected_keys, f"Unexpected keys: {list(result.unexpected_keys)[:5]}"
+                    result = load_without_memory_keys(self.model.generator, checkpoint["model"])
                 else:
                     if self.is_main_process:
                         print("Warning: Generator checkpoint not found.")
@@ -1175,105 +1102,9 @@ class Trainer:
             if dist.get_rank() == 0:
                 print(f"[SeqTrain-Trainer] Training generator: generating next chunk")
 
-            # Cross-chunk truncated BPTT over K = bptt_window chunks: roll K chunks, detach the state
-            # only at the window start, sum the per-chunk losses, one backward over the window (trains
-            # the write across chunk boundaries; graph alive for one backward, freed after = no leak).
-            K_bptt = int(getattr(self.config, "bptt_window", 1))
-            # per-step random horizon K ~ U{bptt_window_min .. bptt_window} so the single grad
-            # chunk (W=1) supervises many horizons up to the freeze horizon, at proven W=1 VRAM.
-            # Rank-synced: FSDP collectives require every rank to run the same number of forwards.
-            K_min = int(getattr(self.config, "bptt_window_min", K_bptt))
-            if K_bptt > K_min:
-                if not dist.is_initialized():
-                    K_bptt = int(torch.randint(K_min, K_bptt + 1, (1,)).item())
-                else:
-                    _K = torch.tensor(
-                        int(torch.randint(K_min, K_bptt + 1, (1,)).item()) if dist.get_rank() == 0 else 0,
-                        device=self.device, dtype=torch.int32)
-                    dist.broadcast(_K, src=0)
-                    K_bptt = int(_K.item())
-            if K_bptt > 1:
-                # roll K_bptt chunks: the first (K_bptt - W) under no_grad (deep state past KV-eviction,
-                # cheap), the last W with grad = the supervised tail. W=1 avoids the cross-chunk
-                # checkpoint-vs-eviction error (no backward recomputes a previous chunk). Absent -> W=K.
-                W = int(getattr(self.config, "grad_tail_W", K_bptt))
-                W = max(1, min(W, K_bptt))
-                _losses = []
-                _logs = []
-                _used = 0
-                # force a fresh sequence so the K-chunk window always starts at frame 0 (chunk 0 sets the
-                # identity anchor, the grad tail lands in the same sequence).
-                # seed step: every train_seed_every steps also put chunk 0 in-graph so the fast-weight
-                # seed w0/w1/w2 (only reachable via init_state at chunk 0) receives gradient.
-                _seed_every = int(getattr(self.config, "train_seed_every", 0))
-                _gen_idx = self.step // max(1, int(getattr(self.config, "dfake_gen_update_ratio", 1)))
-                seed_step = _seed_every > 0 and (_gen_idx % _seed_every == 0)   # every N-th generator step
-                _twin_on = self.streaming_model._twin_on   # one definition, the model's
-                if getattr(self.config, "id_loss_weight", 0.0) > 0.0 or _twin_on or seed_step:
-                    self.streaming_active = False
-                    self.start_new_sequence()
-                # seed steps also grad chunk 0 -> more grad chunks; normalize each per-chunk backward so
-                # the total gradient equals the normal path's mean(losses)/gas
-                _n_grad = W + (1 if (seed_step and K_bptt - W > 0) else 0)
-                for _k in range(K_bptt):
-                    if _k > 0 and not self.streaming_model.can_generate_more():
-                        break
-                    _used += 1
-                    rg = (_k >= K_bptt - W) or (seed_step and _k == 0)   # +chunk 0 on seed steps
-                    # build the mem-OFF counterfactual twin only for the last (grad-tail) chunk
-                    _mk_twin = (rg and _k == K_bptt - 1 and _twin_on)
-                    _gc, _ci = self.streaming_model.generate_next_chunk(
-                        requires_grad=rg, detach_state=(_k == K_bptt - W),
-                        keep_last_write_grad=(rg and _k < K_bptt - 1 and _k + 1 > K_bptt - W),
-                        make_twin=_mk_twin)
-                    if rg:
-                        _l, _ld = self.streaming_model.compute_generator_loss(chunk=_gc, chunk_info=_ci)
-                        _logs.append(_ld)
-                        if seed_step:   # per-chunk backward; sever the KV-cache grad link between chunks
-                            _snap = self._snapshot_ttt_state()
-                            torch.cuda.empty_cache()   # reclaim the ~800MB reserved-but-unallocated cache
-                                                       # at the post-forward low-water mark, before chunk-0's
-                                                       # backward peak (seed step only ~1/20). Fits the 4-GPU budget.
-                            try:
-                                (_l / (self.gradient_accumulation_steps * _n_grad)).backward()
-                            finally:
-                                self._restore_ttt_state(_snap)
-                            self.streaming_model._clear_cache_gradients()
-                            del _snap
-                            torch.cuda.empty_cache()
-                            _losses.append(_l.detach())
-                        else:
-                            _losses.append(_l)
-                if _losses:
-                    generator_loss = sum(_losses) / len(_losses)
-                    if not seed_step:                             # normal step: one backward over the window
-                        _ttt_snap = self._snapshot_ttt_state()
-                        try:
-                            (generator_loss / self.gradient_accumulation_steps).backward()
-                        finally:
-                            self._restore_ttt_state(_ttt_snap)
-                    # first few steps: confirm the read (qkv/proj) and write (lrs/decay) memory params get gradients
-                    if self.step in (0, 5, 10, 15, 20, 30) and (not dist.is_initialized() or dist.get_rank() == 0):
-                        try:
-                            gn = lambda p: (float(p.grad.detach().float().norm()) if (p is not None and getattr(p, "grad", None) is not None) else -1.0)
-                            mems = [mm for mm in self.model.generator.modules() if type(mm).__name__ == "VideoMemoryLayer"]
-                            for i, m in enumerate(mems):
-                                print(f"mem-grad step={self.step} mem{i} "
-                                      f"WRITE lrs={gn(m.lrs.weight):.3e} decay={gn(getattr(m,'decay_logit',None)):.3e} "
-                                      f"READ qkv={gn(m.qkv.weight):.3e} proj={gn(m.proj.weight):.3e} "
-                                      f"SEED w0={gn(m.w0):.3e}")
-                        except Exception as _e:
-                            print(f"mem-grad check failed: {_e}")
-                else:
-                    generator_loss = torch.tensor(0.0, device=self.device)
-                generator_log_dict = merge_dict_list(_logs) if _logs else {}
-                generator_log_dict.update({
-                    "generator_loss": generator_loss,
-                    "generator_grad_norm": torch.tensor(0.0, device=self.device),
-                    "bptt_chunks_used": torch.tensor(float(_used), device=self.device),
-                    "bptt_grad_chunks": torch.tensor(float(len(_losses)), device=self.device),
-                })
-                return generator_log_dict
+            horizon = self._sample_bptt_horizon()
+            if horizon > 1:
+                return self._bptt_generator_step(horizon)
 
             train_first_chunk = getattr(self.config, "train_first_chunk", False)
             if train_first_chunk:
@@ -1364,48 +1195,6 @@ class Trainer:
             
             return critic_log_dict
 
-    def _vram_profile_tick(self):
-        """VRAM profiler hook"""
-        n = getattr(self.config, "profile_vram", 0)
-        if not n:
-            return
-        warmup = getattr(self.config, "profile_vram_warmup", 3)
-        if self.step == warmup:
-            torch.cuda.reset_peak_memory_stats()
-        elif self.step >= warmup + n:
-            torch.cuda.synchronize()
-            alloc = torch.cuda.max_memory_allocated() / 2**30
-            reserved = torch.cuda.max_memory_reserved() / 2**30
-            if not dist.is_initialized() or dist.get_rank() == 0:
-                print(f"[VRAM_PROFILE] layers={getattr(self.config, 'model_kwargs', {}).get('memory_layers', [])} "
-                      f"train_write={getattr(self.config, 'train_write', False)} "
-                      f"alloc_GiB={alloc:.2f} reserved_GiB={reserved:.2f}", flush=True)
-            if dist.is_initialized():
-                dist.barrier()
-            os._exit(0)
-
-    def _clip_mem_grads(self):
-        """Explicit grad clip on the FSDP-ignored memory params. The generator FSDP
-        clip_grad_norm_ does NOT cover them. Called after the mem-grad hand-allreduce and before
-        the optimizer step. Default max_grad_norm_mem ~1e9 => no-op (byte-identical)."""
-        if getattr(self, "mem_params", None) and self.max_grad_norm_mem < 1e8:
-            torch.nn.utils.clip_grad_norm_(self.mem_params, self.max_grad_norm_mem)
-
-    def _lr_sched_step(self):
-        """Cosine lr decay for both generator groups (LoRA + mem) from lr_decay_start to
-        max_iters, each to its own floor fraction. lr_decay_start defaults beyond max_iters =>
-        never fires => lr stays at its base value (byte-identical)."""
-        s0 = self._lr_decay_start
-        if self.step < s0:
-            return
-        T = self.config.max_iters
-        prog = min(1.0, (self.step - s0) / max(1, T - s0))
-        cos = 0.5 * (1.0 + math.cos(math.pi * prog))           # 1 -> 0 over [s0, T]
-        fracs = [self._lr_floor_frac, self._lr_mem_floor_frac]  # [LoRA, mem]; mem group is index 1
-        for i, (g, base) in enumerate(zip(self.generator_optimizer.param_groups, self._base_lrs)):
-            fl = fracs[i] if i < len(fracs) else fracs[-1]
-            g["lr"] = base * (fl + (1.0 - fl) * cos)
-
     def train(self):
         start_step = self.step
         pbar_total = max(0, self.config.max_iters - self.step)
@@ -1428,7 +1217,7 @@ class Trainer:
                     print(f"[Debug] Step {self.step}: switch_mode={getattr(self.config,'switch_mode','fixed')}")
 
                 if self.streaming_training:
-                    # (D) push the global step to the rollout pipeline so it can anneal
+                    # push the global step to the rollout pipeline so it can anneal
                     # cache_dropout_prob (no-op when the anneal window is off). The pipeline is the
                     # StreamingSwitchTrainingPipeline reached via streaming_model.inference_pipeline;
                     # its clear_kv_cache() -> _maybe_cache_dropout() reads this step.
@@ -1481,9 +1270,9 @@ class Trainer:
                         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                             print(f"[SeqTrain-Trainer] Generator training completed, grad_norm={generator_grad_norm.item()}")
 
-                        self._clip_mem_grads()                 # (C) clip FSDP-ignored mem grads
+                        self._clip_mem_grads()
                         self.generator_optimizer.step()
-                        self._lr_sched_step()                  # (B) cosine lr decay (no-op pre-decay_start)
+                        self._lr_sched_step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                         self._log_memory_stats()
@@ -1546,9 +1335,9 @@ class Trainer:
                         generator_log_dict = merge_dict_list(accumulated_generator_logs)
                         generator_log_dict["generator_grad_norm"] = generator_grad_norm
 
-                        self._clip_mem_grads()                 # (C) clip FSDP-ignored mem grads
+                        self._clip_mem_grads()
                         self.generator_optimizer.step()
-                        self._lr_sched_step()                  # (B) cosine lr decay (no-op pre-decay_start)
+                        self._lr_sched_step()
                         if self.generator_ema is not None:
                             self.generator_ema.update(self.model.generator)
                     else:
@@ -1592,7 +1381,7 @@ class Trainer:
                         except:
                             pass
                         # identity + temporal-variance terms
-                        for _k in ["e1_id_cos", "e1_id_loss", "e1_latent_motion", "e1_tv_loss"]:
+                        for _k in ["identity_id_cos", "identity_id_loss", "identity_latent_motion", "identity_tv_loss"]:
                             if _k in generator_log_dict:
                                 try:
                                     self.writer.add_scalar(f"generator/{_k}", generator_log_dict[_k].mean().item(), self.step)
@@ -1714,203 +1503,6 @@ class Trainer:
             full = lora_model.state_dict()
         return get_peft_model_state_dict(lora_model, state_dict=full)
 
-    def _log_memory_stats(self):
-        """opt-in memory instrumentation.
-        config.log_memory_stats: print gate stats and live fast-weight drift.
-        config.assert_memory_drift: fail loudly if the state stops accumulating
-        (guards against fsdp/pytree container rebuilds swallowing the state writes;
-        run after any change to the ttt threading or a torch upgrade).
-        note: |w| is pinned at its init norm by weight_norm_update, so only
-        ||w - w_init|| discriminates a frozen state from a living one."""
-        do_log = getattr(self.config, "log_memory_stats", False)
-        do_assert = getattr(self.config, "assert_memory_drift", False)
-        if not (do_log or do_assert) or not self.is_main_process:
-            return
-        try:
-            if do_log and hasattr(self, "writer"):
-                first_gate = None
-                if not hasattr(self, "_mem_init"):
-                    self._mem_init = {}   # lazy init-weight snapshots (CPU) for weight-delta proof
-                # per-layer gate bias, shift+scale bias, gate-weight norm, P_o/P_c norms, weight-deltas
-                for n, p in self.model.generator.named_parameters():
-                    if "memory" not in n:
-                        continue
-                    mm = re.search(r"blocks\.(\d+)\.", n)
-                    li = mm.group(1) if mm else "x"
-                    if n.endswith("proj.bias"):
-                        b = p.detach().float(); third = b.numel() // 3
-                        g = b[2 * third:].abs().mean().item()
-                        ss = b[:2 * third].abs().mean().item()
-                        self.writer.add_scalar(f"memory/gate_b{li}", g, self.step)
-                        self.writer.add_scalar(f"memory/shiftscale_b{li}", ss, self.step)
-                        first_gate = g if first_gate is None else first_gate
-                    elif n.endswith("proj.weight"):
-                        wt = p.detach().float(); third = wt.shape[0] // 3
-                        self.writer.add_scalar(f"memory/gatew_b{li}", wt[2 * third:].norm().item(), self.step)
-                    elif n.endswith("gx_po.weight"):   # agreement projection P_o
-                        self.writer.add_scalar(f"memory/Po_b{li}", p.detach().float().norm().item(), self.step)
-                    elif n.endswith("gx_pc.weight"):   # agreement projection P_c
-                        self.writer.add_scalar(f"memory/Pc_b{li}", p.detach().float().norm().item(), self.step)
-                    elif n.endswith("proj_extra.weight"):
-                        # gate_extra usage: proj_extra is zero-init, so per-input column-norm = how much
-                        # the gate learned to use each combo input. Feature order is code-fixed:
-                        # [agreement(1), denoising_step(GX_EMB=16), frames_since_switch(16)]. Normalize the
-                        # 16-dim ones by sqrt(16) so all three are per-weight-RMS comparable.
-                        w = p.detach().float(); E = 16
-                        if w.dim() == 2 and w.shape[1] >= 1 + 2 * E:
-                            self.writer.add_scalar(f"memory/gx_agree_b{li}", w[:, 0:1].norm().item(), self.step)
-                            self.writer.add_scalar(f"memory/gx_denoise_b{li}", w[:, 1:1 + E].norm().item() / (E ** 0.5), self.step)
-                            self.writer.add_scalar(f"memory/gx_frames_b{li}", w[:, 1 + E:1 + 2 * E].norm().item() / (E ** 0.5), self.step)
-                    # weight-delta from init -> proof the read (qkv) / gate (proj) weights actually move
-                    if n.endswith("qkv.weight") or n.endswith("proj.weight"):
-                        cur = p.detach().float().cpu()
-                        if n not in self._mem_init:
-                            self._mem_init[n] = cur.clone()
-                        else:
-                            d = (cur - self._mem_init[n]).norm().item()
-                            tag = "dqkv" if "qkv" in n else "dproj"
-                            self.writer.add_scalar(f"memory/{tag}_b{li}", d, self.step)
-                # effective contribution + read magnitude + agreement score (captured in step())
-                for n, mod in self.model.generator.named_modules():
-                    if type(mod).__name__ != "VideoMemoryLayer":
-                        continue
-                    mm = re.search(r"blocks\.(\d+)\.", n)
-                    li = mm.group(1) if mm else "x"
-                    if getattr(mod, "dbg_out_rms", None) is not None:
-                        self.writer.add_scalar(f"memory/memout_b{li}", float(mod.dbg_out_rms), self.step)
-                    if getattr(mod, "dbg_read_rms", None) is not None:
-                        self.writer.add_scalar(f"memory/read_b{li}", float(mod.dbg_read_rms), self.step)
-                    if getattr(mod, "dbg_dc_frac", None) is not None:
-                        self.writer.add_scalar(f"memory/dcfrac_b{li}", float(mod.dbg_dc_frac), self.step)
-                    if getattr(mod, "dbg_amp_disp", None) is not None:
-                        self.writer.add_scalar(f"memory/ampdisp_b{li}", float(mod.dbg_amp_disp), self.step)
-                    if getattr(mod, "dbg_ampdisp_spatial", None) is not None:
-                        self.writer.add_scalar(f"memory/ampdisp_spatial_b{li}", float(mod.dbg_ampdisp_spatial), self.step)
-                    if getattr(mod, "dbg_ampdisp_temporal", None) is not None:
-                        self.writer.add_scalar(f"memory/ampdisp_temporal_b{li}", float(mod.dbg_ampdisp_temporal), self.step)
-                    if getattr(mod, "dbg_gate_mean", None) is not None:
-                        self.writer.add_scalar(f"memory/gatemean_b{li}", float(mod.dbg_gate_mean), self.step)
-                    if getattr(mod, "dbg_inj_stream", None) is not None:
-                        self.writer.add_scalar(f"memory/injstream_b{li}", float(mod.dbg_inj_stream), self.step)
-                    if getattr(mod, "dbg_agreement", None) is not None:
-                        self.writer.add_scalar(f"memory/agree_b{li}", float(mod.dbg_agreement), self.step)
-                if first_gate is not None:
-                    print(f"mem stats step={self.step} gate(first)={first_gate:.3e}")
-            pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
-            ttt = getattr(pipe, "ttt_cache", None)
-            if ttt is None:
-                if do_log:
-                    print(f"mem stats step={self.step} no ttt_cache")
-                return
-            import re as _re
-            inits = {}
-            for _n, _p in self.model.generator.named_parameters():
-                _key = _n.rsplit(".", 1)[-1]
-                if "memory" not in _n or _key not in ("w0", "w1", "w2"):
-                    continue
-                _mb = _re.search(r"blocks\.(\d+)\.", _n)
-                inits.setdefault(int(_mb.group(1)) if _mb else -1, {})[_key] = _p.detach()
-            found = False
-            max_drift = 0.0
-            for i, blk in enumerate(ttt):
-                st = getattr(blk, "state", None)
-                if st is None:
-                    continue
-                found = True
-                blk_inits = inits.get(i, {})
-                drifts = []; d_block = 0.0
-                for w, key in zip(st, ("w0", "w1", "w2")):
-                    if key in blk_inits:
-                        d = (w.detach().float() - blk_inits[key].float()).norm().item()
-                        max_drift = max(max_drift, d); d_block = max(d_block, d)
-                        drifts.append(f"{d:.3e}")
-                    else:
-                        drifts.append("n/a")
-                if do_log and hasattr(self, "writer"):
-                    self.writer.add_scalar(f"memory/drift_b{i}", d_block, self.step)
-                if do_log:
-                    print(f"mem stats step={self.step} block={i} drift=({', '.join(drifts)})")
-                # state-norm / init-norm ratio: the muon=0 collapse shows as ratio << 1 (the cap
-                # never binds); muon>0 keeps it ~1 (cap binds at init). drift (dist-from-init)
-                # cannot see this. Also report mean per-column ratio (the cap acts per column).
-                sn_ratios = []
-                col_ratios = []
-                for w, key in zip(st, ("w0", "w1", "w2")):
-                    if key in blk_inits:
-                        wf = w.detach().float(); inf = blk_inits[key].float()
-                        sn_ratios.append(wf.norm().item() / (inf.norm().item() + 1e-9))
-                        try:
-                            cr = (wf.norm(dim=-2) / (inf.norm(dim=-2) + 1e-9)).mean().item()
-                        except Exception:
-                            cr = float("nan")
-                        col_ratios.append(cr)
-                    else:
-                        sn_ratios.append(float("nan")); col_ratios.append(float("nan"))
-                if do_log:
-                    print(f"mem stats step={self.step} block={i} "
-                          f"statenorm/init=({', '.join(f'{r:.3f}' for r in sn_ratios)}) "
-                          f"colnorm/init=({', '.join(f'{r:.3f}' for r in col_ratios)})")
-                    if hasattr(self, "writer"):
-                        self.writer.add_scalar(f"memory/statenorm_ratio_b{i}", sn_ratios[0], self.step)
-                        self.writer.add_scalar(f"memory/colnorm_ratio_b{i}", col_ratios[0], self.step)
-            if not found and do_log:
-                print(f"mem stats step={self.step} ttt allocated but no state")
-            if do_log and found and hasattr(self, "writer"):
-                self.writer.add_scalar("memory/drift_max", max_drift, self.step)
-            if do_assert and self.step >= getattr(self.config, "dfake_gen_update_ratio", 1):
-                assert found, "drift guard: no live fast-weight state (writes swallowed again?)"
-                assert max_drift > 1.0, f"drift guard: drift={max_drift:.3e} ~ 0, memory stuck at init"
-        except AssertionError:
-            raise
-        except Exception as e:  # never let logging kill a training run
-            print(f"mem stats logging failed: {e}")
-
-    def _snapshot_ttt_state(self):
-        # the fast-weight state is mutated inside the gradient-checkpointed block, so backward-time
-        # recompute re-runs the write and leaves the cache holding an earlier chunk's state. Snapshot
-        # the post-generation state before backward, restore it after. The injection EMA buffer is
-        # mutated the same way (recompute rewrites ttt_cache.ema[key]), so snapshot/restore it too --
-        # else the per-chunk (seed-step) backward corrupts the EMA going into the next chunk's forward.
-        pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
-        cache = getattr(pipe, "ttt_cache", None) if pipe is not None else None
-        if not cache:
-            return None
-        return [
-            {
-                "state": (None if getattr(c, "state", None) is None
-                          else tuple(t.detach().to("cpu") for t in c.state)),
-                "ema": {k: v.detach().to("cpu") for k, v in (getattr(c, "ema", {}) or {}).items()},
-                # eviction-feed fifo: backward recompute re-appends inside the checkpointed
-                # block, so restore the pre-backward list. Entries are (idx, tensor) tuples
-                # replaced per write (tensors never mutated in place) -> a shallow list copy
-                # of refs suffices, no device round-trip needed.
-                "fifo": list(getattr(c, "fifo", []) or []),
-            }
-            for c in cache
-        ]
-
-    def _restore_ttt_state(self, snap):
-        if snap is None:
-            return
-        pipe = getattr(getattr(self, "streaming_model", None), "inference_pipeline", None)
-        cache = getattr(pipe, "ttt_cache", None) if pipe is not None else None
-        if not cache:
-            return
-        for c, s in zip(cache, snap):
-            c.state = None if s["state"] is None else tuple(t.to(self.device) for t in s["state"])
-            c.ema = {k: v.to(self.device) for k, v in s["ema"].items()}
-            c.fifo = list(s.get("fifo", []))  # undo recompute-time appends
-
-    def _gather_memory_state_dict(self, fsdp_model):
-        "gather the full state dict on rank 0 and keep only the memory params (full-rank, not lora)"
-        with FSDP.state_dict_type(
-            fsdp_model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
-        ):
-            full = fsdp_model.state_dict()
-        return {k: v for k, v in full.items() if "memory" in k}
-    
     # --------------------------------------------------------------------------------------------------------------
     # Visualization helpers
     # --------------------------------------------------------------------------------------------------------------
