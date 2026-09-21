@@ -28,6 +28,7 @@ def _load_script():
         from test_imports import _StubFinder
         finder = _StubFinder()
         sys.meta_path.insert(0, finder)
+    before = set(sys.modules)
     try:
         spec = importlib.util.spec_from_file_location(
             "_eval_metrics_under_test", os.path.join(ROOT, "scripts", "eval_metrics.py"))
@@ -37,6 +38,8 @@ def _load_script():
     finally:
         if finder is not None:
             sys.meta_path.remove(finder)
+            for name in set(sys.modules) - before:      # leave no stand-in behind for other tests
+                del sys.modules[name]
 
 
 metrics = _load_script()
@@ -107,6 +110,36 @@ def test_the_decision_code_reaches_every_published_verdict():
         verdict = metrics.verdict_of(t["summaries"]["memon"], t["on_zero"][0], t["noise_floor"],
                                      vb_diffs, vb_par, t["drift_diff"], t["drift_par"])
         assert verdict == t["verdict"], (path, verdict, t["verdict"])
+
+
+def test_verdicts_on_the_cases_no_published_table_shows():
+    """Every branch of the decision, checked against the rule written out flat: the published
+    tables are all ACTIVE-NEGATIVE or close to it, and none has a missing number."""
+    nan = float("nan")
+    lag, floor = metrics.FREEZE_LAG, 0.18
+
+    def flat(s_on, d, vb_par, drift_par):
+        frozen = s_on["lag2"] < lag and s_on["lag1"] < lag
+        flicker = s_on["lag2"] < lag and s_on["lag1"] >= lag
+        if frozen:
+            return "FREEZE"
+        if flicker:
+            return "FLICKER"
+        if not (d >= floor):
+            return "INERT"
+        if vb_par and drift_par:
+            return "ACTIVE-NEUTRAL"
+        return "ACTIVE (" if vb_par is None or drift_par is None else "ACTIVE-POSITIVE"   # gap +0.05
+
+    for lag1 in (0.0, 0.5, nan):
+        for lag2 in (0.0, 0.5, nan):
+            for d in (0.0, 0.5, nan):
+                for vb_par in (True, False, None):
+                    for drift_par in (True, False, None):
+                        s_on = {"lag1": lag1, "lag2": lag2}
+                        verdict = metrics.verdict_of(s_on, d, floor, {"SC": 0.1, "BC": None, "DD": -0.1},
+                                                     vb_par, 0.05, drift_par)
+                        assert verdict.startswith(flat(s_on, d, vb_par, drift_par)), (s_on, d, verdict)
 
 
 if __name__ == "__main__":

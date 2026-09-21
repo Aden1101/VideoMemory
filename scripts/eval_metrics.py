@@ -228,9 +228,9 @@ def verdict_of(s_on, d_on_zero, noise_floor, vb_diffs, vb_par, drift_diff, drift
     still = s_on["lag2"] < FREEZE_LAG
     if still and s_on["lag1"] < FREEZE_LAG:
         return "FREEZE  (lag-2 ~0 AND lag-1 ~0: memon output is static)"
-    if still:
+    if still and s_on["lag1"] >= FREEZE_LAG:
         return "FLICKER (lag-2 ~0 but lag-1 >>0: period-2 phase-swap, not real motion)"
-    if d_on_zero < noise_floor:
+    if not d_on_zero >= noise_floor:        # a NaN distance, no shared video, reads as inert
         return (f"INERT   (delta(memon,memzero)={d_on_zero:.4f} < floor {noise_floor}: memory made "
                 f"~no difference to the output)\n"
                 f"          NOTE: cannot distinguish INERT from CANCELLED without injection-dose telemetry. "

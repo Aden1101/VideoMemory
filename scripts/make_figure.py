@@ -175,8 +175,8 @@ def check_claims(runs):
 
 def main():
     runs = {run: load(run) for run, _ in RUNS}
-    check_claims(runs)
     draw(runs)
+    check_claims(runs)      # after the drawing: a failed claim still leaves the figure to look at
 
 
 if __name__ == "__main__":

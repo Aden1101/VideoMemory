@@ -98,9 +98,12 @@ def test_plain_composite_is_the_masked_blend(scene):
 def test_uniform_mask_is_flat_and_dose_matched(scene):
     composite, anchor, out, m = scene
     bg = out[:, CUR - 1:CUR]
-    weight = (composite(MEM_COMP_UNIFORM="1") - bg) / (anchor - bg)   # implied subject weight
-    assert float(weight.std()) < 1e-5
-    assert abs(float(weight.mean()) - float(m.mean())) < 1e-5
+    # implied subject weight, read where anchor and background differ enough for the division
+    # to be well conditioned in float32
+    apart = (anchor - bg).abs() > 0.1
+    weight = ((composite(MEM_COMP_UNIFORM="1") - bg) / (anchor - bg))[apart]
+    assert float(weight.std()) < 1e-4
+    assert abs(float(weight.mean()) - float(m.mean())) < 1e-4
 
 
 def test_anchor_noise_destroys_the_content_and_keeps_the_mask(scene):

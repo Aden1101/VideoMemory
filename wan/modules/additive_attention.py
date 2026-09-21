@@ -14,13 +14,17 @@ from wan.modules.attention import attention
 
 class AdditiveKVAttentionMixin:
     def _attend(self, roped_query, k, v, grid_sizes, freqs, frame_seqlen, v_ref, *,
-                window_frame, n_sink=0):
+                window_frame, current_start_frame, n_sink=0):
         """The block's attention over its context, plus the anchor tokens when an arm installed
-        some. `window_frame` is the RoPE frame where the local window starts: the anchor goes
-        one frame before it by default, in the band the sink and the window leave free, so
-        nothing in the cache moves. With no anchor this is upstream's attention call."""
+        some. `window_frame` is the RoPE frame where the local window starts, or None when the
+        keys carry their cache positions, in which case it is `local_attn_size` frames back.
+        The anchor goes one frame before it by default, in the band the sink and the window
+        leave free, so nothing in the cache moves. With no anchor this is upstream's attention
+        call and none of this is evaluated."""
         if getattr(self, "_add_kv", None) is None:
             return attention(roped_query, k, v)
+        if window_frame is None:
+            window_frame = current_start_frame - max(self.local_attn_size, 1)
         return self._additive_attention(roped_query, k, v, grid_sizes, freqs, frame_seqlen,
                                         max(0, window_frame - 1), v_ref, n_sink=n_sink)
 

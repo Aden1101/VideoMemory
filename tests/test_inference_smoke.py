@@ -80,6 +80,17 @@ def main():
             print(f"  .. chunk {c}: {tuple(out[0].shape)} in {(time.time()-t0)*1000:5.0f} ms, "
                   f"cache at {ends[-1]} tokens")
 
+        # the same chunk read twice, memory live then zeroed: the denoising loop also calls the
+        # model several times on one chunk, so the caches accept it
+        x = [torch.randn(16, F, H, W, device=device, dtype=DT)]
+        common["current_start"] = CHUNKS * F * FRAME_SEQ
+        live = m(x, t=t, ttt_update=False, **common)
+        os.environ["MEM_ZERO_ALL"] = "1"
+        try:
+            zeroed = m(x, t=t, ttt_update=False, **common)
+        finally:
+            del os.environ["MEM_ZERO_ALL"]
+
     check("output shape matches the input",
           tuple(outs[0][0].shape) == (16, F, H, W), str(tuple(outs[0][0].shape)))
     check("no non-finite value", all(bool(torch.isfinite(o).all()) for o in outs))
@@ -95,6 +106,8 @@ def main():
     init = m.blocks[1].memory.init_state(1, device, DT)
     check("that state moved away from its init",
           any(not torch.equal(w, w0) for w, w0 in zip(ttt[1].state, init)))
+    check("reading the memory changes the output, MEM_ZERO_ALL takes that away",
+          not torch.equal(live, zeroed))
 
     print(f"\n{len(OK)}/{len(OK)} inference smoke PASS on {device}")
 

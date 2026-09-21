@@ -79,7 +79,7 @@ class MemoryTrainingMixin:
         """Clip the gradients of the memory, after they were averaged across ranks and before
         the optimizer step."""
         if self.mem_params and self.max_grad_norm_mem is not None:
-            torch.nn.utils.clip_grad_norm_(self.mem_params, float(self.max_grad_norm_mem))
+            torch.nn.utils.clip_grad_norm_(self.mem_params, self.max_grad_norm_mem)
 
     def _lr_sched_step(self):
         """Cosine decay of both generator groups from lr_decay_start to max_iters, each down to
@@ -293,10 +293,13 @@ class MemoryTrainingMixin:
         clips nothing and the second never starts."""
         # the memory is kept out of FSDP, so generator.clip_grad_norm_, an FSDP method, skips
         # it: this is the only clip its gradients get
-        self.max_grad_norm_mem = getattr(config, "max_grad_norm_mem", None)
+        clip = getattr(config, "max_grad_norm_mem", None)
+        # a norm of 1e8 or more also means "no clip": configs used 1e9 to say so
+        self.max_grad_norm_mem = None if clip is None or float(clip) >= 1e8 else float(clip)
         # base learning rate of each optimizer group, [LoRA, memory]; the schedule scales them
         self._base_lrs = [g["lr"] for g in self.generator_optimizer.param_groups]
-        self._lr_decay_start = getattr(config, "lr_decay_start", None)
+        start = getattr(config, "lr_decay_start", None)
+        self._lr_decay_start = None if start is None else int(start)
         self._lr_floors = [float(getattr(config, "lr_floor_frac", 1.0)),
                            float(getattr(config, "lr_mem_floor_frac", 1.0))]
 

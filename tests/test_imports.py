@@ -1,6 +1,6 @@
-"""Import every module this work wrote or touched, for real, with the heavy third-party
-packages replaced by stubs. No torch needed, a second to run, Python 3.10 or later (upstream
-writes `X | None` in signatures).
+"""Import every module this work wrote or touched. Where torch is not installed the heavy
+third-party packages are replaced by stubs, so this runs anywhere in a second; where it is,
+the imports are the real ones. Python 3.10 or later (upstream writes `X | None` in signatures).
 
 It catches what compiling a file cannot: an import cycle, a name missing at import time, a
 class whose bases do not combine, a decorator applied to the wrong thing. It runs no function
@@ -10,6 +10,7 @@ body, so it says nothing about behaviour.
 """
 import importlib
 import importlib.abc
+import importlib.util
 import importlib.machinery
 import os
 import sys
@@ -126,7 +127,8 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 def import_all():
     """{module: error message} for every module that failed to import."""
     finder = _StubFinder()
-    sys.meta_path.insert(0, finder)
+    if importlib.util.find_spec("torch") is None:       # with torch installed, import for real
+        sys.meta_path.insert(0, finder)
     sys.path.insert(0, ROOT)
     before = set(sys.modules)
     failures = {}
@@ -137,9 +139,10 @@ def import_all():
             except Exception as error:                  # noqa: BLE001, reported below
                 failures[name] = f"{type(error).__name__}: {error}"
     finally:
-        sys.meta_path.remove(finder)
-        for name in set(sys.modules) - before:          # leave no stub behind for other tests
-            del sys.modules[name]
+        if finder in sys.meta_path:
+            sys.meta_path.remove(finder)
+            for name in set(sys.modules) - before:      # leave no stub behind for other tests
+                del sys.modules[name]
     return failures
 
 

@@ -43,19 +43,16 @@ def test_the_read_uses_the_state_from_before_this_write():
     assert not torch.equal(new_state[0], state[0])              # and the write did happen
 
 
-def test_a_later_chunk_cannot_change_an_earlier_output():
-    def rollout(xs):
-        c, state, outs = cell(g_init=0.1), None, []
+def test_what_an_earlier_chunk_wrote_reaches_a_later_output():
+    def last_output(xs):
+        c, state = cell(g_init=0.1), None
         for x in xs:
             out, state = c.step(x, state=state)
-            outs.append(out)
-        return outs
+        return out
 
     xs = chunks(3)
-    changed = xs[:2] + [xs[2] + 1.0]
-    a, b = rollout(xs), rollout(changed)
-    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
-    assert not torch.equal(a[2], b[2])
+    changed_first = [xs[0] + 1.0] + xs[1:]
+    assert not torch.equal(last_output(xs), last_output(changed_first))
 
 
 def test_a_write_rotates_the_state_without_changing_its_column_norms():

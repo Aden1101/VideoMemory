@@ -6,6 +6,7 @@ from omegaconf import OmegaConf
 import wandb
 
 from trainer.distillation import Trainer as ScoreDistillationTrainer
+from utils.env import check_arm_variables
 
 def main():
     parser = argparse.ArgumentParser()
@@ -16,6 +17,7 @@ def main():
     parser.add_argument("--no-one-logger", action="store_true", help="Disable One Logger (enabled by default)")
 
     args = parser.parse_args()
+    check_arm_variables()    # a misspelt MEM_* variable stops the run here, not mid-way
 
     config = OmegaConf.load(args.config_path)
     default_config = OmegaConf.load("configs/default_config.yaml")

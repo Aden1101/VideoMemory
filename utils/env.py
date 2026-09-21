@@ -30,7 +30,7 @@ def env_on(name):
 
 # Every variable the code reads to switch an arm or a control. Each is documented where it is
 # read (pipeline/switch/, wan/modules/memory_inject.py, model/twin_objective.py).
-# tests/test_env_registry.py keeps this list equal to what the source actually reads.
+# tests/test_env_and_schedule.py keeps this list equal to what the source actually reads.
 ARM_VARIABLES = frozenset("""
 ANCHOR_BLUR_SIGMA ANCHOR_DUMP ANCHOR_FROM_FILE
 FRAMEBANK FRAMEBANK_GT FRAMEBANK_TAU FRAMEBANK_TIE

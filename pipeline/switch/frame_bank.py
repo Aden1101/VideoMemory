@@ -111,9 +111,9 @@ class FrameBankMixin:
         def chosen(prefix, pick, fields):
             """What the event log keeps of a selection: whether one was made, which entry, and
             whether it shows the right subject."""
-            out = {f"{prefix}recalled": pick is not None,
-                   f"{prefix}correct": bool(pick is not None and pick["subject"] == subj)}
+            out = {f"{prefix}recalled": pick is not None}
             out.update({f"{prefix}chosen_{f}": None if pick is None else int(pick[f]) for f in fields})
+            out[f"{prefix}correct"] = bool(pick is not None and pick["subject"] == subj)
             return out
 
         pick = choose(tau)

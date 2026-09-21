@@ -55,6 +55,16 @@ def cell_alone():
     return digest(*outs, *state)
 
 
+def _build_model(**kwargs):
+    """The cell options travel as one `memory_kwargs` dict, or as flat keyword arguments in the
+    revisions that predate it: this script has to run on both sides of such a change."""
+    cell = dict(gate_init=0.1, **CELL)
+    try:
+        return CausalWanModel(memory_kwargs=cell, **kwargs)
+    except TypeError:
+        return CausalWanModel(**cell, **kwargs)
+
+
 def model_rollout():
     """A miniature model, six chunks, memory branch live: per chunk one read pass at t=1000
     and one write pass at t=0, as the inference pipeline does. The eviction delay of a 12-frame
@@ -64,11 +74,10 @@ def model_rollout():
     frame_seq = (H // 2) * (W // 2)
     dt = torch.bfloat16
     torch.manual_seed(0)
-    m = CausalWanModel(dim=heads * head_dim, ffn_dim=2048, num_heads=heads, num_layers=layers,
-                       text_dim=64, text_len=16, local_attn_size=local, sink_size=3,
-                       memory_layers=(1,), in_dim=16, out_dim=16,
-                       memory_kwargs=dict(gate_init=0.1, **CELL),
-                       mem_stream_scale=0.5, eviction_feed=True)
+    m = _build_model(dim=heads * head_dim, ffn_dim=2048, num_heads=heads, num_layers=layers,
+                     text_dim=64, text_len=16, local_attn_size=local, sink_size=3,
+                     memory_layers=(1,), in_dim=16, out_dim=16,
+                     mem_stream_scale=0.5, eviction_feed=True)
     m = m.to(device=device, dtype=dt).eval()
     with torch.no_grad():
         m.head.head.weight.normal_(0, 0.02)     # the output head is zero-init: perturb it
@@ -92,7 +101,9 @@ def model_rollout():
                     ttt_update=False, **common)
             m(out, t=torch.zeros(1, F, device=device, dtype=dt), ttt_update=True, **common)
             outs.append(torch.stack(list(out)))
-    assert ttt[1].state is not None, "the memory block never wrote: the rollout is too short"
+    init = m.blocks[1].memory.init_state(1, device, dt)
+    assert any(not torch.equal(w.float(), w0.float()) for w, w0 in zip(ttt[1].state, init)), \
+        "the memory state never left its init: the rollout is too short to write"
     return digest(*outs, *ttt[1].state)
 
 

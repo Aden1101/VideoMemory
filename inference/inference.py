@@ -20,10 +20,12 @@ from utils.misc import set_seed
 
 from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
 from utils.device import device as af_device, describe as af_describe
+from utils.env import check_arm_variables
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
 args = parser.parse_args()
+check_arm_variables()    # a misspelt MEM_* variable stops the run here, not mid-way
 
 config = OmegaConf.load(args.config_path)
 

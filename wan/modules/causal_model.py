@@ -436,9 +436,8 @@ class CausalWanSelfAttention(AdditiveKVAttentionMixin, nn.Module):
 
                 x = self._attend(
                     roped_query, k_cat, v_cat, grid_sizes, freqs, frame_seqlen, v,
-                    window_frame=(rope_start_f_k_local if (rope_enhance and local_budget > 0)
-                                  else current_start_frame - max(self.local_attn_size, 1)),
-                    n_sink=k_sink.shape[1])
+                    window_frame=rope_start_f_k_local if (rope_enhance and local_budget > 0) else None,
+                    current_start_frame=current_start_frame, n_sink=k_sink.shape[1])
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
                 k_win = temp_k[:, window_start:local_end_index]
@@ -461,8 +460,8 @@ class CausalWanSelfAttention(AdditiveKVAttentionMixin, nn.Module):
                         q, grid_sizes, freqs, start_frame=rope_start_f).type_as(v)
                 x = self._attend(
                     roped_query, k_win, v_win, grid_sizes, freqs, frame_seqlen, v,
-                    window_frame=(rope_start_f_k_win if rope_enhance
-                                  else current_start_frame - max(self.local_attn_size, 1)))
+                    window_frame=rope_start_f_k_win if rope_enhance else None,
+                    current_start_frame=current_start_frame)
 
         # output
         x = x.flatten(2)
