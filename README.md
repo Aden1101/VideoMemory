@@ -21,20 +21,7 @@ A memory branch is inserted in a few transformer blocks (layers 5, 16, 27 of 30)
 carries a fast weight `W` that is rewritten during generation, by the forward pass, not by the
 optimizer.
 
-```
-chunk t                    chunk t+1
-   │                          │
-   ▼                          ▼
-┌────────────────────────────────────────┐
-│  KV cache   [ sink ×3 | window ×9 ]    │  FIFO, oldest chunk evicted
-└────────────────────────────────────────┘
-                 │ evicted chunk  (what attention can no longer see)
-                 ▼
-        ┌──────────────────┐
-        │   memory cell    │   read   o = f_W(q)          q from the current chunk
-        │   fast weight W  │   write  W <- renorm(Muon(grad_W <f_W(k), v>))
-        └──────────────────┘   inject x <- x + gate(x) * AdaLN(o)   into the residual stream
-```
+![where the memory sits and what it is fed](assets/architecture.png)
 
 Three points are not obvious from the code:
 
