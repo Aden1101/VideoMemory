@@ -294,7 +294,7 @@ class MemoryTrainingMixin:
         # the memory is kept out of FSDP, so generator.clip_grad_norm_, an FSDP method, skips
         # it: this is the only clip its gradients get
         clip = getattr(config, "max_grad_norm_mem", None)
-        # a norm of 1e8 or more also means "no clip": configs used 1e9 to say so
+        # a norm of 1e8 or more is read as "no clip": a config writes 1e9 to turn the clip off
         self.max_grad_norm_mem = None if clip is None or float(clip) >= 1e8 else float(clip)
         # base learning rate of each optimizer group, [LoRA, memory]; the schedule scales them
         self._base_lrs = [g["lr"] for g in self.generator_optimizer.param_groups]

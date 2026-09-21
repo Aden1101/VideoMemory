@@ -74,7 +74,7 @@ left in because the tables are kept exactly as the script wrote them.
 The tables call the thresholds pre-registered. Git cannot show that: they enter this
 repository's history in the same commit as the first tables (`cf1d8f1`, 2026-08-13). They have
 not changed since, and every table prints the ones it used. The French words in the verdict
-line are a leftover of the script's first version, kept for the same reason as the verdicts.
+line are the script's own, kept for the same reason as the verdicts.
 
 The evaluation script wrote a hardcoded run name and step into every header it produced. Those
 labels were wrong and have been rewritten from the directory they sit in; no measurement was
