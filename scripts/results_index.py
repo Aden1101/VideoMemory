@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """The published tables as data. `read_table` turns one results/*/*/metrics.txt back into
-numbers; it is the only parser of those files, used by the figure, by the tests and by
+numbers; it is the only parser of those files, used by the figure and by the tests.
 
-    python scripts/results_index.py         # writes results/index.json, one row per table
+    python scripts/results_index.py         # the 29 tables as JSON on stdout, one row per table
 
 Plain Python, no dependency.
 """
@@ -15,7 +15,6 @@ import re
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARMS = ("memon", "memzero", "stock")
 VBENCH = ("SC", "BC", "DD")
-INDEX = os.path.join(ROOT, "results", "index.json")
 
 
 def table_paths():
@@ -79,7 +78,4 @@ def index_rows():
 
 
 if __name__ == "__main__":
-    with open(INDEX, "w") as f:
-        json.dump(index_rows(), f, indent=1)
-        f.write("\n")
-    print(f"{len(index_rows())} tables -> {os.path.relpath(INDEX, ROOT)}")
+    print(json.dumps(index_rows(), indent=1))

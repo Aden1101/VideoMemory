@@ -5,8 +5,7 @@ unmodified model, on the same prompts and the same seed. `scripts/make_figure.py
 directly, so `assets/motion_identity.png` is regenerated from measurements and never from a
 hand-copied table.
 
-`index.json` holds the same numbers as data, one row per table, written by
-`python scripts/results_index.py`; a test keeps it equal to the tables.
+`python scripts/results_index.py` prints the same numbers as JSON, one row per table.
 
 One directory per run, named like the config it was trained with in `configs/runs/`:
 

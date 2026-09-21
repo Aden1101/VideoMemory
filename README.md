@@ -152,6 +152,13 @@ Two passes because the text encoder (11.4 GB) and the generator do not fit in me
 a consumer machine: pass 1 encodes and exits, pass 2 never loads the encoder. Training needs
 CUDA and two 48 GB cards.
 
+What has and has not been run since the code was reorganised into its own modules: the memory
+cell, the model and the inference rollouts give bit-identical numbers before and after, with
+the real weights. The training path (`trainer/memory_training.py`, `model/twin_objective.py`)
+was moved the same way and read side by side against the previous code, but not executed
+since, for lack of a CUDA machine. The training code as it stood before is at the git tag
+`before-refactor`; run a few steps of both and compare the loss before trusting a new run.
+
 Runs on CUDA, Apple Metal and CPU. On CUDA every device call delegates to the original
 `torch.cuda` one, so no previously measured number moves. `tests/test_device.py` checks that by
 reimplementing upstream's rotary embedding and demanding bitwise equality.

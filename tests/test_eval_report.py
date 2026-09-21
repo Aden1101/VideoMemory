@@ -16,7 +16,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from scripts.results_index import INDEX, index_rows, read_table, table_paths  # noqa: E402
+from scripts.results_index import index_rows, read_table, table_paths  # noqa: E402
 
 TABLES = table_paths()
 
@@ -51,8 +51,11 @@ def test_there_are_tables_to_check():
     assert len(TABLES) >= 29, len(TABLES)
 
 
-def test_the_index_says_what_the_tables_say():
-    assert json.load(open(INDEX)) == index_rows(), "run python scripts/results_index.py"
+def test_every_table_becomes_a_row_of_data():
+    rows = index_rows()
+    assert len(rows) == len(TABLES)
+    assert all(set(row["arms"]) == {"memon", "memzero", "stock"} for row in rows)
+    json.dumps(rows)                                    # and the rows are plain data
 
 
 def test_the_report_code_writes_every_published_table_again():
