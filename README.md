@@ -21,7 +21,19 @@ A memory branch is inserted in a few transformer blocks (layers 5, 16, 27 of 30)
 carries a fast weight `W` that is rewritten during generation, by the forward pass, not by the
 optimizer.
 
-![where the memory sits and what it is fed](assets/architecture.png)
+What the memory is fed. Attention sees the sink and a rolling window; the chunk that has just
+left the window is the one the memory writes.
+
+![three generation steps: the window slides, the chunk it drops is written to the memory](assets/arch_context.png)
+
+Where it sits. The branch reads the same normalised input as self-attention and adds a gated
+output to the residual stream; its state lives outside the block and is carried across chunks.
+
+![the transformer block with the memory branch between self-attention and cross-attention](assets/arch_block.png)
+
+What the cell does. The read of a step uses the state from before that step's write.
+
+![the read and the write around the state W](assets/arch_cell.png)
 
 Three points are not obvious from the code:
 
