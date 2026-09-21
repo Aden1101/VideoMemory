@@ -6,7 +6,7 @@ runs unless its environment variable is set.
 """
 from pipeline.switch.additive_kv import AdditiveKVMixin
 from pipeline.switch.anchor_controls import AnchorControlsMixin
-from pipeline.switch.anchor_decode import AnchorDecodeMixin
+from pipeline.switch.decoded_anchor import AnchorDecodeMixin
 from pipeline.switch.composite import CompositeMixin
 from pipeline.switch.frame_bank import FrameBankMixin
 from pipeline.switch.memory_state import MemoryStateMixin

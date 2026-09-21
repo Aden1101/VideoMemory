@@ -18,7 +18,7 @@ from utils.env import env_int, env_on, env_str
 from pipeline.causal_inference import CausalInferencePipeline  # reuse init utilities
 from wan.modules.video_memory import TTTBlockCache
 from pipeline.switch.memory_state import MemoryStateMixin, _memwriter_sync
-from pipeline.switch.anchor_decode import AnchorDecodeMixin
+from pipeline.switch.decoded_anchor import AnchorDecodeMixin
 from pipeline.switch.anchor_controls import AnchorControlsMixin
 from pipeline.switch.sdedit import SdeditMixin
 from pipeline.switch.sink import SinkMixin

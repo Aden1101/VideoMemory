@@ -39,3 +39,6 @@ wandb/
 
 # --- debug log ---
 tea_debug.log
+
+# machine-dependent hashes written by tests/fingerprints.py --record
+tests/fingerprints.json

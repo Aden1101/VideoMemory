@@ -1,27 +1,23 @@
 #!/usr/bin/env python
-# Three-way evaluation metrics: the scoring code behind every results/*/eval*/metrics.txt.
-#
-# It takes the videos of three arms generated on the same prompts and the same seed (memory
-# active, memory zeroed with MEM_ZERO_ALL=1, unmodified model) plus their VBench outputs, and
-# writes the table. The title line carries no run name or step: the tables under results/ were
-# relabelled from the directory they sit in.
-#
-# Computes, per video and per arm:
-#   (a) FLICKER-BLIND lag-2 motion  = mean |x[t]-x[t-2]| in pixel space (freeze detector that a
-#       period-2 flicker CANNOT inflate); lag-1 reported too so freeze vs flicker are separable:
-#           lag2 ~0 AND lag1 ~0  -> FROZEN
-#           lag2 ~0 AND lag1 >>0 -> FLICKER (motion is period-2 phase-swap, not real motion)
-#       optional Farneback optical-flow magnitude (--optical_flow), same freeze signal, cross-check.
-#   (b) DINO first->last identity retention = cos(DINO(frame_0), DINO(frame_last)) + the full
-#       drift curve cos(DINO(f0), DINO(ft)).  DINOv2-vitb14 loaded exactly like model/twin_objective.py.
-#   (c) PAIRED delta(memon, memzero): per-frame DINO cosine-distance AND pixel-L2 between the two
-#       arms on the SAME seed/prompt (identical noise -> the only difference is the memory injection),
-#       compared to the 0.18 noise floor.  Also delta(memzero, AF-stock) = pure LoRA co-train drift.
-#   (d) collates VBench SC / BC / DD aggregate scores for all three arms.
-#
-# Then prints a PRE-REGISTERED decision (thresholds are constants below, printed in the report).
-#
-# Standalone-runnable (does NOT import wan / touch the training stack).
+"""Three-way evaluation: the scoring code behind every results/*/eval*/metrics.txt.
+
+Input: the videos of three arms generated on the same prompts and the same seed (memory active,
+memory zeroed with MEM_ZERO_ALL=1, unmodified model) and their VBench outputs. Output: the table.
+The title line carries no run name: the tables under results/ were relabelled from their folder.
+
+Per video and per arm:
+  motion    mean |x[t] - x[t-2]| in pixels (lag 2), which a period-2 flicker cannot inflate, and
+            lag 1 next to it: both near zero is a freeze, lag 2 near zero with lag 1 high is a
+            flicker. --optical_flow adds the Farneback flow magnitude as a cross-check.
+  identity  cos(DINO(frame 0), DINO(last frame)), and the whole curve against frame 0. DINOv2
+            ViT-B/14, loaded as model/twin_objective.py loads it.
+Per pair of arms, frame by frame on the same prompt and seed, so that only the arm differs:
+  memon vs memzero   what the memory injection changes, against the 0.18 noise floor
+  memzero vs stock   what the LoRA co-training alone changes
+VBench SC / BC / DD are collated for the three arms, then the thresholds below give a verdict.
+
+Standalone: it imports nothing from the training stack.
+"""
 import argparse
 import glob
 import json

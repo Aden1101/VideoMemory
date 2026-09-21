@@ -6,11 +6,13 @@ script runs three small deterministic computations and hashes what comes out: th
 alone, a miniature CausalWanModel rolled out with the memory branch live (read pass, then the
 write pass that feeds the evicted chunk), and the composite blend. It needs no weights.
 
-    python tests/golden.py --record     # on the code you trust: writes tests/golden.json
-    python tests/golden.py              # on the code you changed: compares, exits 1 on a diff
+    python tests/fingerprints.py --record   # on the code you trust: writes tests/fingerprints.json
+    python tests/fingerprints.py            # on the code you changed: compares, exits 1 on a diff
 
-Hashes depend on the device, the dtype kernels and the torch version, so record and compare on
-the same machine. AF_DEVICE=cpu makes that easy.
+To compare two revisions, copy this file onto the older one first
+(`git checkout <newer> -- tests/fingerprints.py`); the recorded file is ignored by git, so it
+survives the checkout back. Hashes depend on the device, the kernels and the torch version:
+record and compare on the same machine. AF_DEVICE=cpu makes that easy.
 """
 import argparse
 import hashlib
@@ -27,7 +29,7 @@ from utils.device import device  # noqa: E402
 from wan.modules.causal_model import CausalWanModel  # noqa: E402
 from wan.modules.video_memory import TTTBlockCache, VideoMemoryLayer  # noqa: E402
 
-GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden.json")
+RECORDED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fingerprints.json")
 # the cell options of the reported runs (configs/runs/run3_write_evicted_stable.yaml)
 CELL = dict(bounded_gate=True, bounded_mod=True, rel_norm=True, dc_remove=True, use_decay=True)
 
@@ -144,11 +146,11 @@ def main():
     got = {name: fn() for name, fn in CASES.items()}
     got["_where"] = f"{device} torch {torch.__version__}"
     if args.record:
-        with open(GOLDEN, "w") as f:
+        with open(RECORDED, "w") as f:
             json.dump(got, f, indent=2)
-        print(f"recorded {GOLDEN}\n{json.dumps(got, indent=2)}")
+        print(f"recorded {RECORDED}\n{json.dumps(got, indent=2)}")
         return
-    with open(GOLDEN) as f:
+    with open(RECORDED) as f:
         want = json.load(f)
     if want["_where"] != got["_where"]:
         print(f"warning: recorded on {want['_where']}, running on {got['_where']}")

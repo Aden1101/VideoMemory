@@ -27,6 +27,20 @@ Three directories are controls on a single checkpoint, and the figure leaves the
 | `run1_…/eval_R1` | step 1250 again, with `MEM_REJECT_STREAM=1` on the memory-active arm: the part of the injection parallel to the residual stream is removed. The memory-zeroed arm is identical to `eval1250`, as it should be. It is a different arm, not a repeat measurement |
 | `run2_…/eval1000_msc05` | step 1000 again, with `MEM_STREAM_SCALE=0.5` on the memory-active arm at inference |
 
+## How a table is made
+
+Four steps on one checkpoint, six held-out prompts, seed 42, 240 latent frames:
+
+1. generate with the memory active;
+2. generate again with `MEM_ZERO_ALL=1`, same config, which zeroes the injection and nothing else;
+3. run VBench (subject consistency, background consistency, dynamic degree) on both, and on
+   the unmodified model's videos, which are generated once and reused;
+4. `python scripts/eval_metrics.py`, which adds the DINO first-to-last identity, the lag-1 and
+   lag-2 motion and the paired distances, and writes `metrics.txt`.
+
+The driver that chained these on the cluster is not included. `tests/test_eval_report.py` reads
+every table back and checks that the script's report and decision code write it again.
+
 ## What is and is not comparable
 
 The `stock` rows were not generated alongside each table. They come from one earlier
@@ -53,6 +67,11 @@ whether the memory changes the output at all (`delta(memon, memzero)` against a 
 and then whether any VBench or drift number differs from `stock`. `ACTIVE-POSITIVE` does not
 mean the memory helps, and the verdicts are not part of this project's conclusion. They are
 left in because the tables are kept exactly as the script wrote them.
+
+The tables call the thresholds pre-registered. Git cannot show that: they enter this
+repository's history in the same commit as the first tables (`cf1d8f1`, 2026-08-13). They have
+not changed since, and every table prints the ones it used. The French words in the verdict
+line are a leftover of the script's first version, kept for the same reason as the verdicts.
 
 The evaluation script wrote a hardcoded run name and step into every header it produced. Those
 labels were wrong and have been rewritten from the directory they sit in; no measurement was

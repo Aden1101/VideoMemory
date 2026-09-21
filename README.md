@@ -4,6 +4,8 @@ A research fork of [Anchor-Forcing](https://github.com/vivoCameraResearch/Anchor
 (Wan2.1-T2V-1.3B, causal streaming, DMD distillation) that adds a fast-weight memory to the
 backbone, to fight identity drift over minutes of generated video.
 
+The result is negative: [the memory does not help](#result). What this work adds to upstream is
+listed in [Where the code is](#where-the-code-is), and [its tests run without a GPU](#running-it).
 Upstream's README is kept at [`UPSTREAM_README.md`](UPSTREAM_README.md).
 
 ## The problem
@@ -63,6 +65,12 @@ are plain DMD; the twin is there to be read, not to explain the figure.
 
 ![motion vs identity](assets/motion_identity.png)
 
+- The memory does not help: with it active, identity is lower than with it zeroed at 10 of the
+  15 checkpoints, by 0.07 on average.
+- Training costs motion, memory or not: in runs 1 to 3 both arms fall under the motion reference.
+- One lead is open: a training-free delta write rule reads the subject out of the state where
+  the deployed rule does not.
+
 One column per training run, identity on top, motion below, against the training step. The
 dashed line is that run's own unmodified model. The four share everything except what their
 titles name: same frozen backbone, same LoRA co-training, and the same objective, plain DMD
@@ -78,10 +86,8 @@ has both measurements at step 1250, and going from sink 3 to sink 1 costs 0.06 t
 identity, the size of the effects below. So the conclusions rest on memory active against memory
 zeroed; against the reference, only run 1 is a fair comparison.
 
-The memory does not help. With it active, identity is lower than with it zeroed at 10 of the 15
-checkpoints, by 0.07 on average. Training costs motion: in runs 1 to 3 both arms fall under the
-motion reference, memory or not, so that cost belongs to the continued training and not to the
-memory. Where motion does come back, run 2 at step 1250, identity with the memory active has
+The motion cost belongs to the continued training and not to the memory, since the
+memory-zeroed arm pays it too. Where motion does come back, run 2 at step 1250, identity with the memory active has
 collapsed to 0.36. In run 1, the one fair comparison to the reference, the only arm that ends
 above it on identity is the memory-zeroed one (0.773 against 0.743), with a third fewer clips
 rated dynamic; with the memory active identity is 0.667 and dynamic degree 0.23, a near-frozen
@@ -101,9 +107,8 @@ of A's first appearance, real or decoded from the memory state. Controls matter 
 taken from a different video helps as much as the right one, which is how the apparent gain
 turned out never to have been content-driven.
 
-One lead is still open. A training-free delta write rule reads the subject out of the state
-where the deployed rule does not: median 13.5/19 against 7.0 over 10 seeds, with a background
-control at chance. The score counts, out of 19 video pairs with a clearly distinct subject, how
+The open lead in numbers: median 13.5/19 for the delta rule against 7.0 for the deployed one,
+over 10 seeds, with a background control at chance. The score counts, out of 19 video pairs with a clearly distinct subject, how
 many the state tells apart in a two-way choice, so chance is 9.5; it is read offline from
 replayed states (`write_only` and `replay_writes` in `wan/modules/video_memory.py` are that
 replay's interface). The two distributions barely overlap (11 to 16 against 6 to 10), but the
@@ -113,6 +118,24 @@ reproduced from here.
 
 ## Running it
 
+Without a GPU and without weights, the checks that need no torch run in seconds:
+
+```bash
+pip install pytest
+python -m pytest tests/                # with torch installed this runs everything, none of it needs weights
+python tests/test_env_and_schedule.py  # arm switches and prompt schedule
+python tests/test_imports.py           # every module imports, heavy packages stubbed
+python tests/test_eval_report.py       # the scoring script writes the 29 published tables again
+```
+
+With torch, `tests/test_memory_cell.py` checks what this README says of the cell through the code
+the model calls: a zero gate is exactly inert, the read sees the state from before the write, the
+write takes the evicted chunk and keeps the column norms, and an offline replay rebuilds the same
+state. `tests/test_inference_smoke.py` streams a miniature model with the memory live, and
+`tests/fingerprints.py` hashes the memory path to tell a refactor from a behaviour change.
+
+With the weights:
+
 ```bash
 python scripts/download_weights.py                    # Wan2.1-T2V-1.3B + Anchor-Forcing checkpoints, ~26 GB
 python scripts/encode_prompts.py --file ckpt/prompts/bench/vbench_all_dimension_extended.txt --limit 1
@@ -120,20 +143,8 @@ AF_LAZY_TEXT_ENCODER=1 PYTHONPATH=. python inference/inference.py --config_path 
 ```
 
 That config runs the unmodified model. The four training runs behind the figure have their
-configs under `configs/runs/`, and their measurements under `results/`.
-
-Each table under `results/` comes from four steps on one checkpoint, six held-out prompts,
-seed 42, 240 latent frames:
-
-1. generate with the memory active;
-2. generate again with `MEM_ZERO_ALL=1`, same config, which zeroes the injection and nothing else;
-3. run VBench (subject consistency, background consistency, dynamic degree) on both, and on
-   the unmodified model's videos, which are generated once and reused;
-4. `python scripts/eval_metrics.py`, which adds the DINO first-to-last identity, the lag-1 and
-   lag-2 motion and the paired distances, and writes `metrics.txt`.
-
-The driver that chained these on the cluster is not included; `results/README.md` says what is
-comparable to what.
+configs under `configs/runs/` and their measurements under `results/`, whose README gives the
+evaluation protocol and says what is comparable to what.
 
 Two passes because the text encoder (11.4 GB) and the generator do not fit in memory together on
 a consumer machine: pass 1 encodes and exits, pass 2 never loads the encoder. Training needs
@@ -142,20 +153,6 @@ CUDA and two 48 GB cards.
 Runs on CUDA, Apple Metal and CPU. On CUDA every device call delegates to the original
 `torch.cuda` one, so no previously measured number moves. `tests/test_device.py` checks that by
 reimplementing upstream's rotary embedding and demanding bitwise equality.
-
-```bash
-python -m pytest tests/                # everything below, none of it needs weights
-python tests/test_env_and_schedule.py  # arm switches and prompt schedule: no torch, one second
-python tests/test_imports.py           # every module imports, heavy packages stubbed: no torch
-python tests/test_eval_report.py       # the scoring script writes the 29 published tables again: no torch
-python tests/test_device.py            # device layer
-python tests/test_inference_smoke.py   # real model, streaming
-python tests/golden.py --record        # fingerprints of the memory path, to compare after a change
-```
-
-`tests/test_memory_cell.py` checks what this README says of the cell through the code the model
-calls: a zero gate is exactly inert, the read sees the state from before the write, the write
-takes the evicted chunk and keeps the column norms, and an offline replay rebuilds the same state.
 
 ## Where the code is
 

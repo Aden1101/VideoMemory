@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
 
-from pipeline.switch.anchor_decode import AnchorDecodeMixin
+from pipeline.switch.decoded_anchor import AnchorDecodeMixin
 from pipeline.switch.composite import CompositeMixin
 
 H, W, CUR = 60, 104, 180

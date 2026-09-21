@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from pipeline.switch.anchor_decode import _memdec_pooled_cond
+from pipeline.switch.decoded_anchor import _memdec_pooled_cond
 from utils.env import env_float, env_int
 
 
