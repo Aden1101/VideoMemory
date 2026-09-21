@@ -4,38 +4,35 @@ the residual stream, and store the state the write produced.
 Mixed into CausalWanAttentionBlock. The block itself, its attention and its caches are
 upstream's and stay in wan/modules/causal_model.py.
 """
+import inspect
 import math
 
 import torch
 
 from utils.env import env_int, env_str
+from wan.modules.video_memory import VideoMemoryLayer
 
 _ABLATION_ANNOUNCED = False
 
-# The options of the memory cell, under the names the configs give them, mapped to the
-# VideoMemoryLayer argument each one sets. This is the only list of them outside the cell:
-# the wrapper, the model and the block pass `memory_kwargs` through untouched.
-MEMORY_OPTIONS = {
-    "gate_init": "g_init", "ckpt_write": "checkpoint_write", "gate_extra": "gate_extra",
-    "use_decay": "use_decay", "decay_init": "decay_init", "bounded_gate": "bounded_gate",
-    "single_norm": "single_norm", "bounded_mod": "bounded_mod", "rel_norm": "rel_norm",
-    "dc_remove": "dc_remove", "muon_update_steps": "muon_update_steps",
-    "mem_state_type": "state_type", "mem_linear_beta": "linear_beta",
-}
+# The options of the memory cell are the arguments of VideoMemoryLayer, documented there; the
+# wrapper, the model and the block pass `memory_kwargs` through untouched. Four have another
+# name in the configs.
+CONFIG_NAMES = {"gate_init": "g_init", "ckpt_write": "checkpoint_write",
+                "mem_state_type": "state_type", "mem_linear_beta": "linear_beta"}
 
 
 def memory_cell_args(memory_kwargs):
     """Config-named memory options -> VideoMemoryLayer arguments. An unknown name is an error:
     a misspelt option would otherwise leave the cell on its default with nothing said."""
-    memory_kwargs = dict(memory_kwargs or {})
-    unknown = sorted(set(memory_kwargs) - set(MEMORY_OPTIONS))
-    if unknown:
-        raise TypeError(f"unknown memory option(s) {unknown}, expected among {sorted(MEMORY_OPTIONS)}")
     # a block's gate opens at 0.1 unless told otherwise; the bare cell defaults to 0.0
     args = {"g_init": 0.1}
-    args.update({MEMORY_OPTIONS[k]: v for k, v in memory_kwargs.items()})
+    args.update({CONFIG_NAMES.get(k, k): v for k, v in dict(memory_kwargs or {}).items()})
+    # every argument of the cell but the ones the block sets itself
+    known = set(inspect.signature(VideoMemoryLayer.__init__).parameters) - {"self", "dim", "num_heads", "inter_multi"}
+    if set(args) - known:
+        raise TypeError(f"unknown memory option(s) {sorted(set(args) - known)}, expected among "
+                        f"{sorted((known - set(CONFIG_NAMES.values())) | set(CONFIG_NAMES))}")
     return args
-
 
 
 def _reject_parallel(mem_out, x):

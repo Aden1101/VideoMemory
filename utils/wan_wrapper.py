@@ -222,7 +222,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             **memory_kwargs
     ):
         """`memory_kwargs` collects every other key of the config's `model_kwargs`: the options
-        of the memory cell, listed and checked in wan.modules.memory_inject.MEMORY_OPTIONS."""
+        of the memory cell, checked by wan.modules.memory_inject.memory_cell_args."""
         super().__init__()
         # 修改为模型路径，方便修改
         if is_causal:
