@@ -57,14 +57,16 @@ def test_set_values():
 def test_the_registry_lists_exactly_what_the_source_reads():
     files = subprocess.check_output(["git", "ls-files", "*.py"], cwd=ROOT).decode().split()
     read = set()
-    pattern = re.compile(r"""(?:env_int|env_float|env_str|env_on|environ\.get|environ\.pop|environ)[(\[]\s*["']([A-Z][A-Z_0-9]*)["']""")
+    readers = r"(?:env_int|env_float|env_str|env_on|environ\.get|environ\.pop|environ)"
+    pattern = re.compile(readers + r"""[(\[]\s*["']([A-Z][A-Z_0-9]*)["']""")
     for f in files:
         if f.startswith("tests/"):
             continue
         read |= {n for n in pattern.findall(open(os.path.join(ROOT, f)).read())
                  if n.startswith(env._ARM_PREFIXES)}
-    assert read == set(env.ARM_VARIABLES), (sorted(read - env.ARM_VARIABLES),
-                                            sorted(env.ARM_VARIABLES - read))
+    listed = set(env.ARM_VARIABLES)
+    assert read == listed, (sorted(read - listed), sorted(listed - read))
+    assert all(what.strip() for what in env.ARM_VARIABLES.values())
 
 
 def test_a_misspelt_arm_is_refused():

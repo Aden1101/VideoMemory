@@ -25,6 +25,11 @@ measured numbers and never from a hand-copied table.
 """
 import os
 import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from results_index import ARMS, ROOT, read_table  # noqa: E402
 
 # Panels are numbered and titled by what changed between runs; the directory on the left holds
 # that run's measurements, and configs/runs/ holds the config it was trained with.
@@ -50,28 +55,18 @@ INK, INK2, MUTED, LINE = "#0b0b0b", "#52514e", "#8a8880", "#dedad3"
 def load(run):
     """[(step, identity per arm, dynamic degree per arm), ...] of one run, by step."""
     out = {}
-    base = os.path.join("results", run)
+    base = os.path.join(ROOT, "results", run)
+    # One point per step. Run 2 has step 500 at both sink settings; directories are visited in
+    # sorted order, so eval500_sink1 replaces eval500 and the line stays at sink 1 throughout.
     for d in sorted(os.listdir(base)):
         m = KEEP.match(d)
-        if not m:
-            continue
         path = os.path.join(base, d, "metrics.txt")
-        if not os.path.exists(path):
+        if not m or not os.path.exists(path):
             continue
-        t = open(path).read()
-        ident, dd = {}, {}
-        for line in t.split("\n"):
-            g = re.match(r"^(memon|memzero|stock)\s+\d+\s+[\d.]+\s+[\d.]+\s+\S+\s+([\d.]+)", line)
-            if g:
-                ident[g.group(1)] = float(g.group(2))
-            g = re.match(r"^DD\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", line)
-            if g:
-                dd = dict(zip(("memon", "memzero", "stock"), map(float, g.groups())))
-        if ident and dd:
-            # One point per step. Run 2 has step 500 at both sink settings; directories are
-            # visited in sorted order, so eval500_sink1 replaces eval500 and the line stays
-            # at sink 1 throughout.
-            out[int(m.group(1))] = (ident, dd)
+        table = read_table(path)
+        ident = {arm: table["summaries"][arm]["id_cos"] for arm in ARMS}
+        dd = {arm: table["vb"][arm]["DD"] for arm in ARMS}
+        out[int(m.group(1))] = (ident, dd)
     return [(s, *out[s]) for s in sorted(out)]
 
 
@@ -85,7 +80,7 @@ def identity_gaps(runs):
     return [ident["memon"] - ident["memzero"] for pts in runs.values() for _, ident, _ in pts]
 
 
-def draw(runs, path="assets/motion_identity.png"):
+def draw(runs, path=os.path.join(ROOT, "assets", "motion_identity.png")):
     """Two rows, identity then motion, one column per run; the title is computed from `runs`."""
     import matplotlib
     matplotlib.use("Agg")

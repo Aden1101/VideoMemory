@@ -107,25 +107,27 @@ of A's first appearance, real or decoded from the memory state. Controls matter 
 taken from a different video helps as much as the right one, which is how the apparent gain
 turned out never to have been content-driven.
 
-The open lead in numbers: median 13.5/19 for the delta rule against 7.0 for the deployed one,
-over 10 seeds, with a background control at chance. The score counts, out of 19 video pairs with a clearly distinct subject, how
-many the state tells apart in a two-way choice, so chance is 9.5; it is read offline from
-replayed states (`write_only` and `replay_writes` in `wan/modules/video_memory.py` are that
-replay's interface). The two distributions barely overlap (11 to 16 against 6 to 10), but the
-delta rule's median sits just under the 14/19 a single seed needs to be significant. The probe
-scripts ran on the training cluster and are not in this repository, so these numbers cannot be
-reproduced from here.
+The open lead in numbers: median 13.5/19 for the delta rule against 7.0 for the deployed one, over
+10 seeds, with a background control at chance. The score counts, out of 19 video pairs with a
+clearly distinct subject, how many the state tells apart in a two-way choice, so chance is 9.5; it
+is read offline from replayed states (`write_only` and `replay_writes` in
+`wan/modules/video_memory.py` are that replay's interface). The two distributions barely overlap (11
+to 16 against 6 to 10), but the delta rule's median sits just under the 14/19 a single seed needs to
+be significant. The probe scripts ran on the training cluster and are not in this repository, so
+these numbers cannot be reproduced from here.
 
 ## Running it
 
 Without a GPU and without weights, the checks that need no torch run in seconds:
 
 ```bash
-pip install pytest
-python -m pytest tests/                # with torch installed this runs everything, none of it needs weights
+pip install -r requirements-dev.txt
+python -m pytest                       # without torch, the four files below; with it, all of tests/
 python tests/test_env_and_schedule.py  # arm switches and prompt schedule
 python tests/test_imports.py           # every module imports, heavy packages stubbed
 python tests/test_eval_report.py       # the scoring script writes the 29 published tables again
+python tests/test_readme_claims.py     # the numbers and the config claims of this README
+python -m utils.env                    # the 57 switches of the measurement arms, one line each
 ```
 
 With torch, `tests/test_memory_cell.py` checks what this README says of the cell through the code

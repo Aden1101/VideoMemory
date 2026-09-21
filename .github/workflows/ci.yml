@@ -1,0 +1,19 @@
+# The checks that need neither torch nor weights: arm switches, prompt schedule, imports with
+# the heavy packages stubbed, the scoring script against the published tables, and the claims
+# of the README. The tests that need torch are left out by tests/conftest.py.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  torch-free:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: python -m pytest -q

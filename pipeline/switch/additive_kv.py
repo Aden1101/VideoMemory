@@ -1,8 +1,6 @@
 """Adding the anchor to the attention context instead of evicting a true frame for it."""
 import os
 
-import torch
-
 from pipeline.switch.memory_state import _find_causal_model
 from utils.env import env_float
 

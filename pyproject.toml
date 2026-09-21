@@ -1,0 +1,19 @@
+# Tooling only: the project is run from its root, not installed.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# Lint what this work added. Upstream's files are left as they were imported, so that
+# `git diff 392b3f8` on them keeps showing call sites and nothing else.
+[tool.ruff]
+line-length = 120
+include = [
+    "wan/modules/video_memory.py", "wan/modules/memory_inject.py",
+    "wan/modules/additive_attention.py", "wan/modules/anchor_decoder.py",
+    "model/twin_objective.py", "trainer/memory_training.py", "pipeline/memory_rollout.py",
+    "pipeline/switch/*.py", "utils/env.py", "utils/device.py", "utils/prompt_cache.py",
+    "utils/video_io.py", "scripts/*.py", "tests/*.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E731", "E741"]      # small lambdas and the l/I/O names of the maths are deliberate
