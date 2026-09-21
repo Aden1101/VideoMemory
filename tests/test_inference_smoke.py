@@ -4,8 +4,10 @@ with its read pass and its write pass, as the inference pipeline does. No image 
 this checks that the chain executes, the caches advance and the memory writes. Catches what an
 import test cannot, which is everything that only fails at run time.
 
-    python tests/test_inference_smoke.py            # detected device
-    AF_DEVICE=cpu python tests/test_inference_smoke.py
+    python tests/test_inference_smoke.py            # detected device: a second on CUDA or Metal
+
+On CPU (AF_DEVICE=cpu) it takes many minutes: the memory write orthogonalises 6144 x 1536
+matrices in bfloat16, which a CPU has no fast kernel for.
 """
 import os
 import sys

@@ -27,7 +27,6 @@ import sys
 
 import torch
 import torch.nn.functional as F
-from torchvision.io import read_video
 
 # ----------------------------- PRE-REGISTERED THRESHOLDS -----------------------------
 NOISE_FLOOR = 0.18       # DINO cosine-distance: delta(memon,memzero) below this => memory made ~no difference
@@ -82,7 +81,8 @@ def load_video(path, device, small_hw=(120, 208)):
     """Returns:
        big01   [T,3,H,W] float in [0,1] on `device` (native res, for DINO),
        small01 [T,3,h,w] float16 in [0,1] on CPU (downsampled, for pixel metrics / pairing)."""
-    v, _, _ = read_video(path, pts_unit="sec", output_format="THWC")  # [T,H,W,3] uint8
+    from torchvision.io import read_video       # torchvision < 0.24; imported here so that the
+    v, _, _ = read_video(path, pts_unit="sec", output_format="THWC")  # report code loads anywhere
     big = v.permute(0, 3, 1, 2).contiguous().to(device).float().div_(255.0)  # [T,3,H,W]
     small = F.interpolate(big, size=small_hw, mode="bilinear", align_corners=False).half().cpu()
     return big, small
