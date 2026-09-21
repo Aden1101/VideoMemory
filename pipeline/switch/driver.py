@@ -3,7 +3,7 @@ and at each switch rebuild the attention context, feeding a past subject back in
 segment is a revisit. Which arm feeds it back is chosen by the environment; each arm lives in
 its own module of this package.
 
-Mixed into SwitchCausalInferencePipeline, next to upstream's single-switch inference().
+Mixed into SwitchCausalInferencePipeline, whose `inference()` is the two-switch case of it.
 """
 import json
 import os
@@ -152,21 +152,16 @@ class ScheduleDriverMixin:
                         cond_prev=None):
         """Cache surgery at one schedule boundary.
 
-        is_revisit=False -> plain switch: no recall hook fires and, with FRAMEBANK
-        off, the call is byte-identical to the first switch of `inference()`.
-        is_revisit=True  -> the entering prompt has been seen before: the recall hooks fire.
+        is_revisit=False -> plain switch: no recall hook fires and, with FRAMEBANK off, this is
+        upstream's recache under the new prompt.
+        is_revisit=True  -> the entering subject has been seen before: the recall hooks fire.
         `a_end` = end latent frame (exclusive) of the segment where the entering subject first
-        appeared, i.e. the anchor frame is `a_end - 1`. In the fixed A->B->A rollout of `inference()` that is
-        `self._first_switch_frame`, so this is a strict generalization of the block in
-        `inference()` (same statements, same order, same tensors).
+        appeared, i.e. the anchor frame is `a_end - 1`.
 
         Note on FRAMEBANK: its router runs at every transition, revisit or not, Echo-Forcing
         is never told which switch is a revisit, so a false recall on a fresh scene
         is a real failure mode of the baseline and must be measurable, not hidden.
         """
-        assert not env_int("MEM_DECODE_THRU"), \
-            "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
-            "eviction arithmetic assumes the single anchor of the A->B->A rollout, run it through inference()"
         window = None
         timesteps = None                  # MEM_ANCHOR_T: per-slot declared timestep of the recache
         composites_before = self._comp_applied
@@ -259,7 +254,10 @@ class ScheduleDriverMixin:
         come before the sharpening, so sharpening a wrong anchor is the exact twin of
         sharpening the right one; the composite comes last, so it applies to whatever they left."""
         n = self._window_frames(current_start_frame)
-        frame, cond_on = self._memdec_frame(ckpt, cond_new, output.dtype, output.device)
+        if env_int("MEM_DECODE_THRU"):
+            frame, cond_on = self._early_decoded_frame(), "thru"
+        else:
+            frame, cond_on = self._memdec_frame(ckpt, cond_new, output.dtype, output.device)
         kslots = max(1, env_int("MEM_DECODE_SLOTS", 1))
         dump = env_str("MEM_DECODE_DUMP")
         if dump:
@@ -279,7 +277,7 @@ class ScheduleDriverMixin:
                                                              current_start_frame)
         log(f"[MEM_DECODE] decoded anchor spliced ({kslots}/{n} slots, window convention "
             f"{'recency duplicated' if offset < 0 else f'slot_offset={offset}'}"
-            f"), cond={'ON' if cond_on else 'off'}")
+            f"), cond={cond_on if cond_on == 'thru' else ('ON' if cond_on else 'off')}")
         return window, timesteps
 
     def _report_attention_mass(self):
@@ -367,26 +365,27 @@ class ScheduleDriverMixin:
                    conditioning differs but the subject (hence the re-ID reference and the
                    frame-bank ceiling) is the same, and the router has a real matching job.
 
-        Equivalence with `inference()`: schedule [(0, 0), (sw1, 1), (sw2, 0)] with prompts [A, B] reproduces
-        `inference(noise, text_prompts_first=[A], text_prompts_second=[B], switch_frame_index=sw1,
-        second_switch_frame_index=sw2)` exactly. The text encoder is called once per
-        schedule entry, in schedule order, which is the call sequence of `inference()` (A, B, A).
+        A prompt is a string, or a list of strings aligned with the batch. The text encoder is
+        called once per schedule entry, in schedule order.
         """
         num_output_frames = noise.shape[1]
         assert num_output_frames % self.num_frame_per_block == 0
-        assert not env_int("MEM_DECODE_THRU"), \
-            "MEM_DECODE_THRU is not supported by the N-switch driver: its " \
-            "eviction arithmetic assumes the single anchor of the A->B->A rollout, run it through inference()"
         plan = parse_schedule(schedule, len(prompts), subjects, num_output_frames,
                               self.num_frame_per_block)
         for line in plan.describe(prompts):
             log(f"[schedule] {line}")
-        # one text-encoder call per schedule entry, in schedule order, as `inference()` does
-        conds = [self.text_encoder(text_prompts=[prompts[p]]) for p in plan.prompt]
+        conds = [self.text_encoder(text_prompts=[prompts[p]] if isinstance(prompts[p], str)
+                                   else list(prompts[p])) for p in plan.prompt]
         starts = [start for start, _ in plan.schedule]
+        # MEM_DECODE_THRU decodes the anchor when its chunk leaves the window, so it has to know
+        # the anchor from the start: the one of the only revisit
+        revisits = [i for i, revisit in enumerate(plan.is_revisit) if revisit]
+        assert not env_int("MEM_DECODE_THRU") or len(revisits) == 1, \
+            f"MEM_DECODE_THRU follows a single anchor: the schedule needs one revisit, got {len(revisits)}"
+        early = revisits[0] if len(revisits) == 1 else None
 
-        output = self._begin_rollout(noise, low_memory,
-                                     first_switch_frame=starts[1] if len(starts) > 1 else None)
+        output = self._begin_rollout(
+            noise, low_memory, first_switch_frame=None if early is None else plan.anchor_end(early))
         seg = 0
         for current_start_frame in range(0, num_output_frames, self.num_frame_per_block):
             if seg + 1 < len(starts) and current_start_frame >= starts[seg + 1]:
@@ -394,6 +393,8 @@ class ScheduleDriverMixin:
                 self._enter_segment(plan, conds, seg, output, current_start_frame)
             self._denoise_chunk(noise, output, conds[seg], current_start_frame,
                                 num_input_frames=0, current_num_frames=self.num_frame_per_block)
+            if early is not None:
+                self._thru_maybe_decode(current_start_frame, conds[early], output.dtype, output.device)
             self._trace_attention_mass(current_start_frame, seg)
 
         self._report_attention_mass()

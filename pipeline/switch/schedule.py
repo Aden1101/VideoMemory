@@ -41,8 +41,9 @@ class Schedule:
         for i, (start, p) in enumerate(self.schedule):
             revisit = (f"  REVISIT of seg{self.first_appearance[self.subject[i]]}"
                        if self.is_revisit[i] else "")
+            text = prompts[p] if isinstance(prompts[p], str) else prompts[p][0]    # or one per sample
             lines.append(f"  seg{i}: frames [{start}, {self.end[i]})  prompt{p} "
-                         f"subject{self.subject[i]}{revisit}  '{prompts[p][:60]}'")
+                         f"subject{self.subject[i]}{revisit}  '{text[:60]}'")
         return lines
 
 
@@ -74,3 +75,25 @@ def parse_schedule(schedule: Sequence, num_prompts: int, subjects: Optional[Sequ
         first_appearance.setdefault(s, i)
     is_revisit = [first_appearance[s] < i for i, s in enumerate(subject)]
     return Schedule(schedule, prompt, subject, end, first_appearance, is_revisit)
+
+
+def two_switch_schedule(switch_frame: int, return_frame: Optional[int], own_return_prompt: bool,
+                        num_frames: int, frames_per_block: int):
+    """(schedule, subjects) of the fixed rollout A -> B, or A -> B -> A when `return_frame` is
+    given. Prompt 0 is A, 1 is B, and 2 the return prompt when it has a wording of its own;
+    either way the return shows A's subject. A switch is taken at the first block that starts
+    at or after its frame, one switch per block at most, so a switch past the last block never
+    happens and a switch at frame 0 leaves A no segment."""
+    assert return_frame is None or return_frame > switch_frame, \
+        "the return must come after the first switch"
+    stages = [(0, 0), (1, 1), (2 if own_return_prompt else 0, 0)]       # (prompt, subject)
+    stage, schedule, subjects = 0, [], []
+    for start in range(0, num_frames, frames_per_block):
+        if stage == 1 and return_frame is not None and start >= return_frame:
+            stage = 2
+        elif stage == 0 and start >= switch_frame:
+            stage = 1
+        if not schedule or schedule[-1][1] != stages[stage][0] or subjects[-1] != stages[stage][1]:
+            schedule.append((start, stages[stage][0]))
+            subjects.append(stages[stage][1])
+    return schedule, subjects

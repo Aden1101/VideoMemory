@@ -152,6 +152,20 @@ def test_invalid_schedules_are_refused():
         raise AssertionError(f"accepted {bad} with subjects {subjects}")
 
 
+def test_the_fixed_rollout_as_a_schedule():
+    two = schedule.two_switch_schedule
+    assert two(21, None, False, 63, 3) == ([(0, 0), (21, 1)], [0, 1])
+    assert two(21, 42, False, 63, 3) == ([(0, 0), (21, 1), (42, 0)], [0, 1, 0])
+    assert two(21, 42, True, 63, 3) == ([(0, 0), (21, 1), (42, 2)], [0, 1, 0])     # a paraphrase
+    assert two(20, 40, False, 63, 3) == ([(0, 0), (21, 1), (42, 0)], [0, 1, 0])    # next block
+    assert two(99, None, False, 63, 3) == ([(0, 0)], [0])                          # never happens
+    assert two(0, None, False, 63, 3) == ([(0, 1)], [1])                           # B from the start
+    assert two(19, 20, False, 63, 3) == ([(0, 0), (21, 1), (24, 0)], [0, 1, 0])    # one switch per block
+    for sw, back in ((21, 42), (20, 40), (19, 20), (0, 3)):
+        plan = schedule.parse_schedule(*two(sw, back, False, 63, 3)[:1], 2, two(sw, back, False, 63, 3)[1], 63, 3)
+        assert plan.is_revisit[-1] == (plan.subject[0] == 0 and len(plan.subject) == 3)
+
+
 # ---- the frame bank's selection ------------------------------------------------------------
 def test_the_router_recalls_the_best_match_only_above_its_threshold():
     bank = [{"seg": 0, "subject": 7}, {"seg": 1, "subject": 8}, {"seg": 2, "subject": 7}]

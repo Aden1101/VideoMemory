@@ -128,33 +128,14 @@ class AnchorDecodeMixin:
             f"(write age 1), frame cached for the return splice; "
             f"cond={'ON' if cond_on else 'off'}")
 
-    def _single_anchor_window(self, output, current_start_frame, cond, ckpt):
-        """The recache window of the fixed A -> B -> A rollout: the anchor decoded from the memory
-        now, or under MEM_DECODE_THRU the one decoded when its chunk was evicted, appended after
-        the true recent frames. MEM_DECODE_SLOTS repeats it over the last k slots, which pushes B
-        out of the readable context k times faster."""
-        n = self._window_frames(current_start_frame)
-        if env_int("MEM_DECODE_THRU"):
-            assert self._thru_frame is not None, \
-                "MEM_DECODE_THRU: the anchor chunk was never evicted before the " \
-                "return switch (check switch indices / local_attn_size)"
-            frame, cond_on = self._thru_frame, None
-            log(f"[MEM_DECODE_THRU] splicing the frame decoded at eviction "
-                f"{self._thru_info}")
-        else:
-            frame, cond_on = self._memdec_frame(ckpt, cond, output.dtype, output.device)
-        kslots = max(1, env_int("MEM_DECODE_SLOTS", 1))
-        dump = env_str("MEM_DECODE_DUMP")
-        if dump:
-            torch.save(frame.detach().to("cpu", torch.float16), f"{dump}.f{current_start_frame}.pt")
-            log(f"[MEM_DECODE_DUMP] anchor latent saved -> {dump}.f{current_start_frame}.pt")
-        log(f"[MEM_DECODE] decoded anchor spliced at recency ({kslots}/{n} slots), "
-            f"cond={'thru' if cond_on is None else ('ON' if cond_on else 'off')}")
-        return self._memdec_window(output, current_start_frame, n, frame, kslots, slot_offset=-1)
+    def _early_decoded_frame(self):
+        """The anchor MEM_DECODE_THRU decoded when its chunk was evicted."""
+        assert self._thru_frame is not None, \
+            "MEM_DECODE_THRU: the anchor chunk was never evicted before the return switch " \
+            "(check the switch frames against local_attn_size)"
+        log(f"[MEM_DECODE_THRU] splicing the frame decoded at eviction {self._thru_info}")
+        return self._thru_frame
 
-    # Both drivers build their window here. `inference_schedule()` generalises `inference()`,
-    # and the two are checked to produce bitwise identical latents on the single-switch
-    # schedule, for every arm.
     @staticmethod
     def _memdec_window(output, current_start_frame, n, anchor, kslots, slot_offset):
         """The recache window of n frames carrying the recalled anchor.

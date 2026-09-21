@@ -2,8 +2,7 @@
 
 This is a measurement arm, not a feature: it hands the model the frames that a perfect
 memory would have recovered, so the score it reaches is the ceiling the memory is aiming at.
-Off by default. Both switch drivers (the fixed A->B->A rollout in `inference()` and the
-N-switch `_switch_recache`) build the same window through these three helpers.
+Off by default.
 
     REPLAY_PAST=1          turn the arm on
     REPLAY_PAST_FRAMES=k   only the last k window slots come from the past, the rest stays

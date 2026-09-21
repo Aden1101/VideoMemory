@@ -70,7 +70,7 @@ def _memwriter_restore(cm):
 
 
 def sync_memory_writer(model):
-    """Called once per inference() call, before any write happens. MEM_WRITER empty/unset =>
+    """Called once per rollout, before any write happens. MEM_WRITER empty/unset =>
     no-op (or a restore, if a previous arm of this process had overlaid a writer)."""
     path = env_str("MEM_WRITER")
     cm = find_causal_model(model)
@@ -113,9 +113,7 @@ def sync_memory_writer(model):
 
 class MemoryStateMixin:
     def _reset_memory_slots(self):
-        """Per rollout: the memory state frozen at the first switch (A -> B -> A driver) and the
-        one kept per subject (N-switch driver), both used by MEM_EPISODIC."""
-        self._ttt_snap_A = None
+        """Per rollout: the memory state kept per subject when it is left, for MEM_EPISODIC."""
         self._ttt_snap_by_prompt = {}
 
     def _snapshot_ttt(self):
