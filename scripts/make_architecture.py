@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""README diagrams, one question each.
+"""README diagrams, one question each. What the cell computes is given as equations in the
+README, not drawn.
 
   assets/arch_context.png   what the memory is fed: three consecutive generation steps on one
                             time axis, the window sliding and the chunk it drops going to the memory
   assets/arch_block.png     where the memory sits in a transformer block
-  assets/arch_cell.png      what the cell does: the read and the write around the state W
 
     python scripts/make_architecture.py
 """
@@ -182,57 +182,6 @@ def draw_block():
     c.save("arch_block.png")
 
 
-# ---- 3. what the cell does -------------------------------------------------------------------
-def draw_cell():
-    """Two lanes around the state W. The read, on the current chunk: queries through the fast
-    weights, normalised, gated, injected. The write, on the evicted chunk: one gradient step on an
-    inner score, orthogonalised by Newton-Schulz iterations (Muon), then the columns renormalised:
-    back to their initial norm, or capped at it when the state is allowed to forget (use_decay).
-    The read of a step uses the state from before that step's write."""
-    c = Canvas(16.4, 5.9)
-    read_y, state_y, write_y = 4.55, 2.95, 1.35
-
-    c.text(0.15, read_y + 0.9, "read", size=10, colour=BLUE, weight="bold", ha="left")
-    c.text(0.15, write_y - 0.85, "write", size=10, colour=ORANGE, weight="bold", ha="left")
-
-    # read lane
-    c.module(1.45, read_y, 1.9, 0.78, "current chunk", face=BLUE_F, edge=BLUE)
-    c.arrow((2.4, read_y), (3.35, read_y), colour=BLUE)
-    c.text(2.87, read_y + 0.22, "$q$", size=10.5, colour=BLUE)
-    c.module(4.6, read_y, 2.5, 0.78, "$o = f_W(q)$", face="#ffffff", edge=BLUE, size=10.5)
-    c.arrow((5.85, read_y), (6.75, read_y), colour=BLUE)
-    c.module(7.75, read_y, 2.0, 0.78, "RMS norm", face="#ffffff", edge=BLUE)
-    c.arrow((8.75, read_y), (9.65, read_y), colour=BLUE)
-    c.module(10.95, read_y, 2.6, 0.78, r"bounded gate $\odot$ AdaLN", face="#ffffff", edge=BLUE)
-    c.arrow((12.25, read_y), (13.35, read_y), colour=BLUE)
-    c.text(13.45, read_y, "added to the\nresidual stream", size=8.8, colour=BLUE, ha="left")
-
-    # the state, shared by the two lanes
-    c.module(4.6, state_y, 3.2, 0.95, "state $W = (w_0, w_1, w_2)$\na SwiGLU MLP, per block",
-             face=BLUE_F, edge=BLUE, lw=1.3, size=9.2)
-    c.arrow((4.6, state_y + 0.48), (4.6, read_y - 0.39), colour=BLUE)
-    c.text(4.75, (state_y + read_y) / 2 + 0.05, "before\nthis write", size=8.2, colour=MUTED, ha="left")
-
-    # write lane
-    c.module(1.45, write_y, 1.9, 0.78, "evicted chunk", face=ORANGE_F, edge=ORANGE)
-    c.arrow((2.4, write_y), (3.35, write_y), colour=ORANGE)
-    c.text(2.87, write_y + 0.22, "$k, v$", size=10.5, colour=ORANGE)
-    c.module(4.6, write_y, 2.5, 0.78, r"$\nabla_W \langle f_W(k),\, v \rangle$", face="#ffffff",
-             edge=ORANGE, size=10.5)
-    c.arrow((5.85, write_y), (6.75, write_y), colour=ORANGE)
-    c.module(7.75, write_y, 2.0, 0.78, "Muon", face="#ffffff", edge=ORANGE)
-    c.text(7.75, write_y - 0.62, "Newton-Schulz, 5 iterations", size=8.2, colour=MUTED)
-    c.arrow((8.75, write_y), (9.65, write_y), colour=ORANGE)
-    c.module(10.95, write_y, 2.6, 0.78, "renormalise\nthe columns", face="#ffffff",
-             edge=ORANGE, size=9)
-    c.arrow((12.25, write_y), (13.0, write_y), (13.0, state_y), (6.2, state_y), colour=ORANGE)
-    c.text(13.15, (write_y + state_y) / 2, "the new state:\ncolumn norms never\nexceed their initial value",
-           size=8.8, colour=ORANGE, ha="left")
-    c.arrow((4.6, state_y - 0.48), (4.6, write_y + 0.39), colour=ORANGE)
-    c.save("arch_cell.png")
-
-
 if __name__ == "__main__":
     draw_context()
     draw_block()
-    draw_cell()

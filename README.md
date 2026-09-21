@@ -31,9 +31,23 @@ output to the residual stream; its state lives outside the block and is carried 
 
 ![the transformer block with the memory branch between self-attention and cross-attention](assets/arch_block.png)
 
-What the cell does. The read of a step uses the state from before that step's write.
+What the cell does, for the chunk generated at step $t$: $q$ comes from that chunk, $k$ and
+$v$ from the tokens of the chunk that has just left the window, and $`W = (w_0, w_1, w_2)`$.
 
-![the read and the write around the state W](assets/arch_cell.png)
+```math
+\begin{aligned}
+\textbf{read}\quad & o_t = f_{W_{t-1}}(q_t), \qquad f_W(x) = \big(\mathrm{SiLU}(x\,w_0)\odot x\,w_2\big)\,w_1 \\
+\textbf{write}\quad & G = \nabla_W \sum_i \eta_i\,\langle f_W(k_i),\, v_i\rangle \\
+& \widetilde{W} = W_{t-1} + \mathrm{Muon}(G) \\
+& W_t[:,j] = \widetilde{W}[:,j]\,\frac{\lVert W_0[:,j]\rVert}{\lVert \widetilde{W}[:,j]\rVert} \\
+\textbf{inject}\quad & x \leftarrow x + g(x)\odot \mathrm{AdaLN}\big(\mathrm{norm}(o_t)\big)
+\end{aligned}
+```
+
+The read uses the state from before this step's write. $`\eta_i`$ is a learning rate per token
+and per matrix, predicted from the token; Muon is five Newton-Schulz iterations; $g$ is the
+bounded gate. With `use_decay` the state is first scaled by a learned forget gate, and the last
+line caps each column at its initial norm instead of restoring it.
 
 Three points are not obvious from the code:
 
