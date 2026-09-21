@@ -26,11 +26,6 @@ measured numbers and never from a hand-copied table.
 import os
 import re
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-
 # Panels are numbered and titled by what changed between runs; the directory on the left holds
 # that run's measurements, and configs/runs/ holds the config it was trained with.
 #
@@ -53,6 +48,7 @@ INK, INK2, MUTED, LINE = "#0b0b0b", "#52514e", "#8a8880", "#dedad3"
 
 
 def load(run):
+    """[(step, identity per arm, dynamic degree per arm), ...] of one run, by step."""
     out = {}
     base = os.path.join("results", run)
     for d in sorted(os.listdir(base)):
@@ -79,84 +75,109 @@ def load(run):
     return [(s, *out[s]) for s in sorted(out)]
 
 
-fig, axes = plt.subplots(2, 4, figsize=(11.6, 6.0), dpi=200, sharey="row")
-fig.patch.set_facecolor("#ffffff")
-
 ROWS = [(1, "identity kept\n(DINO, first vs last frame)"),      # index into (step, ident, dd)
         (2, "motion\n(VBench dynamic degree)")]
 
-ALL = {run: load(run) for run, _ in RUNS}
-# The headline is the arm-against-arm gap, the one comparison that holds in every panel.
-gaps = [i["memon"] - i["memzero"] for pts in ALL.values() for _, i, _ in pts]
-n_lower = sum(g < 0 for g in gaps)
 
-for col, (run, label) in enumerate(RUNS):
-    pts = ALL[run]
-    steps = [p[0] for p in pts]
-    for row, (idx, ylab) in enumerate(ROWS):
-        ax = axes[row][col]
-        ax.set_facecolor("#ffffff")
-        ax.axhline(pts[0][idx]["stock"], color=C["stock"], ls=(0, (5, 3)), lw=1.5, zorder=2)
-        for arm in ("memzero", "memon"):
-            ys = [p[idx][arm] for p in pts]
-            ax.plot(steps, ys, "-o", color=C[arm], lw=1.8, ms=5.5,
-                    markerfacecolor=C[arm], markeredgecolor="#ffffff", markeredgewidth=1.0,
-                    zorder=3)
-        ax.set_xticks(steps)
-        ax.set_xticklabels([str(v) for v in steps], fontsize=8.5)
-        ax.set_xlim(steps[0] - (steps[-1] - steps[0]) * .12,
-                    steps[-1] + (steps[-1] - steps[0]) * .12)
-        ax.grid(True, axis="y", color=LINE, lw=.7, alpha=.9)
-        ax.set_axisbelow(True)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        for side in ("left", "bottom"):
-            ax.spines[side].set_color(LINE)
-        ax.tick_params(colors=MUTED, labelsize=8.5, length=0)
-        if col == 0:
-            ax.set_ylabel(ylab, fontsize=9.5, color=INK2, labelpad=8)
-    axes[0][col].set_title(label, fontsize=10.5, color=INK, fontweight="bold",
-                           loc="left", pad=22, linespacing=1.35)
-    note = (f"arms at sink {ARM_SINK[run]}" if ARM_SINK[run] == 3
-            else f"arms at sink {ARM_SINK[run]}, reference at sink 3")
-    axes[0][col].text(0.0, 1.035, note, transform=axes[0][col].transAxes,
-                      fontsize=8.5, color=MUTED, ha="left", va="bottom")
+def identity_gaps(runs):
+    """memory active minus memory zeroed, on identity, at every checkpoint of every run: the
+    one comparison that holds in every panel, both arms sharing checkpoint, seed and sink."""
+    return [ident["memon"] - ident["memzero"] for pts in runs.values() for _, ident, _ in pts]
 
-axes[0][0].set_ylim(0.20, 0.85)
-axes[1][0].set_ylim(-0.05, 1.10)
-fig.suptitle(f"Memory on scores lower identity than memory off at {n_lower} of {len(gaps)} "
-             f"checkpoints (mean gap {sum(gaps) / len(gaps):+.2f})",
-             fontsize=14, color=INK, fontweight="bold", x=0.012, ha="left", y=0.975)
-fig.text(0.5, 0.055, "training step", fontsize=10, color=INK2, ha="center")
-fig.legend(handles=[
-    Line2D([], [], marker="o", color=C["memon"], markerfacecolor=C["memon"],
-           markeredgecolor="#ffffff", markersize=6, lw=1.8, label="memory active"),
-    Line2D([], [], marker="o", color=C["memzero"], markerfacecolor=C["memzero"],
-           markeredgecolor="#ffffff", markersize=6, lw=1.8, label="memory zeroed"),
-    Line2D([], [], color=C["stock"], ls=(0, (5, 3)), lw=1.5,
-           label="unmodified model (sink 3)")],
-    loc="lower center", ncol=3, frameon=False, fontsize=10, labelcolor=INK2,
-    handletextpad=.7, columnspacing=3.0, bbox_to_anchor=(0.5, -0.005))
 
-fig.tight_layout(rect=[0.005, 0.085, 1, 0.925])
-fig.savefig("assets/motion_identity.png", facecolor="#ffffff", bbox_inches="tight")
+def draw(runs, path="assets/motion_identity.png"):
+    """Two rows, identity then motion, one column per run; the title is computed from `runs`."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
-# The README also says no arm matches its reference on both metrics at once, so check it.
-# Single-metric wins exist and are visible: run 1's memory-zeroed arm ends above its identity
-# line, with a third fewer clips rated dynamic. For runs 2 to 4 this check is lenient on
-# identity, since the arms are at sink 1 and the reference at sink 3, and nearly unfalsifiable
-# on motion for runs 1 to 3, whose reference sits at the 0.99 ceiling.
-beaten = []
-for run, _ in RUNS:
-    pts = ALL[run]
-    sx, sy = pts[0][2]["stock"], pts[0][1]["stock"]
-    for step, i, d in pts:
-        for arm in ("memon", "memzero"):
-            if d[arm] >= sx and i[arm] >= sy:
-                beaten.append((run, step, arm))
-    print(f"{run:14} {len(pts)} checkpoints : {[s for s, _, _ in pts]}  "
-          f"reference ({sx:.3f}, {sy:.3f})")
-assert not beaten, f"these points match or beat their reference on both metrics: {beaten}"
-print(f"\nno arm is at or above its own reference on both metrics; "
-      f"memon < memzero on identity at {n_lower}/{len(gaps)} checkpoints, "
-      f"mean gap {sum(gaps) / len(gaps):+.4f}")
+    gaps = identity_gaps(runs)
+    n_lower = sum(g < 0 for g in gaps)
+    fig, axes = plt.subplots(2, 4, figsize=(11.6, 6.0), dpi=200, sharey="row")
+    fig.patch.set_facecolor("#ffffff")
+
+    for col, (run, label) in enumerate(RUNS):
+        pts = runs[run]
+        steps = [p[0] for p in pts]
+        for row, (idx, ylab) in enumerate(ROWS):
+            ax = axes[row][col]
+            ax.set_facecolor("#ffffff")
+            ax.axhline(pts[0][idx]["stock"], color=C["stock"], ls=(0, (5, 3)), lw=1.5, zorder=2)
+            for arm in ("memzero", "memon"):
+                ys = [p[idx][arm] for p in pts]
+                ax.plot(steps, ys, "-o", color=C[arm], lw=1.8, ms=5.5,
+                        markerfacecolor=C[arm], markeredgecolor="#ffffff", markeredgewidth=1.0,
+                        zorder=3)
+            ax.set_xticks(steps)
+            ax.set_xticklabels([str(v) for v in steps], fontsize=8.5)
+            ax.set_xlim(steps[0] - (steps[-1] - steps[0]) * .12,
+                        steps[-1] + (steps[-1] - steps[0]) * .12)
+            ax.grid(True, axis="y", color=LINE, lw=.7, alpha=.9)
+            ax.set_axisbelow(True)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            for side in ("left", "bottom"):
+                ax.spines[side].set_color(LINE)
+            ax.tick_params(colors=MUTED, labelsize=8.5, length=0)
+            if col == 0:
+                ax.set_ylabel(ylab, fontsize=9.5, color=INK2, labelpad=8)
+        axes[0][col].set_title(label, fontsize=10.5, color=INK, fontweight="bold",
+                               loc="left", pad=22, linespacing=1.35)
+        note = (f"arms at sink {ARM_SINK[run]}" if ARM_SINK[run] == 3
+                else f"arms at sink {ARM_SINK[run]}, reference at sink 3")
+        axes[0][col].text(0.0, 1.035, note, transform=axes[0][col].transAxes,
+                          fontsize=8.5, color=MUTED, ha="left", va="bottom")
+
+    axes[0][0].set_ylim(0.20, 0.85)
+    axes[1][0].set_ylim(-0.05, 1.10)
+    fig.suptitle(f"Memory on scores lower identity than memory off at {n_lower} of {len(gaps)} "
+                 f"checkpoints (mean gap {sum(gaps) / len(gaps):+.2f})",
+                 fontsize=14, color=INK, fontweight="bold", x=0.012, ha="left", y=0.975)
+    fig.text(0.5, 0.055, "training step", fontsize=10, color=INK2, ha="center")
+    fig.legend(handles=[
+        Line2D([], [], marker="o", color=C["memon"], markerfacecolor=C["memon"],
+               markeredgecolor="#ffffff", markersize=6, lw=1.8, label="memory active"),
+        Line2D([], [], marker="o", color=C["memzero"], markerfacecolor=C["memzero"],
+               markeredgecolor="#ffffff", markersize=6, lw=1.8, label="memory zeroed"),
+        Line2D([], [], color=C["stock"], ls=(0, (5, 3)), lw=1.5,
+               label="unmodified model (sink 3)")],
+        loc="lower center", ncol=3, frameon=False, fontsize=10, labelcolor=INK2,
+        handletextpad=.7, columnspacing=3.0, bbox_to_anchor=(0.5, -0.005))
+
+    fig.tight_layout(rect=[0.005, 0.085, 1, 0.925])
+    fig.savefig(path, facecolor="#ffffff", bbox_inches="tight")
+
+
+def check_claims(runs):
+    """The README says no arm matches its reference on both metrics at once, so check it.
+    Single-metric wins exist and are visible: run 1's memory-zeroed arm ends above its identity
+    line, with a third fewer clips rated dynamic. For runs 2 to 4 the check is lenient on
+    identity, since the arms are at sink 1 and the reference at sink 3, and nearly unfalsifiable
+    on motion for runs 1 to 3, whose reference sits at the 0.99 ceiling."""
+    gaps = identity_gaps(runs)
+    n_lower = sum(g < 0 for g in gaps)
+    beaten = []
+    for run, _ in RUNS:
+        pts = runs[run]
+        sx, sy = pts[0][2]["stock"], pts[0][1]["stock"]
+        for step, i, d in pts:
+            for arm in ("memon", "memzero"):
+                if d[arm] >= sx and i[arm] >= sy:
+                    beaten.append((run, step, arm))
+        print(f"{run:14} {len(pts)} checkpoints : {[s for s, _, _ in pts]}  "
+              f"reference ({sx:.3f}, {sy:.3f})")
+    assert not beaten, f"these points match or beat their reference on both metrics: {beaten}"
+    print(f"\nno arm is at or above its own reference on both metrics; "
+          f"memon < memzero on identity at {n_lower}/{len(gaps)} checkpoints, "
+          f"mean gap {sum(gaps) / len(gaps):+.4f}")
+
+
+def main():
+    runs = {run: load(run) for run, _ in RUNS}
+    check_claims(runs)
+    draw(runs)
+
+
+if __name__ == "__main__":
+    main()

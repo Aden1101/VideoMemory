@@ -13,7 +13,7 @@
 #           lag2 ~0 AND lag1 >>0 -> FLICKER (motion is period-2 phase-swap, not real motion)
 #       optional Farneback optical-flow magnitude (--optical_flow), same freeze signal, cross-check.
 #   (b) DINO first->last identity retention = cos(DINO(frame_0), DINO(frame_last)) + the full
-#       drift curve cos(DINO(f0), DINO(ft)).  DINOv2-vitb14 loaded exactly like model/streaming_training.py.
+#       drift curve cos(DINO(f0), DINO(ft)).  DINOv2-vitb14 loaded exactly like model/twin_objective.py.
 #   (c) PAIRED delta(memon, memzero): per-frame DINO cosine-distance AND pixel-L2 between the two
 #       arms on the SAME seed/prompt (identical noise -> the only difference is the memory injection),
 #       compared to the 0.18 noise floor.  Also delta(memzero, AF-stock) = pure LoRA co-train drift.
@@ -25,6 +25,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 
@@ -42,9 +43,10 @@ DINO_MEAN = (0.485, 0.456, 0.406)
 DINO_STD = (0.229, 0.224, 0.225)
 
 VB_DIMS = {"subject_consistency": "SC", "background_consistency": "BC", "dynamic_degree": "DD"}
+ARMS = ("memon", "memzero", "stock")
 
 
-# ----------------------------- DINO (matches model/streaming_training.py:832-858) -----------------------------
+# ----------------------------- DINO (matches _get_dino in model/twin_objective.py) -----------------------------
 _DINO = None
 
 
@@ -111,13 +113,12 @@ def optical_flow_mag(small01):
     return float(sum(mags) / len(mags)) if mags else 0.0
 
 
-def list_videos(d):
-    return sorted(glob.glob(os.path.join(d, "*-*.mp4")),
-                  key=lambda p: [int(t) for t in os.path.splitext(os.path.basename(p))[0].split("-")])
-
-
 def key_of(path):
     return os.path.splitext(os.path.basename(path))[0]  # e.g. "3-0"
+
+
+def list_videos(d):
+    return sorted(glob.glob(os.path.join(d, "*-*.mp4")), key=lambda p: _prompt_order(key_of(p)))
 
 
 # ----------------------------- VBench collation -----------------------------
@@ -166,9 +167,19 @@ def process_arm(name, vdir, device, small_hw, do_flow):
     return res
 
 
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else float("nan")
+
+
+def _prompt_order(key):
+    return [int(t) for t in key.split("-")]
+
+
 def paired_delta(arm_a, arm_b):
-    """Per-frame DINO cosine-distance + pixel-L2 between matched keys. Returns (dino_delta, pix_delta, n)."""
-    keys = sorted(set(arm_a) & set(arm_b), key=lambda k: [int(t) for t in k.split("-")])
+    """Distance between two arms on the videos they share, frame by frame. Returns the mean DINO
+    cosine distance, the mean pixel L2, the number of shared videos and the DINO distance of
+    each video."""
+    keys = sorted(set(arm_a) & set(arm_b), key=_prompt_order)
     dds, pxs = [], []
     for k in keys:
         ea, eb = arm_a[k]["emb"], arm_b[k]["emb"]
@@ -178,151 +189,151 @@ def paired_delta(arm_a, arm_b):
         sa, sb = arm_a[k]["small"].float(), arm_b[k]["small"].float()
         m = min(sa.shape[0], sb.shape[0])
         pxs.append(float((sa[:m] - sb[:m]).pow(2).sum(1).sqrt().mean().item()))  # per-pixel L2, meaned
-    mean = lambda xs: (sum(xs) / len(xs)) if xs else float("nan")
-    return mean(dds), mean(pxs), len(keys), {k: round(d, 4) for k, d in zip(keys, dds)}
+    return _mean(dds), _mean(pxs), len(keys), {k: round(d, 4) for k, d in zip(keys, dds)}
 
 
 def arm_summary(arm):
-    agg = lambda f: (sum(f(e) for e in arm.values()) / len(arm)) if arm else float("nan")
+    entries = list(arm.values())
     return {
-        "n": len(arm),
-        "lag1": agg(lambda e: e["lag1"]),
-        "lag2": agg(lambda e: e["lag2"]),
-        "id_cos": agg(lambda e: e["id_cos"]),
-        "flow": agg(lambda e: e["flow"]) if arm and "flow" in next(iter(arm.values())) else None,
+        "n": len(entries),
+        "lag1": _mean([e["lag1"] for e in entries]),
+        "lag2": _mean([e["lag2"] for e in entries]),
+        "id_cos": _mean([e["id_cos"] for e in entries]),
+        "flow": _mean([e["flow"] for e in entries]) if entries and "flow" in entries[0] else None,
     }
 
 
+# ----------------------------- decision (pre-registered) -----------------------------
+# Everything from here to main() is plain Python on the numbers computed above, so
+# tests/test_eval_report.py replays it against the tables published under results/.
+def compare_to_stock(s_on, s_stock, vb):
+    """memon minus stock: per VBench dimension (None where a score is missing), whether every
+    available dimension is within tolerance, the identity gap, and whether it is within
+    tolerance. A parity is None when there is nothing to compare."""
+    vb_diffs = {}
+    for dim in VB_DIMS.values():
+        a, b = vb["memon"][dim], vb["stock"][dim]
+        vb_diffs[dim] = None if (a is None or b is None) else round(a - b, 4)
+    within = [abs(v) <= VBENCH_PARITY_TOL for v in vb_diffs.values() if v is not None]
+    vb_par = all(within) if within else None
+    if math.isnan(s_on["id_cos"]) or math.isnan(s_stock["id_cos"]):
+        return vb_diffs, vb_par, None, None
+    drift_diff = round(s_on["id_cos"] - s_stock["id_cos"], 4)
+    return vb_diffs, vb_par, drift_diff, abs(drift_diff) <= DRIFT_PARITY_TOL
+
+
+def verdict_of(s_on, d_on_zero, noise_floor, vb_diffs, vb_par, drift_diff, drift_par):
+    """The pre-registered reading, tried in this order: frozen, flickering, memory without
+    effect, then memory active and at parity with, better than or worse than the stock model."""
+    still = s_on["lag2"] < FREEZE_LAG
+    if still and s_on["lag1"] < FREEZE_LAG:
+        return "FREEZE  (lag-2 ~0 AND lag-1 ~0: memon output is static)"
+    if still:
+        return "FLICKER (lag-2 ~0 but lag-1 >>0: period-2 phase-swap, not real motion)"
+    if d_on_zero < noise_floor:
+        return (f"INERT   (delta(memon,memzero)={d_on_zero:.4f} < floor {noise_floor}: memory made "
+                f"~no difference to the output)\n"
+                f"          NOTE: cannot distinguish INERT from CANCELLED without injection-dose telemetry. "
+                f"If a telemetry probe shows injection dose > 0 while this delta < floor => CANCELLED.")
+    if vb_par and drift_par:
+        return ("ACTIVE-NEUTRAL (the honest win): memory changes the output (delta > floor) yet "
+                "VBench SC/BC/DD AND identity-drift are at parity with AF-stock.")
+    if vb_par is None or drift_par is None:
+        return ("ACTIVE (delta > floor) but VBench/drift parity INCONCLUSIVE (missing a VBench dim or "
+                "stock drift). Fill the gap, then re-read. Flag for human eye.")
+    better = sum(1 for v in vb_diffs.values() if v and v > 0) >= 2 or (drift_diff and drift_diff > 0)
+    return (f"ACTIVE-{'POSITIVE' if better else 'NEGATIVE'} (delta > floor + a VBench/drift difference "
+            f"vs AF-stock). FLAG FOR HUMAN EYE (ship côte-à-côte).")
+
+
+def render_report(summaries, vb, vb_diffs, on_zero, zero_stock, drift_diff, drift_par, verdict,
+                  noise_floor):
+    """The text table. `summaries` and `vb` are keyed by arm; `on_zero` and `zero_stock` are the
+    (DINO distance, pixel L2, n, per-video distances) that paired_delta returns."""
+    score = lambda x: f"{x:.4f}" if x is not None else "  n/a"
+    rule = "=" * 92
+    lines = [rule, "3-way memory eval  (memon | memzero=LoRA-drift-only | AF-stock)", rule,
+             f"pre-registered thresholds: NOISE_FLOOR(DINO cos-dist)={noise_floor}  FREEZE_LAG={FREEZE_LAG}  "
+             f"VBENCH_PARITY_TOL={VBENCH_PARITY_TOL}  DRIFT_PARITY_TOL={DRIFT_PARITY_TOL}",
+             "",
+             f"{'arm':<10}{'n':>3}  {'lag1':>8}{'lag2(flkblind)':>16}{'flow':>9}  {'id_cos(f0,fL)':>14}"]
+    for arm in ARMS:
+        s = summaries[arm]
+        lines.append(f"{arm:<10}{s['n']:>3}  {s['lag1']:>8.4f}{s['lag2']:>16.4f}{score(s['flow']):>9}"
+                     f"  {s['id_cos']:>14.3f}")
+    lines += ["", "VBench (aggregate; higher=better for SC/BC/DD):",
+              f"{'dim':<6}{'memon':>9}{'memzero':>9}{'stock':>9}{'memon-stock':>13}"]
+    for dim in VB_DIMS.values():
+        diff = vb_diffs[dim]
+        lines.append(f"{dim:<6}" + "".join(f"{score(vb[arm][dim]):>9}" for arm in ARMS)
+                     + f"{(f'{diff:+.4f}' if diff is not None else '  n/a'):>13}")
+    lines += ["", "PAIRED deltas (same seed 42, per-frame):",
+              f"  delta(memon, memzero)  DINO cos-dist = {on_zero[0]:.4f}   pixel-L2 = {on_zero[1]:.4f}   "
+              f"(n={on_zero[2]} paired)   [PRIMARY vs floor {noise_floor}]",
+              f"      per-prompt DINO cos-dist: {on_zero[3]}",
+              f"  delta(memzero, AF-stock) DINO cos-dist = {zero_stock[0]:.4f}   pixel-L2 = {zero_stock[1]:.4f}   "
+              f"(n={zero_stock[2]} paired)   [pure LoRA co-train drift, attribution guard]",
+              "", f"identity-drift(memon) - drift(stock) = {drift_diff}   (parity={drift_par})", "",
+              "-" * 92, f"VERDICT: {verdict}", "-" * 92]
+    return "\n".join(lines)
+
+
 # ----------------------------- main -----------------------------
-def main():
+def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--memon_dir", required=True)
-    ap.add_argument("--memzero_dir", required=True)
-    ap.add_argument("--stock_dir", required=True)
-    ap.add_argument("--vbench_memon", default="")
-    ap.add_argument("--vbench_memzero", default="")
-    ap.add_argument("--vbench_stock", default="")
+    for arm in ARMS:
+        ap.add_argument(f"--{arm}_dir", required=True)
+    for arm in ARMS:
+        ap.add_argument(f"--vbench_{arm}", default="")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--noise_floor", type=float, default=NOISE_FLOOR)
     ap.add_argument("--optical_flow", action="store_true", help="also compute Farneback flow magnitude (slow)")
     ap.add_argument("--small_h", type=int, default=120)
     ap.add_argument("--small_w", type=int, default=208)
     ap.add_argument("--out", default="")
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def main():
+    args = parse_args()
     device = args.device if torch.cuda.is_available() else "cpu"
     small_hw = (args.small_h, args.small_w)
 
-    memon = process_arm("memon", args.memon_dir, device, small_hw, args.optical_flow)
-    memzero = process_arm("memzero", args.memzero_dir, device, small_hw, args.optical_flow)
-    stock = process_arm("stock", args.stock_dir, device, small_hw, args.optical_flow)
+    arms = {arm: process_arm(arm, getattr(args, f"{arm}_dir"), device, small_hw, args.optical_flow)
+            for arm in ARMS}
+    on_zero = paired_delta(arms["memon"], arms["memzero"])
+    zero_stock = paired_delta(arms["memzero"], arms["stock"])
+    summaries = {arm: arm_summary(videos) for arm, videos in arms.items()}
+    vb = {arm: collate_vbench(getattr(args, f"vbench_{arm}")) for arm in ARMS}
 
-    d_on_zero, px_on_zero, n_oz, per_key_oz = paired_delta(memon, memzero)
-    d_zero_stock, px_zero_stock, n_zs, _ = paired_delta(memzero, stock)
-
-    s_on, s_zero, s_stock = arm_summary(memon), arm_summary(memzero), arm_summary(stock)
-    vb = {
-        "memon": collate_vbench(args.vbench_memon),
-        "memzero": collate_vbench(args.vbench_memzero),
-        "stock": collate_vbench(args.vbench_stock),
-    }
-
-    # ----------------------------- DECISION (pre-registered) -----------------------------
-    frozen = (s_on["lag2"] < FREEZE_LAG) and (s_on["lag1"] < FREEZE_LAG)
-    flicker = (s_on["lag2"] < FREEZE_LAG) and (s_on["lag1"] >= FREEZE_LAG)
-    active = d_on_zero >= args.noise_floor
-
-    def vbench_parity():
-        diffs = {}
-        for dim in ("SC", "BC", "DD"):
-            a, b = vb["memon"][dim], vb["stock"][dim]
-            diffs[dim] = None if (a is None or b is None) else round(a - b, 4)
-        within = [abs(v) <= VBENCH_PARITY_TOL for v in diffs.values() if v is not None]
-        return diffs, (all(within) if within else None)
-
-    vb_diffs, vb_par = vbench_parity()
-    drift_diff = None if (s_on["id_cos"] != s_on["id_cos"] or s_stock["id_cos"] != s_stock["id_cos"]) \
-        else round(s_on["id_cos"] - s_stock["id_cos"], 4)
-    drift_par = None if drift_diff is None else (abs(drift_diff) <= DRIFT_PARITY_TOL)
-
-    if frozen:
-        verdict = "FREEZE  (lag-2 ~0 AND lag-1 ~0: memon output is static)"
-    elif flicker:
-        verdict = "FLICKER (lag-2 ~0 but lag-1 >>0: period-2 phase-swap, not real motion)"
-    elif not active:
-        verdict = (f"INERT   (delta(memon,memzero)={d_on_zero:.4f} < floor {args.noise_floor}: memory made "
-                   f"~no difference to the output)\n"
-                   f"          NOTE: cannot distinguish INERT from CANCELLED without injection-dose telemetry. "
-                   f"If a telemetry probe shows injection dose > 0 while this delta < floor => CANCELLED.")
-    else:
-        if vb_par and drift_par:
-            verdict = ("ACTIVE-NEUTRAL (the honest win): memory changes the output (delta > floor) yet "
-                       "VBench SC/BC/DD AND identity-drift are at parity with AF-stock.")
-        elif vb_par is None or drift_par is None:
-            verdict = ("ACTIVE (delta > floor) but VBench/drift parity INCONCLUSIVE (missing a VBench dim or "
-                       "stock drift). Fill the gap, then re-read. Flag for human eye.")
-        else:
-            better = ((sum(1 for v in vb_diffs.values() if v and v > 0)) >= 2) or (drift_diff and drift_diff > 0)
-            verdict = (f"ACTIVE-{'POSITIVE' if better else 'NEGATIVE'} (delta > floor + a VBench/drift difference "
-                       f"vs AF-stock). FLAG FOR HUMAN EYE (ship côte-à-côte).")
-
-    # ----------------------------- REPORT -----------------------------
-    L = []
-    P = lambda s="": L.append(s)
-    P("=" * 92)
-    P("3-way memory eval  (memon | memzero=LoRA-drift-only | AF-stock)")
-    P("=" * 92)
-    P(f"pre-registered thresholds: NOISE_FLOOR(DINO cos-dist)={args.noise_floor}  FREEZE_LAG={FREEZE_LAG}  "
-      f"VBENCH_PARITY_TOL={VBENCH_PARITY_TOL}  DRIFT_PARITY_TOL={DRIFT_PARITY_TOL}")
-    P()
-    P(f"{'arm':<10}{'n':>3}  {'lag1':>8}{'lag2(flkblind)':>16}{'flow':>9}  {'id_cos(f0,fL)':>14}")
-    for nm, s in (("memon", s_on), ("memzero", s_zero), ("stock", s_stock)):
-        flow = f"{s['flow']:.4f}" if s["flow"] is not None else "  n/a"
-        P(f"{nm:<10}{s['n']:>3}  {s['lag1']:>8.4f}{s['lag2']:>16.4f}{flow:>9}  {s['id_cos']:>14.3f}")
-    P()
-    P("VBench (aggregate; higher=better for SC/BC/DD):")
-    P(f"{'dim':<6}{'memon':>9}{'memzero':>9}{'stock':>9}{'memon-stock':>13}")
-    for dim in ("SC", "BC", "DD"):
-        f = lambda x: f"{x:.4f}" if x is not None else "  n/a"
-        diff = vb_diffs[dim]
-        P(f"{dim:<6}{f(vb['memon'][dim]):>9}{f(vb['memzero'][dim]):>9}{f(vb['stock'][dim]):>9}"
-          f"{(f'{diff:+.4f}' if diff is not None else '  n/a'):>13}")
-    P()
-    P("PAIRED deltas (same seed 42, per-frame):")
-    P(f"  delta(memon, memzero)  DINO cos-dist = {d_on_zero:.4f}   pixel-L2 = {px_on_zero:.4f}   "
-      f"(n={n_oz} paired)   [PRIMARY vs floor {args.noise_floor}]")
-    P(f"      per-prompt DINO cos-dist: {per_key_oz}")
-    P(f"  delta(memzero, AF-stock) DINO cos-dist = {d_zero_stock:.4f}   pixel-L2 = {px_zero_stock:.4f}   "
-      f"(n={n_zs} paired)   [pure LoRA co-train drift, attribution guard]")
-    P()
-    P(f"identity-drift(memon) - drift(stock) = {drift_diff}   (parity={drift_par})")
-    P()
-    P("-" * 92)
-    P(f"VERDICT: {verdict}")
-    P("-" * 92)
-    report = "\n".join(L)
+    vb_diffs, vb_par, drift_diff, drift_par = compare_to_stock(summaries["memon"], summaries["stock"], vb)
+    verdict = verdict_of(summaries["memon"], on_zero[0], args.noise_floor,
+                         vb_diffs, vb_par, drift_diff, drift_par)
+    report = render_report(summaries, vb, vb_diffs, on_zero, zero_stock, drift_diff, drift_par,
+                           verdict, args.noise_floor)
     print(report)
 
     if args.out:
         dump = {
             "thresholds": {"noise_floor": args.noise_floor, "freeze_lag": FREEZE_LAG,
                            "vbench_parity_tol": VBENCH_PARITY_TOL, "drift_parity_tol": DRIFT_PARITY_TOL},
-            "arms": {"memon": s_on, "memzero": s_zero, "stock": s_stock},
+            "arms": summaries,
             "vbench": vb, "vbench_memon_minus_stock": vb_diffs,
-            "delta_memon_memzero": {"dino_cos_dist": d_on_zero, "pixel_l2": px_on_zero, "n": n_oz,
-                                    "per_prompt": per_key_oz},
-            "delta_memzero_stock": {"dino_cos_dist": d_zero_stock, "pixel_l2": px_zero_stock, "n": n_zs},
+            "delta_memon_memzero": {"dino_cos_dist": on_zero[0], "pixel_l2": on_zero[1], "n": on_zero[2],
+                                    "per_prompt": on_zero[3]},
+            "delta_memzero_stock": {"dino_cos_dist": zero_stock[0], "pixel_l2": zero_stock[1],
+                                    "n": zero_stock[2]},
             "drift_memon_minus_stock": drift_diff,
-            "drift_curves": {"memon": {k: v["drift_curve"] for k, v in memon.items()},
-                             "memzero": {k: v["drift_curve"] for k, v in memzero.items()},
-                             "stock": {k: v["drift_curve"] for k, v in stock.items()}},
+            "drift_curves": {arm: {k: v["drift_curve"] for k, v in videos.items()}
+                             for arm, videos in arms.items()},
             "verdict": verdict,
         }
+        text_path = os.path.splitext(args.out)[0] + ".txt"
         with open(args.out, "w") as f:
             json.dump(dump, f, indent=2)
-        with open(os.path.splitext(args.out)[0] + ".txt", "w") as f:
+        with open(text_path, "w") as f:
             f.write(report + "\n")
-        print(f"\n[metrics] wrote {args.out} and {os.path.splitext(args.out)[0] + '.txt'}")
+        print(f"\n[metrics] wrote {args.out} and {text_path}")
 
 
 if __name__ == "__main__":
