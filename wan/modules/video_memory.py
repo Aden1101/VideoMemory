@@ -191,7 +191,8 @@ def weight_norm_update(w0, w1, w2, w0_grad, w1_grad, w2_grad, muon_update_steps,
     Default (decay=None): LaCT renorm, ascend the Muon'd grad, then renorm each column to its
     pre-update norm (norm conserved, no forgetting; the state only rotates in a fixed-norm shell).
     Gated-delta (decay/init_norms set): w <- decay*w + muon(grad), then cap each column to its init norm
-    (shrink allowed = explicit forgetting). `allreduce_fn` = LaCT's context-parallel allreduce, on the raw gradients.
+    (shrink allowed = explicit forgetting). `allreduce_fn` = LaCT's context-parallel allreduce,
+    on the raw gradients.
     """
     # Remember that the weight norm before the update is applied
     w0_norm = w0.detach().norm(dim=1, keepdim=True)
@@ -256,63 +257,68 @@ def linear_delta_chunk_update(x, W, beta):
 
 
 class VideoMemoryLayer(nn.Module):
-    """ Causal adaptation of LaCT's FastWeightGluMLPMultihead.
+    """The memory cell: a fast-weight state read with the current chunk and rewritten with the
+    chunk that left the attention window. Call `step` once per generator call; what it returns
+    is the gated contribution to add to the residual stream.
 
-    Same fast-weight SwiGLU memory (qkv/lr projection, inner-loop gradient, Muon + weight-norm
-    update, gated AdaLN output), wired for autoregressive video instead of bidirectional VGGT
-    patches. Use `step(x, state, do_update)` per generator call (ar/inference/rollout). Output is
-    the gated contribution to add to the residual.
+    A causal adaptation of LaCT's FastWeightGluMLPMultihead: same qkv/lr projection, inner-loop
+    gradient, Muon update and gated AdaLN output, stepped chunk by chunk instead of applied to a
+    bidirectional sequence.
+
+    Arguments
+      num_heads, inter_multi  one head of width dim, hidden width 4 * dim: the largest state,
+                              which is what test-time training benefits from
+      base_lr                 the inner learning rate the per-token rates start from
+      muon_update_steps       Newton-Schulz iterations on the write gradient; 0 = plain SGD
+      qk_norm                 RMSNorm on q and k, for stability over a long rollout
+      g_init                  initial gate bias; 0 makes the branch inert at step 0
+      use_decay, decay_init   let the state forget: w <- decay * w + update, norms capped at
+                              their init value, instead of renormalising to a fixed norm
+      bounded_gate            tanh on the gate, so the injection cannot grow without bound
+      bounded_mod             tanh on scale and shift too
+      rel_norm                normalise the read by one RMS per chunk instead of per token, so
+                              a token's read magnitude, its relevance, reaches the gate
+      single_norm             without rel_norm: skip the per-token norm of the read
+      dc_remove               subtract the token mean of the injection, so the branch cannot
+                              learn a constant bias
+      detach_state            None = detach the new state in eval, keep its graph in training
+      checkpoint_write        gradient-checkpoint the write
+      gate_extra              extra gate inputs among "agreement", "denoising_step",
+                              "frames_since_switch"; zero-initialised, so inert until trained
+      state_type              "swiglu", the fast-weight MLP (w0, w1, w2), or "linear_delta":
+                              one fp32 matrix W per block, written by a training-free delta
+                              rule on the raw evicted tokens and read as W q. Six times
+                              smaller, and the module keeps every SwiGLU parameter, so a
+                              checkpoint loads in both modes
+      linear_beta             step size of that delta rule
     """
     def __init__(
         self,
         dim: int = 1536,
-        num_heads: int = 1,        # nh=1 -> head_dim=dim, max state size (large head_dim is better for TTT)
-        inter_multi: int = 4,      # k=4
+        num_heads: int = 1,
+        inter_multi: int = 4,
         base_lr: float = 1e-2,
-        muon_update_steps: int = 5,  # 0 = plain SGD on the fast weight
-        qk_norm: bool = True,      # RMSNorm on head_dim (on for autoregressive stability; LaCT default False)
-        use_modulation: bool = True,
-        g_init: float = 0.0,       # 0.0 -> inert warm start (identical to baseline at step 0; LaCT: 0.1)
-        use_decay: bool = False,   # gated-delta forgetting in weight_norm_update (else renorm-to-init)
-        decay_init: float = 0.95,  # initial forget gate value = sigmoid(decay_logit); 1.0 = no forgetting
-        bounded_gate: bool = False,  # tanh-bound the output gate (kills the unbounded fixed-RMS injection)
-        single_norm: bool = False,   # read-path hygiene: drop the redundant o_norm so proj sees the raw
-                                     # read magnitude (relevance-coupled injection); keep only AdaLN a_norm
-        bounded_mod: bool = False,   # tanh-bound scale/shift too, so injection amplitude is state-independent
-        rel_norm: bool = False,      # amplitude fix: replace per-token o_norm with one chunk-scalar RMS, so
-                                     # per-token relative read magnitude (relevance) survives to proj + carrier
-                                     # while the global write-count growth cancels every chunk; also drops a_norm
-        dc_remove: bool = False,     # amplitude fix: subtract the token-mean of the injection (train + inference)
-                                     # so proj cannot learn the token-constant DC-bias crutch
-        detach_state: Optional[bool] = None,  # None -> detach in eval, keep graph in train
-        checkpoint_write: bool = False,  # gradient-checkpoint the write update
-        gate_extra: Optional[Sequence[str]] = None,  # extra gate inputs (off=[]): "agreement","denoising_step","frames_since_switch"
-        state_type: str = "swiglu",   # "swiglu": the fast-weight MLP (w0, w1, w2)
-                                      # | "linear_delta" (matrix state W, delta rule on raw h)
-        linear_beta: float = 0.5,     # beta of the delta rule
+        muon_update_steps: int = 5,
+        qk_norm: bool = True,
+        g_init: float = 0.0,
+        use_decay: bool = False,
+        decay_init: float = 0.95,
+        bounded_gate: bool = False,
+        single_norm: bool = False,
+        bounded_mod: bool = False,
+        rel_norm: bool = False,
+        dc_remove: bool = False,
+        detach_state: Optional[bool] = None,
+        checkpoint_write: bool = False,
+        gate_extra: Optional[Sequence[str]] = None,
+        state_type: str = "swiglu",
+        linear_beta: float = 0.5,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
-        # ---- alternative state: the linear delta rule, training-free --------------------
-        # state_type="linear_delta" swaps only the state/read/write core of the cell:
-        #   state : one matrix W (head_dim x head_dim) per block, init 0, fp32; fp16 or bf16
-        #           would change the rounding of the sequential rule;
-        #   write : linear_delta_chunk_update on the raw evicted-chunk tokens (the same
-        #           x_write the SwiGLU write receives from the eviction feed), k = h/||h||,
-        #           v = h, no qkv projection, no learned parameter, training-free;
-        #   read  : o = W @ q for the existing read-path queries q (qkv projection + q_norm),
-        #           plugged exactly where swiglu_apply reads today, so the whole downstream
-        #           (o_norm/rel_norm, gate, modulation, injection, hooks) is unchanged.
-        # GPU footprint (nh=1, d=1536, B=1): W fp32 = 1536*1536*4 = 9.44 MB per block
-        # (28.3 MB for the 3 deployed blocks; fp16 snapshot 4.72 MB/block, ~14.2 MB/age),
-        # vs the SwiGLU state (w0+w1+w2 bf16, inter_multi=4) = 56.6 MB per block (169.9 MB
-        # for 3 blocks): ~6x smaller. The module still owns every SwiGLU parameter
-        # (qkv/lrs/proj/w0/w1/w2/...), so checkpoints load unchanged in both modes.
         assert state_type in ("swiglu", "linear_delta"), f"unknown state_type {state_type!r}"
-        if state_type == "linear_delta":
-            # the rule is defined on full raw tokens (d = 1536); splitting h per head would
-            # be a different rule, so refuse it.
-            assert num_heads == 1, "linear_delta state requires num_heads == 1"
+        # the delta rule is defined on whole tokens; splitting them per head is another rule
+        assert state_type == "swiglu" or num_heads == 1, "linear_delta state requires num_heads == 1"
         self.state_type = state_type
         self.linear_beta = float(linear_beta)
 
@@ -321,7 +327,6 @@ class VideoMemoryLayer(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.muon_update_steps = muon_update_steps
-        self.use_modulation = use_modulation
         self.use_decay = use_decay
         self.bounded_gate = bounded_gate
         self.single_norm = single_norm
@@ -342,13 +347,13 @@ class VideoMemoryLayer(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=1e-5) if qk_norm else nn.Identity()
 
         # Projection layers
-        self.proj = nn.Linear(dim, dim if not use_modulation else dim * 3, bias=True)
-        if use_modulation:
-            # Adaptive layer normalization without affine parameters
-            self.a_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-            self._init_modulation_params(dim, g_init=g_init)
-            if self.gate_extra:
-                self._build_gate_extra(dim)
+        # one projection of the read gives the shift, the scale and the gate of the injection
+        self.proj = nn.Linear(dim, dim * 3, bias=True)
+        # Adaptive layer normalization without affine parameters
+        self.a_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self._init_modulation_params(dim, g_init=g_init)
+        if self.gate_extra:
+            self._build_gate_extra(dim)
 
         # TTT fast weight dimensions
         di = self.head_dim
@@ -369,390 +374,317 @@ class VideoMemoryLayer(nn.Module):
         self.o_norm = RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
 
     def _init_modulation_params(self, dim: int, g_init=0.1):
+        """Zero projection, so shift and scale start at 0 and the gate at its bias g_init."""
         with torch.no_grad():
             nn.init.zeros_(self.proj.weight)
             nn.init.zeros_(self.proj.bias)
-            self.proj.bias[2 * dim:] = g_init  # gate bias only
+            self.proj.bias[2 * dim:] = g_init       # proj outputs [shift | scale | gate]
 
-    # ---- optional extra gate inputs; zero-init proj so they contribute nothing until trained ----
-    GX_RANK = 64   # shared-space rank for the memory<->prompt agreement
-    GX_EMB = 16    # sinusoidal dim for scalar signals (denoising step / frames-since-switch)
+    # ---- optional extra inputs of the gate ----------------------------------------------------
+    GX_RANK = 64   # rank of the space where the read and the prompt are compared
+    GX_EMB = 16    # width of the sinusoidal embedding of a scalar input
+    # width of each input, in the order they are concatenated whatever order the config lists
+    # them in: the columns of proj_extra are logged per input by the trainer
+    GATE_INPUTS = {"agreement": 1, "denoising_step": GX_EMB, "frames_since_switch": GX_EMB}
 
     def _build_gate_extra(self, dim: int):
-        _known = {"agreement", "denoising_step", "frames_since_switch"}
-        _bad = [g for g in self.gate_extra if g not in _known]
-        assert not _bad, f"unknown gate_extra entries {_bad}, expected subset of {sorted(_known)}"
-        extra_dim = 0
+        unknown = [g for g in self.gate_extra if g not in self.GATE_INPUTS]
+        assert not unknown, \
+            f"unknown gate_extra entries {unknown}, expected subset of {sorted(self.GATE_INPUTS)}"
         if "agreement" in self.gate_extra:
-            self.gx_po = nn.Linear(dim, self.GX_RANK, bias=False)  # project memory read
-            self.gx_pc = nn.Linear(dim, self.GX_RANK, bias=False)  # project prompt c (same dim)
-            extra_dim += 1                                          # the scalar a in [0,1]
-        if "denoising_step" in self.gate_extra:
-            extra_dim += self.GX_EMB
-        if "frames_since_switch" in self.gate_extra:
-            extra_dim += self.GX_EMB
-        # separate proj, added to the base proj(o_hat); zero-init so it contributes nothing at init
-        self.proj_extra = nn.Linear(extra_dim, 3 * dim, bias=False)
+            self.gx_po = nn.Linear(dim, self.GX_RANK, bias=False)     # of the memory read
+            self.gx_pc = nn.Linear(dim, self.GX_RANK, bias=False)     # of the pooled prompt
+        width = sum(w for name, w in self.GATE_INPUTS.items() if name in self.gate_extra)
+        # added to proj's output, and zero-initialised: the inputs do nothing until trained
+        self.proj_extra = nn.Linear(width, 3 * dim, bias=False)
         nn.init.zeros_(self.proj_extra.weight)
 
     def _gate_extra_vec(self, o_hat, prompt_emb, frames_since_switch, denoising_step):
-        """Build the (B, L, extra_dim) feature vector fed to proj_extra."""
-        B, L, _ = o_hat.shape
+        """The (B, L, width) input of proj_extra."""
+        given = {"agreement": prompt_emb, "denoising_step": denoising_step,
+                 "frames_since_switch": frames_since_switch}
         feats = []
-        if "agreement" in self.gate_extra:
-            if prompt_emb is None:
-                raise ValueError("gate_extra 'agreement' needs prompt_emb (the text context c)")
-            c = prompt_emb.mean(dim=1)                                       # (B, dim) pooled prompt
-            a = torch.sigmoid((self.gx_po(o_hat) * self.gx_pc(c)[:, None, :]).sum(-1, keepdim=True))
-            self.dbg_agreement = a.detach().float().mean()                  # for logging (0-dim, no host sync)
-            feats.append(a.to(o_hat.dtype))                                  # (B, L, 1)
-        if "denoising_step" in self.gate_extra:
-            if denoising_step is None:
-                raise ValueError("gate_extra 'denoising_step' needs the denoising step signal (not wired yet)")
-            feats.append(_sinusoid_embed(denoising_step, self.GX_EMB).to(o_hat.dtype))
-        if "frames_since_switch" in self.gate_extra:
-            if frames_since_switch is None:
-                raise ValueError("gate_extra 'frames_since_switch' needs the frames-since-switch signal (not wired yet)")
-            feats.append(_sinusoid_embed(frames_since_switch, self.GX_EMB).to(o_hat.dtype))
+        for name in self.GATE_INPUTS:
+            if name not in self.gate_extra:
+                continue
+            if given[name] is None:
+                raise ValueError(f"gate_extra {name!r} is on but its input was not passed to step()")
+            if name == "agreement":
+                # how much the read agrees with the prompt, one scalar in [0, 1] per token
+                prompt = prompt_emb.mean(dim=1)                                 # (B, dim)
+                a = torch.sigmoid((self.gx_po(o_hat) * self.gx_pc(prompt)[:, None, :])
+                                  .sum(-1, keepdim=True))
+                self.dbg_agreement = a.detach().float().mean()                  # 0-dim: no host sync
+                feats.append(a.to(o_hat.dtype))
+            else:
+                feats.append(_sinusoid_embed(given[name], self.GX_EMB).to(o_hat.dtype))
         return torch.cat(feats, dim=-1)
 
     def reset_parameters(self):
-        """Re-apply the memory branch's own initialization. Must be called after any global
-        model init (e.g. causalWanModel.init_weights(), which xavier-inits every nn.Linear in
-        the model)."""
-        assert self.use_modulation, "reset_parameters assumes use_modulation=True (the only supported mode)"
+        """Re-apply the branch's own initialisation. To be called after any global init of the
+        model: CausalWanModel.init_weights xavier-initialises every nn.Linear, this one included."""
         self._init_modulation_params(self.dim, g_init=self.g_init)
         if self.gate_extra:
-            nn.init.zeros_(self.proj_extra.weight)  # re-zero extras after global init
+            nn.init.zeros_(self.proj_extra.weight)
 
-    # ---- internals ----
     def _qkv_lr(self, x):
-        B, L, _ = x.shape
-        qkv = self.qkv(x)
-        q, k, v = rearrange(qkv, "b l (qkv h d) -> qkv b h l d", qkv=3, h=self.num_heads)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        q = rearrange(q, "b h l d -> (b h) l d")
-        k = rearrange(k, "b h l d -> (b h) l d")
-        v = rearrange(v, "b h l d -> (b h) l d")
+        """x (B, L, dim) -> q, k, v and the three per-token learning rates, each
+        (B * heads, L, .), plus B. q and k are RMS-normalised per head."""
+        B = x.shape[0]
+        q, k, v = rearrange(self.qkv(x), "b l (qkv h d) -> qkv b h l d", qkv=3, h=self.num_heads)
+        q, k = self.q_norm(q), self.k_norm(k)
+        q, k, v = (rearrange(t, "b h l d -> (b h) l d") for t in (q, k, v))
 
         with torch.amp.autocast("cuda", enabled=False):
-            # LaCT does `lrs = self.lrs(x.float())`; that crashes when the module is deployed in
-            # bf16 (fp32 input vs bf16 weight). Cast the tiny lrs Linear's weights per call instead.
+            # in fp32 whatever the module's dtype. LaCT writes self.lrs(x.float()), which fails
+            # on a bf16 module (fp32 input, bf16 weight), so the small weights are cast instead.
             lrs = F.linear(x.float(), self.lrs.weight.float(),
                            self.lrs.bias.float() if self.lrs.bias is not None else None)
         lrs = F.softplus(lrs.float() + self.inv_base_lr)
         lr0, lr1, lr2 = rearrange(lrs, "b l (n h c) -> n (b h) l c", n=3, h=self.num_heads)
-        # LaCT keeps lr in fp32 and lets the ambient autocast harmonize the matmuls; our pipelines
-        # run in plain bf16 (no autocast), so fold the lr into the compute dtype to avoid bf16@fp32.
-        lr0, lr1, lr2 = lr0.type_as(k), lr1.type_as(k), lr2.type_as(k)
-        return q, k, v, lr0, lr1, lr2, B
+        # LaCT leaves them in fp32 for autocast to reconcile; the pipelines here run in plain
+        # bf16 with no autocast, so they are cast to the compute dtype
+        return q, k, v, lr0.type_as(k), lr1.type_as(k), lr2.type_as(k), B
 
     def _project_output(self, x, batch_size, prompt_emb=None,
                         frames_since_switch=None, denoising_step=None, num_frames=None):
-        if self.rel_norm:                      # amplitude fix: one chunk-scalar RMS per (b*h). relative
-            s = x.float().pow(2).mean(dim=(1, 2), keepdim=True).add(1e-10).sqrt()  # eps inside sqrt: safe backward
-            x = (x.float() / s).type_as(x)   # per-token read magnitude survives; write-count growth cancels/chunk
-        elif not self.single_norm:             # per-token o_norm (erases the read magnitude)
-            x = self.o_norm(x)
+        """The read -> the injection: gate * (carrier * (1 + scale) + shift), where shift, scale
+        and gate are one projection of the normalised read and the carrier is that read."""
+        if self.rel_norm:
+            # one RMS per chunk: the growth of the state with the write count cancels, while a
+            # token's read magnitude relative to the others survives. eps inside the sqrt keeps
+            # the backward finite.
+            rms = x.float().pow(2).mean(dim=(1, 2), keepdim=True).add(1e-10).sqrt()
+            x = (x.float() / rms).type_as(x)
+        elif not self.single_norm:
+            x = self.o_norm(x)                  # per token, which erases the read magnitude
         x = rearrange(x, '(b h) l d -> b l (h d)', h=self.num_heads, b=batch_size)
-        if not self.use_modulation:
-            return self.proj(x)
         shift, scale, gate = self.proj(x).chunk(3, dim=-1)
-        if self.gate_extra:  # extra inputs -> added via the zero-init proj_extra (no-op at init)
-            es, esc, eg = self.proj_extra(
-                self._gate_extra_vec(x, prompt_emb, frames_since_switch, denoising_step)).chunk(3, dim=-1)
+        if self.gate_extra:                     # through a zero-init projection: inert until trained
+            extra = self._gate_extra_vec(x, prompt_emb, frames_since_switch, denoising_step)
+            es, esc, eg = self.proj_extra(extra).chunk(3, dim=-1)
             shift, scale, gate = shift + es, scale + esc, gate + eg
-        if self.bounded_gate:                 # tanh-bound -> no unbounded fixed-RMS injection
+        if self.bounded_gate:
             gate = torch.tanh(gate)
-        if self.bounded_mod:                  # bound scale/shift too -> injection amplitude state-independent
+        if self.bounded_mod:
             scale, shift = torch.tanh(scale), torch.tanh(shift)
-        # rel_norm: the raw (chunk-normed) read is the carrier so amplitude tracks read relevance;
-        # otherwise a_norm re-pins the carrier to unit variance (relevance-decoupled).
+        # under rel_norm the amplitude of the carrier tracks the relevance of the read;
+        # otherwise a_norm pins it to unit variance
         carrier = x if self.rel_norm else self.a_norm(x)
         out = gate * (carrier * (1 + scale) + shift)
-        # diagnostics on the pre-dc-removal injection (0-dim scalars, no host sync)
-        _o = out.detach().float()
-        self.dbg_dc_frac = _o.mean(dim=1, keepdim=True).pow(2).mean() / _o.pow(2).mean().clamp_min(1e-12)
-        _tok = _o.pow(2).mean(dim=-1).sqrt()                          # (b, l) per-token injection RMS
-        self.dbg_amp_disp = _tok.std() / _tok.mean().clamp_min(1e-12) # 0 = flat = amplitude still decoupled
+        self._record_diagnostics(out, gate, num_frames)
+        if self.dc_remove or int(os.environ.get("MEM_DC_REMOVE", "0")):
+            out = out - out.mean(dim=1, keepdim=True)
+        return out
+
+    def _record_diagnostics(self, out, gate, num_frames):
+        """Health numbers of the injection before the DC removal, kept as 0-dim tensors so that
+        nothing here forces a host sync; the trainer reads them at log time."""
+        o = out.detach().float()
+        self.dbg_dc_frac = o.mean(dim=1, keepdim=True).pow(2).mean() / o.pow(2).mean().clamp_min(1e-12)
+        tok = o.pow(2).mean(dim=-1).sqrt()                          # (b, l) per-token injection RMS
+        self.dbg_amp_disp = tok.std() / tok.mean().clamp_min(1e-12) # 0 = flat = amplitude still decoupled
         # split the joint dispersion into the wanted spatial axis (relevance coupling across
         # sites) vs the unwanted temporal axis (per-site frame-to-frame std = the flicker). Needs the
         # frame count to reshape l=(F*S). Health target: temporal small while spatial stays > 0.
-        if num_frames is not None and int(num_frames) > 0 and _tok.shape[1] % int(num_frames) == 0:
+        if num_frames is not None and int(num_frames) > 0 and tok.shape[1] % int(num_frames) == 0:
             _F = int(num_frames)
-            _amp = _tok.reshape(_tok.shape[0], _F, _tok.shape[1] // _F)   # (b, F, S)
-            _site = _amp.mean(dim=1)                                       # (b, S) time-mean amp / site
-            self.dbg_ampdisp_spatial = _site.std() / _site.mean().clamp_min(1e-12)
-            _fstd = _amp.std(dim=1)                                        # (b, S) across-frame std / site
-            self.dbg_ampdisp_temporal = _fstd.mean() / _amp.mean().clamp_min(1e-12)
+            amp = tok.reshape(tok.shape[0], _F, tok.shape[1] // _F)   # (b, F, S)
+            site = amp.mean(dim=1)                                       # (b, S) time-mean amp / site
+            self.dbg_ampdisp_spatial = site.std() / site.mean().clamp_min(1e-12)
+            fstd = amp.std(dim=1)                                        # (b, S) across-frame std / site
+            self.dbg_ampdisp_temporal = fstd.mean() / amp.mean().clamp_min(1e-12)
         self.dbg_gate_mean = gate.detach().float().abs().mean()
-        if self.dc_remove or int(os.environ.get("MEM_DC_REMOVE", "0")):
-            out = out - out.mean(dim=1, keepdim=True)  # kill the token-constant DC channel, train + inference
-        return out
 
     def init_state(self, B, device, dtype):
-        if getattr(self, "state_type", "swiglu") == "linear_delta":
-            # W = 0, one matrix per block (nh = 1), fp32. The `dtype` argument, bf16 at
-            # deployment, is deliberately not applied: this rule fixes its own dtype.
+        """The state before any write: the learned (w0, w1, w2), or W = 0 for the linear rule,
+        which stays in fp32 whatever `dtype` says because its rounding is part of the rule."""
+        if self.state_type == "linear_delta":
             return (torch.zeros(B * self.num_heads, self.head_dim, self.head_dim,
                                 device=device, dtype=torch.float32),)
-        return (self.w0.repeat(B, 1, 1).to(device=device, dtype=dtype),
-                self.w1.repeat(B, 1, 1).to(device=device, dtype=dtype),
-                self.w2.repeat(B, 1, 1).to(device=device, dtype=dtype))
+        return tuple(w.repeat(B, 1, 1).to(device=device, dtype=dtype)
+                     for w in (self.w0, self.w1, self.w2))
 
     def _linear_write(self, x_write, W):
-        """Linear-delta write: new W from the raw evicted-chunk tokens x_write (B, Lw, dim).
+        """The delta-rule write: a new W from the raw tokens x_write (B, Lw, dim).
 
-        The state must be the same function of the data here and in the offline replay that
-        was used to validate the rule, so:
-          - x_write[b] is handed to linear_delta_chunk_update as a 2-D (T, d) fp32 tensor, the
-            same shape and dtype the replay uses; the bf16 to fp32 cast is exact;
-          - TF32 is forced off around the update and restored afterwards, so the result does
-            not depend on the backend flags of the calling pipeline;
-          - the state is functional: W is cloned and the clone is updated in place, so
-            snapshots of older state tuples (twin, truncated backprop, episodic) are never
-            mutated;
-          - no_grad: the rule is training-free by design (no learned parameter in the write;
-            the read path above stays differentiable wrt q)."""
+        It has to be the same function of the data as the offline replay that validated the
+        rule. So each x_write[b] goes to linear_delta_chunk_update as a 2-D fp32 tensor, as the
+        replay does (bf16 to fp32 is exact); TF32 is switched off around the update, so the
+        result does not depend on the caller's backend flags; and W is cloned before being
+        updated, so the state tuples held by a snapshot are never mutated. No grad: the rule
+        has no learned parameter, and the read stays differentiable with respect to q."""
         with torch.no_grad():
-            saved_tf32 = torch.backends.cuda.matmul.allow_tf32
+            tf32 = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = False
             try:
-                Wn = W.detach().clone()
+                new_W = W.detach().clone()
                 for b in range(x_write.shape[0]):
-                    linear_delta_chunk_update(x_write[b].float(), Wn[b], self.linear_beta)
+                    linear_delta_chunk_update(x_write[b].float(), new_W[b], self.linear_beta)
             finally:
-                torch.backends.cuda.matmul.allow_tf32 = saved_tf32
-        return Wn
+                torch.backends.cuda.matmul.allow_tf32 = tf32
+        return new_W
 
     def _detach(self):
+        """Cut the graph of the new state? Yes in eval, no in training, unless detach_state says."""
         return (not self.training) if self.detach_state is None else self.detach_state
 
     def _decay_and_norms(self, B):
-        """Gated-delta forget gate (scalar sigmoid) + per-row INIT norms repeated to the (B*nh) state.
-        Returns (None, None) when use_decay is off (-> weight_norm_update keeps renorm-to-init)."""
+        """Under use_decay: the forget gate, one learned scalar used for the three weights, and
+        the column norms of the init weights, the ceiling weight_norm_update caps the state at.
+        (None, None) otherwise, and weight_norm_update then renormalises to a fixed norm."""
         if not self.use_decay:
             return None, None
-        dec = torch.sigmoid(self.decay_logit)
-        decay = (dec, dec, dec)
-        init_norms = (self.w0.detach().norm(dim=1, keepdim=True).repeat(B, 1, 1),
-                      self.w1.detach().norm(dim=1, keepdim=True).repeat(B, 1, 1),
-                      self.w2.detach().norm(dim=1, keepdim=True).repeat(B, 1, 1))
-        return decay, init_norms
+        decay = torch.sigmoid(self.decay_logit)
+        init_norms = tuple(w.detach().norm(dim=1, keepdim=True).repeat(B, 1, 1)
+                           for w in (self.w0, self.w1, self.w2))
+        return (decay, decay, decay), init_norms
 
     # ---- AR / inference / rollout: one temporal chunk per call ----
     def step(self, x, state=None, do_update=True, allreduce_fn=None,
              prompt_emb=None, frames_since_switch=None, denoising_step=None, num_frames=None,
              x_write=None):
-        """x:(B,L,dim) for the current chunk. Returns (mem_out:(B,L,dim), new_state).
-        prompt_emb/frames_since_switch/denoising_step feed the optional gate_extra inputs.
-        num_frames (latent frames in this call) only feeds the spatial/temporal dispersion split.
-        x_write (B,Lw,dim): the eviction feed. When given, the read query is still taken from the
-        current chunk `x` (what we are generating), but the WRITE stores the k->v association of
-        `x_write` = the EVICTED tokens (what fell out of the KV window), so the memory holds the
-        cache-complement (VideoSSM/AHN-style) instead of the redundant current chunk. x_write=None
-        (default) => write the current chunk, which is the behaviour before the eviction feed."""
+        """One chunk: read the state, then write to it. Returns (mem_out (B, L, dim), new_state).
+
+        x (B, L, dim) is the current chunk; the read query always comes from it. The write
+        stores the k -> v association of `x_write` (B, Lw, dim), the chunk that just left the
+        attention window, so the memory holds what attention can no longer see; with
+        x_write=None it stores the current chunk instead. The read uses the state as it was
+        before this write. prompt_emb, frames_since_switch and denoising_step feed the optional
+        gate_extra inputs; num_frames only feeds the diagnostics."""
         q, k, v, lr0, lr1, lr2, B = self._qkv_lr(x)
         if state is None:
             state = self.init_state(B, x.device, q.dtype)
-        if getattr(self, "state_type", "swiglu") == "linear_delta":
-            # ---- linear-delta core; the else-branch below is the SwiGLU core. Read,
-            # apply-first, plugged exactly where swiglu_apply reads:
-            # o_i = W @ q_i for the existing read-path queries q (fp32 matmul with the fp32
-            # state, cast back to the compute dtype so everything downstream, gate, modulation
-            # and injection, is unchanged). write: delta rule on the raw tokens of
-            # the same chunk the SwiGLU write receives (x_write of the eviction feed,
-            # else the current chunk). k/v/lr* of the qkv projection are unused by the rule.
-            assert allreduce_fn is None, "linear_delta: context-parallel write not supported"
-            (W,) = state
-            o = torch.matmul(q.float(), W.transpose(-1, -2)).type_as(q)
-            new_state = state
-            if do_update:
-                new_state = (self._linear_write(
-                    x_write if x_write is not None else x, W),)
-        else:
-            w0, w1, w2 = state
-            o = swiglu_apply(q, w0, w1, w2)                       # apply-first (state from < this chunk)
-            new_state = state
-            if do_update:                                          # write the (evicted, or current) chunk
-                if x_write is not None:                            # eviction-feed: write source = evicted tokens
+        o = self._read(q, state)
+        new_state = state
+        if do_update:
+            if self.state_type == "linear_delta":
+                assert allreduce_fn is None, "linear_delta: context-parallel write not supported"
+                new_state = (self._linear_write(x if x_write is None else x_write, state[0]),)
+            else:
+                if x_write is not None:
                     _, k, v, lr0, lr1, lr2, _ = self._qkv_lr(x_write)
-                decay, init_norms = self._decay_and_norms(B)
-                def _write(k, v, w0, w1, w2, lr0, lr1, lr2):
-                    g0, g1, g2 = swiglu_fast_weight_gradient(k, v, w0, w1, w2, lr0, lr1, lr2)
-                    return weight_norm_update(
-                        w0, w1, w2, g0, g1, g2, self.muon_update_steps, allreduce_fn,
-                        decay=decay, init_norms=init_norms)
-                if self.checkpoint_write and torch.is_grad_enabled():
-                    w0n, w1n, w2n = checkpoint(_write, k, v, w0, w1, w2, lr0, lr1, lr2,
-                                               use_reentrant=False)
-                else:
-                    w0n, w1n, w2n = _write(k, v, w0, w1, w2, lr0, lr1, lr2)
-                if self._detach():
-                    w0n, w1n, w2n = w0n.detach(), w1n.detach(), w2n.detach()
-                new_state = (w0n, w1n, w2n)
+                new_state = self._swiglu_write(k, v, lr0, lr1, lr2, state, B, allreduce_fn)
+            if self._detach():
+                new_state = tuple(t.detach() for t in new_state)
         out = self._project_output(o, B, prompt_emb=prompt_emb,
                                    frames_since_switch=frames_since_switch,
                                    denoising_step=denoising_step, num_frames=num_frames)
-        # lightweight diagnostics (0-dim tensors -> no host sync here; .item() at log time)
+        # 0-dim tensors, so no host sync here; the trainer calls .item() at log time
         self.dbg_read_rms = o.detach().float().pow(2).mean().sqrt()
         self.dbg_out_rms = out.detach().float().pow(2).mean().sqrt()
         return out, new_state
 
-    # ---- write-replay: the write alone, for offline replays of a rollout's write chain ----
-    def write_only(self, x_write, state, allreduce_fn=None, use_checkpoint=None, grad_fn=None,
-                   micro_batch=None):
-        """One fast-weight write: state -> new state from the evicted-chunk hidden x_write.
+    def _read(self, q, state):
+        """f_W(q) for the SwiGLU state, W q for the linear one. The linear state is fp32, so the
+        product is taken in fp32 and cast back: everything downstream sees the compute dtype."""
+        if self.state_type == "linear_delta":
+            return torch.matmul(q.float(), state[0].transpose(-1, -2)).type_as(q)
+        return swiglu_apply(q, *state)
 
-        Exactly the do_update branch of step() with x_write given, factored out so the
-        offline write-replay can re-run the write chain on collected h
-        sequences and get bitwise the same states as the in-situ rollout
-        Parity contract:
-          - `_qkv_lr(x_write)` is reused as is: the qkv projection stays one fused matmul
-            (1536 -> 4608) with q computed and thrown away, exactly like step(), re-doing
-            it as separate k/v matmuls would change the rounding;
-          - same `_decay_and_norms` per call, same `_write` op order, same checkpoint
-            mechanism (`use_reentrant=False`), no dtype cast added anywhere;
-          - no `_detach()` here: the caller owns the graph (replay_writes keeps it so the
-            gradient reaches qkv / k_norm / lrs / decay_logit through the whole chain);
-          - caller-side requirements for bitwise parity vs inference: module and x_write in
-            the deployment dtype (bf16), no ambient autocast, same TF32/backends settings
-            and same GPU model as the in-situ rollout.
-        use_checkpoint: None -> self.checkpoint_write (the config flag, same as step());
-        the checkpoint branch is only taken when grads are enabled, so a no_grad replay
-        follows the exact same code path as no_grad inference.
-        grad_fn (diagnostic replays only): the inner-loop gradient function, with the exact signature of
-        `swiglu_fast_weight_gradient` (k, v, w0, w1, w2, lr0, lr1, lr2) -> (g0, g1, g2).
-        None (the default, and the only value any training/inference path ever passes) calls
-        `swiglu_fast_weight_gradient` itself, so the default write is bitwise the write of
-        step(): calling the same function object through a local name changes nothing.
-        This exists so an offline replay can swap the write objective (error-correcting
-        variant) without duplicating a single line of the parity contract above.
-        micro_batch (diagnostic replays only): None (the
-        default, and the only value any training/inference path ever passes) = one update on
-        the whole chunk, bitwise the write of step(). An int m > 0 makes the write sequential:
-        the chunk's tokens are consumed in slices of m in their natural index order, each slice
-        seeing the state left by the previous ones. Invariants deliberately preserved so that
-        only the update schedule changes:
-          - `_qkv_lr` still runs once on the whole chunk (one fused matmul) and the slices are
-            taken on its output, so k/v/lr are token-for-token identical to the one-step write;
-          - `_decay_and_norms` still runs once per write and the forget gate is applied on the
-            first slice only (total = decay*w + sum of the slice updates, exactly the one-step
-            algebra); the later slices pass decay 1.0 and keep the same init_norms cap;
-          - the per-row norm cap is applied at every slice: in a sequential rule each
-            intermediate state is a real state (the next slice reads it), so it must be valid.
-        No gradient checkpointing on this path: it is an offline no_grad diagnostic replay.
-        Returns the new (w0, w1, w2) tuple. Nothing on the module is mutated."""
-        # this is the SwiGLU write-replay path; the linear_delta state replays
-        # offline, by replaying the rule on the stored tokens, never through here.
-        assert getattr(self, "state_type", "swiglu") == "swiglu", \
-            f"write_only is undefined for state_type={self.state_type!r}"
-        _, k, v, lr0, lr1, lr2, B = self._qkv_lr(x_write)
+    def _swiglu_write(self, k, v, lr0, lr1, lr2, state, B, allreduce_fn=None,
+                      use_checkpoint=None, grad_fn=None, micro_batch=None):
+        """The SwiGLU write, from projected keys, values and per-token learning rates. The one
+        place it is written: step() and write_only() both end here, so an offline replay builds
+        bitwise the states of the rollout it replays.
+
+        grad_fn replaces the inner-loop gradient (same signature as swiglu_fast_weight_gradient)
+        and micro_batch=m makes the write sequential, m tokens at a time in index order, each
+        slice seeing the state the previous one left. Both are for diagnostic replays; no
+        training or inference path sets them. Under micro_batch the forget gate fires on the
+        first slice only, so the total is still decay * w + the sum of the updates, and the norm
+        cap applies at every slice because each intermediate state is read by the next."""
         w0, w1, w2 = state
         decay, init_norms = self._decay_and_norms(B)
         gfn = swiglu_fast_weight_gradient if grad_fn is None else grad_fn
 
-        def _write(k, v, w0, w1, w2, lr0, lr1, lr2):
+        def update(k, v, w0, w1, w2, lr0, lr1, lr2, decay=decay):
             g0, g1, g2 = gfn(k, v, w0, w1, w2, lr0, lr1, lr2)
-            return weight_norm_update(
-                w0, w1, w2, g0, g1, g2, self.muon_update_steps, allreduce_fn,
-                decay=decay, init_norms=init_norms)
+            return weight_norm_update(w0, w1, w2, g0, g1, g2, self.muon_update_steps,
+                                      allreduce_fn, decay=decay, init_norms=init_norms)
 
         if micro_batch is None:
             use_ckpt = self.checkpoint_write if use_checkpoint is None else bool(use_checkpoint)
             if use_ckpt and torch.is_grad_enabled():
-                # non-reentrant checkpoint: activations of the write are recomputed in backward;
-                # gradients also flow to closure-captured tensors (decay <- decay_logit), which
-                # use_reentrant=False supports (reentrant would silently drop them).
-                return checkpoint(_write, k, v, w0, w1, w2, lr0, lr1, lr2, use_reentrant=False)
-            return _write(k, v, w0, w1, w2, lr0, lr1, lr2)
+                # non-reentrant: gradients also reach the tensors the closure captures
+                # (decay <- decay_logit), which the reentrant variant silently drops
+                return checkpoint(update, k, v, w0, w1, w2, lr0, lr1, lr2, use_reentrant=False)
+            return update(k, v, w0, w1, w2, lr0, lr1, lr2)
 
-        # ---- sequential micro-batch schedule (same two calls as `_write`, in a loop) ----
         m, L = int(micro_batch), int(k.shape[-2])
         assert m > 0, f"micro_batch must be > 0, got {micro_batch}"
-        keep = (1.0, 1.0, 1.0)               # "no forgetting": the decay already fired, slice 0
         for s in range(0, L, m):
             e = min(s + m, L)
-            g0, g1, g2 = gfn(k[..., s:e, :], v[..., s:e, :], w0, w1, w2,
-                             lr0[..., s:e, :], lr1[..., s:e, :], lr2[..., s:e, :])
-            w0, w1, w2 = weight_norm_update(
-                w0, w1, w2, g0, g1, g2, self.muon_update_steps, allreduce_fn,
-                decay=None if decay is None else (decay if s == 0 else keep),
-                init_norms=init_norms)
+            slice_decay = decay if (decay is None or s == 0) else (1.0, 1.0, 1.0)
+            w0, w1, w2 = update(k[..., s:e, :], v[..., s:e, :], w0, w1, w2,
+                                lr0[..., s:e, :], lr1[..., s:e, :], lr2[..., s:e, :],
+                                decay=slice_decay)
         return w0, w1, w2
+
+    def write_only(self, x_write, state, allreduce_fn=None, use_checkpoint=None, grad_fn=None,
+                   micro_batch=None):
+        """The write of step() without the read, for replaying a rollout's writes offline:
+        state -> new (w0, w1, w2) from x_write, the hidden states of an evicted chunk.
+
+        The graph is kept (no detach), so a replay can train the write parameters through the
+        whole chain. For the states to match the rollout bitwise, the caller must give the module
+        and x_write in the deployment dtype (bf16), run without ambient autocast, and keep the
+        TF32 flags and GPU model of the rollout. grad_fn and micro_batch: see _swiglu_write."""
+        assert self.state_type == "swiglu", \
+            f"write_only is undefined for state_type={self.state_type!r}"
+        _, k, v, lr0, lr1, lr2, B = self._qkv_lr(x_write)
+        return self._swiglu_write(k, v, lr0, lr1, lr2, state, B, allreduce_fn,
+                                  use_checkpoint, grad_fn, micro_batch)
 
 
 def replay_writes(layer, h_seq, detach_state=False, state=None, detach_init=True,
                   n_bptt_writes=None, use_checkpoint=None, allreduce_fn=None,
                   return_all=False, grad_fn=None, micro_batch=None):
-    """Differentiable write-replay: re-run a cell's whole write sequence on an
-    ordered list of evicted-chunk hiddens, offline, keeping the graph toward the write
-    parameters (qkv, k_norm, lrs, decay_logit).
+    """Re-run a cell's whole sequence of writes offline, on the ordered hidden states of the
+    chunks it evicted, keeping the graph toward the write parameters (qkv, k_norm, lrs,
+    decay_logit). Returns the final (w0, w1, w2), or (final, [state after each write]) with
+    return_all.
 
-    This works because under MEM_ZERO_ALL=1 the h fed to the writes are pure functions of the
-    frozen backbone, data independent of the writer's parameters, so replaying
-    `state <- write_theta(state, h_i)` from the init state reproduces the state trajectory of
-    the original rollout exactly rather than approximately.
+    The replay is exact and not an approximation because, with the injection zeroed
+    (MEM_ZERO_ALL=1), the hidden states fed to the writes are functions of the frozen backbone
+    alone: they do not depend on the write parameters, so replaying
+    state <- write(state, h_i) from the init state retraces the rollout's states.
 
-    Args:
-        layer: a VideoMemoryLayer (typically blocks[5/16/27].memory of the loaded pipeline),
-            in the deployment dtype (bf16). Its own detach_state flag is irrelevant here:
-            this function never calls step()/_detach(); graph control is explicit below.
-        h_seq: ordered list of write inputs, h_seq[i] = the mem_x_write of the i-th write
-            (the fifo-popped evicted chunk, shape (B, Lw, dim)), in write_chunks order.
-            Must be on layer's device and in layer's compute dtype (cast fp16-stored shards
-            back to bf16 before calling, exact for in-range values).
-        detach_state: True cuts the graph after every write (values unchanged; useful for
-            probing). False (default, the training mode) keeps the full graph.
-        state: initial (w0, w1, w2); None -> layer.init_state(B, device, dtype) exactly like
-            the first in-situ write pass (state is None until the first write pass, which
-            initializes it from the w0/w1/w2 init parameters).
-        detach_init: detach the initial state from the w0/w1/w2 init parameters (True =
-            the inits stay frozen; False = the gradient flows into them).
-        n_bptt_writes: truncated BPTT, only the last n writes build a graph, older writes
-            run under no_grad (stop-gradient at the boundary). The forward is unchanged, so
-            bitwise parity with inference is preserved. None =
-            full BPTT. 0 = pure forward.
-        use_checkpoint: per-write gradient checkpointing; None -> layer.checkpoint_write.
-        return_all: also return the list of states, one per write.
-        grad_fn, micro_batch: forwarded verbatim to write_only; None (default) = the write
-            objective and the one-step schedule of step(), bitwise (see write_only's
-            docstring). Diagnostic replays only.
-
-    Returns: final (w0, w1, w2), or (final, [per-write states]) if return_all."""
-    assert len(h_seq) > 0, "replay_writes: empty h_seq"
-    wdt = layer.qkv.weight.dtype
+    layer           a VideoMemoryLayer in the deployment dtype (bf16). Its detach_state flag
+                    plays no part: the graph is controlled by the arguments below.
+    h_seq           h_seq[i] (B, Lw, dim) is the input of the i-th write, on the layer's device
+                    and in its dtype: cast fp16 shards back to bf16 before calling, never
+                    inside the chain
+    state           where to start; None = the init state, as the first write of a rollout
+    detach_init     keep the init weights out of the graph (True) or train them too
+    n_bptt_writes   only the last n writes build a graph; None = all, 0 = a pure forward.
+                    The values do not change, so parity with the rollout holds either way.
+    detach_state    cut the graph after every write, for probing
+    use_checkpoint, grad_fn, micro_batch, allreduce_fn   passed on to write_only"""
+    assert h_seq, "replay_writes: empty h_seq"
+    weight = layer.qkv.weight
     for i, h in enumerate(h_seq):
         assert h.dim() == 3 and h.shape[-1] == layer.dim, \
             f"h_seq[{i}]: shape {tuple(h.shape)}, expected (B, Lw, {layer.dim})"
-        assert h.dtype == wdt, \
-            (f"h_seq[{i}] dtype {h.dtype} != module dtype {wdt}: cast stored h back to the "
-             f"deployment dtype BEFORE replay (fp16 shard -> bf16), never inside the chain")
-        assert h.device == layer.qkv.weight.device, \
-            f"h_seq[{i}] on {h.device}, module on {layer.qkv.weight.device}"
+        assert h.dtype == weight.dtype, \
+            (f"h_seq[{i}] dtype {h.dtype} != module dtype {weight.dtype}: cast stored h back to "
+             f"the deployment dtype BEFORE replay (fp16 shard -> bf16), never inside the chain")
+        assert h.device == weight.device, f"h_seq[{i}] on {h.device}, module on {weight.device}"
     if state is None:
-        state = layer.init_state(h_seq[0].shape[0], h_seq[0].device, wdt)
+        state = layer.init_state(h_seq[0].shape[0], h_seq[0].device, weight.dtype)
     if detach_init:
         state = tuple(t.detach() for t in state)
 
-    n = len(h_seq)
-    n_grad = n if n_bptt_writes is None else max(0, min(int(n_bptt_writes), n))
-    cut = n - n_grad                     # writes [0, cut) run under no_grad (truncated BPTT)
-    all_states = [] if return_all else None
+    n_grad = len(h_seq) if n_bptt_writes is None else max(0, min(int(n_bptt_writes), len(h_seq)))
+    first_with_grad = len(h_seq) - n_grad
+    all_states = []
     for i, h in enumerate(h_seq):
-        if i < cut:
-            with torch.no_grad():        # forward identical; only the graph is cut
-                state = layer.write_only(h, state, allreduce_fn=allreduce_fn,
-                                         use_checkpoint=use_checkpoint, grad_fn=grad_fn,
-                                         micro_batch=micro_batch)
-        else:
+        with torch.set_grad_enabled(i >= first_with_grad and torch.is_grad_enabled()):
             state = layer.write_only(h, state, allreduce_fn=allreduce_fn,
                                      use_checkpoint=use_checkpoint, grad_fn=grad_fn,
                                      micro_batch=micro_batch)
         if detach_state:
             state = tuple(t.detach() for t in state)
-        if return_all:
+        if return_all:                  # otherwise each state is freed as the next replaces it
             all_states.append(state)
     return (state, all_states) if return_all else state
-

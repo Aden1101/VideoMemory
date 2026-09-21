@@ -17,6 +17,7 @@ import time
 import torch
 
 cpu = torch.device("cpu")
+_GB = 1024 ** 3
 
 
 def _detect():
@@ -99,12 +100,12 @@ def empty_cache(dev=None):
 def total_memory_gb(dev=None):
     k = kind(dev)
     if k == "cuda":
-        return torch.cuda.get_device_properties(dev).total_memory / (1024 ** 3)
+        return torch.cuda.get_device_properties(dev).total_memory / _GB
     if k == "mps":
         # Metal's recommended working-set ceiling, not total RAM: on unified memory this is the
         # amount a process can actually expect to use.
-        return torch.mps.recommended_max_memory() / (1024 ** 3)
-    return float(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+        return torch.mps.recommended_max_memory() / _GB
+    return float(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / _GB
 
 
 def free_memory_gb(dev=None):
@@ -121,11 +122,11 @@ def free_memory_gb(dev=None):
         stats = torch.cuda.memory_stats(dev)
         inactive_reserved = stats["reserved_bytes.all.current"] - stats["active_bytes.all.current"]
         free_driver, _ = torch.cuda.mem_get_info(dev)
-        return (free_driver + inactive_reserved) / (1024 ** 3)
+        return (free_driver + inactive_reserved) / _GB
     if k == "mps":
         used = torch.mps.driver_allocated_memory() if hasattr(torch.mps, "driver_allocated_memory") \
             else torch.mps.current_allocated_memory()
-        return max(0.0, torch.mps.recommended_max_memory() - used) / (1024 ** 3)
+        return max(0.0, torch.mps.recommended_max_memory() - used) / _GB
     return total_memory_gb(dev)
 
 
