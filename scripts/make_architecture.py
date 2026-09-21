@@ -186,9 +186,10 @@ def draw_block():
 def draw_cell():
     """Two lanes around the state W. The read, on the current chunk: queries through the fast
     weights, normalised, gated, injected. The write, on the evicted chunk: one gradient step on an
-    inner score, orthogonalised by Newton-Schulz iterations (Muon), then each column rescaled to
-    its initial norm. The read of a step uses the state from before that step's write."""
-    c = Canvas(15.6, 5.9)
+    inner score, orthogonalised by Newton-Schulz iterations (Muon), then the columns renormalised:
+    back to their initial norm, or capped at it when the state is allowed to forget (use_decay).
+    The read of a step uses the state from before that step's write."""
+    c = Canvas(16.4, 5.9)
     read_y, state_y, write_y = 4.55, 2.95, 1.35
 
     c.text(0.15, read_y + 0.9, "read", size=10, colour=BLUE, weight="bold", ha="left")
@@ -222,11 +223,11 @@ def draw_cell():
     c.module(7.75, write_y, 2.0, 0.78, "Muon", face="#ffffff", edge=ORANGE)
     c.text(7.75, write_y - 0.62, "Newton-Schulz, 5 iterations", size=8.2, colour=MUTED)
     c.arrow((8.75, write_y), (9.65, write_y), colour=ORANGE)
-    c.module(10.95, write_y, 2.6, 0.78, "rescale each column\nto its initial norm", face="#ffffff",
+    c.module(10.95, write_y, 2.6, 0.78, "renormalise\nthe columns", face="#ffffff",
              edge=ORANGE, size=9)
     c.arrow((12.25, write_y), (13.0, write_y), (13.0, state_y), (6.2, state_y), colour=ORANGE)
-    c.text(13.15, (write_y + state_y) / 2, "the new state:\nit can rotate,\nnot grow", size=8.8,
-           colour=ORANGE, ha="left")
+    c.text(13.15, (write_y + state_y) / 2, "the new state:\ncolumn norms never\nexceed their initial value",
+           size=8.8, colour=ORANGE, ha="left")
     c.arrow((4.6, state_y - 0.48), (4.6, write_y + 0.39), colour=ORANGE)
     c.save("arch_cell.png")
 
