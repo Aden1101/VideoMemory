@@ -2,7 +2,7 @@
 and TTTBlockCache. Small, CPU, float32, no weights.
 
 tests/test_grad.py checks the hand-derived write gradient against autograd; this file checks
-the behaviour the README claims for the cell.
+the behavior the README claims for the cell.
 
     python -m pytest tests/test_memory_cell.py
 """

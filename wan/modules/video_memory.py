@@ -7,7 +7,7 @@ the renormalization back to the initial norms, the gated injection and the evict
 
 Words used below. The fast weights (w0, w1, w2) are the MLP's weights: one forward pass
 rewrites them, which is what "test-time training" means, while the optimizer trains everything
-else. Muon orthogonalises the write's gradient with a few Newton-Schulz iterations before it is
+else. Muon orthogonalizes the write's gradient with a few Newton-Schulz iterations before it is
 applied. A chunk is the 3 latent frames generated in one go. The eviction feed hands the write
 the chunk that has just left the attention window instead of the current one.
 """
@@ -280,10 +280,10 @@ class VideoMemoryLayer(nn.Module):
       qk_norm                 RMSNorm on q and k, for stability over a long rollout
       g_init                  initial gate bias; 0 makes the branch inert at step 0
       use_decay, decay_init   let the state forget: w <- decay * w + update, norms capped at
-                              their init value, instead of renormalising to a fixed norm
+                              their init value, instead of renormalizing to a fixed norm
       bounded_gate            tanh on the gate, so the injection cannot grow without bound
       bounded_mod             tanh on scale and shift too
-      rel_norm                normalise the read by one RMS per chunk instead of per token, so
+      rel_norm                normalize the read by one RMS per chunk instead of per token, so
                               a token's read magnitude, its relevance, reaches the gate
       single_norm             without rel_norm: skip the per-token norm of the read
       dc_remove               subtract the token mean of the injection, so the branch cannot
@@ -291,7 +291,7 @@ class VideoMemoryLayer(nn.Module):
       detach_state            None = detach the new state in eval, keep its graph in training
       checkpoint_write        gradient-checkpoint the write
       gate_extra              extra gate inputs among "agreement", "denoising_step",
-                              "frames_since_switch"; zero-initialised, so inert until trained
+                              "frames_since_switch"; zero-initialized, so inert until trained
       state_type              "swiglu", the fast-weight MLP (w0, w1, w2), or "linear_delta":
                               one fp32 matrix W per block, written by a training-free delta
                               rule on the raw evicted tokens and read as W q. Six times
@@ -402,7 +402,7 @@ class VideoMemoryLayer(nn.Module):
             self.gx_po = nn.Linear(dim, self.GX_RANK, bias=False)     # of the memory read
             self.gx_pc = nn.Linear(dim, self.GX_RANK, bias=False)     # of the pooled prompt
         width = sum(w for name, w in self.GATE_INPUTS.items() if name in self.gate_extra)
-        # added to proj's output, and zero-initialised: the inputs do nothing until trained
+        # added to proj's output, and zero-initialized: the inputs do nothing until trained
         self.proj_extra = nn.Linear(width, 3 * dim, bias=False)
         nn.init.zeros_(self.proj_extra.weight)
 
@@ -428,15 +428,15 @@ class VideoMemoryLayer(nn.Module):
         return torch.cat(feats, dim=-1)
 
     def reset_parameters(self):
-        """Re-apply the branch's own initialisation. To be called after any global init of the
-        model: CausalWanModel.init_weights xavier-initialises every nn.Linear, this one included."""
+        """Re-apply the branch's own initialization. To be called after any global init of the
+        model: CausalWanModel.init_weights xavier-initializes every nn.Linear, this one included."""
         self._init_modulation_params(self.dim, g_init=self.g_init)
         if self.gate_extra:
             nn.init.zeros_(self.proj_extra.weight)
 
     def _qkv_lr(self, x):
         """x (B, L, dim) -> q, k, v and the three per-token learning rates, each
-        (B * heads, L, .), plus B. q and k are RMS-normalised per head."""
+        (B * heads, L, .), plus B. q and k are RMS-normalized per head."""
         B = x.shape[0]
         q, k, v = rearrange(self.qkv(x), "b l (qkv h d) -> qkv b h l d", qkv=3, h=self.num_heads)
         q, k = self.q_norm(q), self.k_norm(k)
@@ -456,7 +456,7 @@ class VideoMemoryLayer(nn.Module):
     def _project_output(self, x, batch_size, prompt_emb=None,
                         frames_since_switch=None, denoising_step=None, num_frames=None):
         """The read -> the injection: gate * (carrier * (1 + scale) + shift), where shift, scale
-        and gate are one projection of the normalised read and the carrier is that read."""
+        and gate are one projection of the normalized read and the carrier is that read."""
         if self.rel_norm:
             # one RMS per chunk: the growth of the state with the write count cancels, while a
             # token's read magnitude relative to the others survives. eps inside the sqrt keeps
@@ -539,7 +539,7 @@ class VideoMemoryLayer(nn.Module):
     def _decay_and_norms(self, B):
         """Under use_decay: the forget gate, one learned scalar used for the three weights, and
         the column norms of the init weights, the ceiling weight_norm_update caps the state at.
-        (None, None) otherwise, and weight_norm_update then renormalises to a fixed norm."""
+        (None, None) otherwise, and weight_norm_update then renormalizes to a fixed norm."""
         if not self.use_decay:
             return None, None
         decay = torch.sigmoid(self.decay_logit)

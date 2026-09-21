@@ -38,7 +38,7 @@ def memory_cell_args(memory_kwargs):
 def _reject_parallel(mem_out, x):
     """MEM_REJECT_STREAM, a control arm (results/run1_write_current_chunk/eval_R1): remove, per
     token, the component of the injection parallel to the residual stream x, "more of what is
-    already there" and the part suspected of damping motion. No renormalisation afterwards, so
+    already there" and the part suspected of damping motion. No renormalization afterwards, so
     a read that is entirely self-similar injects nearly nothing."""
     direction = x.detach().float()
     direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -125,7 +125,7 @@ class MemoryInjectMixin:
     def _scale_to_stream(self, mem_out, x):
         """Scale the injection by a fraction of the local RMS of the residual stream, so it
         cannot pile up into an artifact over a long rollout. Measured on x and not on the
-        normalised h, and detached, so the memory cannot inflate the stream to earn a bigger
+        normalized h, and detached, so the memory cannot inflate the stream to earn a bigger
         injection. MEM_STREAM_SCALE overrides the config value at inference."""
         override = env_str("MEM_STREAM_SCALE")
         scale = float(override) if override else float(self.mem_stream_scale or 0.0)

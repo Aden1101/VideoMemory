@@ -156,7 +156,7 @@ class MemoryTrainingMixin:
             elif name.endswith("gx_pc.weight"):       # agreement: projection of the prompt
                 self._scalar(f"Pc_b{b}", w.norm().item())
             elif name.endswith("proj_extra.weight"):
-                # zero-initialised, so the norm of the columns fed by one input says how much
+                # zero-initialized, so the norm of the columns fed by one input says how much
                 # the gate learned to use it. Columns: [agreement (1) | denoising step (E) |
                 # frames since switch (E)]; the E-wide ones are divided by sqrt(E) to compare.
                 E = 16
@@ -270,7 +270,7 @@ class MemoryTrainingMixin:
             mem_ignored = [cell for _, cell in self._memory_cells()]
             for m in mem_ignored:
                 m.to(device=self.device, dtype=self.dtype)
-            # each process initialised its own copy at random: copy rank 0's to the others, so
+            # each process initialized its own copy at random: copy rank 0's to the others, so
             # that all train one memory (its gradients are averaged before each optimizer step)
             for m in mem_ignored:
                 for p in m.parameters():
@@ -285,7 +285,7 @@ class MemoryTrainingMixin:
         gen = self.model.generator
         mem_params = [p for n, p in gen.named_parameters() if "memory" in n and p.requires_grad]
         other_params = [p for n, p in gen.named_parameters() if "memory" not in n and p.requires_grad]
-        # the memory is recognised by "memory" in the parameter name, which a wrapper could rename
+        # the memory is recognized by "memory" in the parameter name, which a wrapper could rename
         assert mem_params or not any("memory" in n for n, _ in gen.named_parameters()), \
             "memory params exist but none landed in the optimizer group (name-match broke post-FSDP)"
         generator_param_groups = [{"params": other_params, "lr": config.lr}]  # LoRA adapters

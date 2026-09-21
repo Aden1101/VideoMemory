@@ -126,7 +126,7 @@ class AnchorControlsMixin:
             device=frame.device, dtype=torch.float32)
         mu = ref.mean(dim=(0, 1, 3, 4), keepdim=True)      # per latent channel (dim 2)
         sd = ref.std(dim=(0, 1, 3, 4), keepdim=True)
-        # MEM_DECODE_NOISE_SEED is set per run, so paired runs do not all share one realisation
+        # MEM_DECODE_NOISE_SEED is set per run, so paired runs do not all share one realization
         eps = private_noise(frame, env_int("MEM_DECODE_NOISE_SEED", ANCHOR_NOISE_SEED) + current_start_frame)
         noise = mu + sd * eps
         out = mix_with_noise(frame.float(), noise, s).to(frame.dtype)
