@@ -24,7 +24,6 @@ auto_resume: false
 logdir: ckpt/runs/run3_write_evicted_stable
 use_wandb: true
 wandb_project: anchor-forcing-memory
-wandb_name: run3_write_evicted_stable
 # 0.99 per generator update, one every 5 trainer steps: tau ~500 steps. 0.999 would barely move.
 ema_weight: 0.99
 ema_start_step: 250
