@@ -39,7 +39,7 @@ class AnchorControlsMixin:
     def _anchor_content(self, output, lo, hi):
         """The original-A content that gets spliced at the return: output[:, lo:hi] by default.
         ANCHOR_FROM_FILE replaces it with a latent frame loaded from disk:
-        the original-A anchor of ANOTHER SEED of the same prompt pair: same prompt, same scene
+        the original-A anchor of another seed of the same prompt pair: same prompt, same scene
         grammar, same sharpness, wrong instance. ANCHOR_BLUR_SIGMA blurs
         the true frame instead. With both off, the true frame is returned as it is."""
         real = output[:, lo:hi]
@@ -91,7 +91,7 @@ class AnchorControlsMixin:
     #   MEM_DECODE_NOISE=s     replace the anchor with noise calibrated on the current window's
     #                          own statistics. At s = 1 nothing of the anchor is left, so what
     #                          still helps is only "erase that slot and let the prompt repaint".
-    #   MEM_DECODE_SRC=path    use the anchor decoded from ANOTHER video's memory: same decoder,
+    #   MEM_DECODE_SRC=path    use the anchor decoded from another video's memory: same decoder,
     #                          same fidelity, same statistics, wrong content.
     def _maybe_wrong_anchor(self, frame):
         """MEM_DECODE_SRC: the anchor decoded from another video's memory instead of this one,
@@ -137,12 +137,12 @@ class AnchorControlsMixin:
               f"{float(out.float().std()):.3f}", flush=True)
         return out
 
-    # ---- stop lying to the model about the anchor's noise level ------------------------------
-    # The splice declares the anchor as a clean frame (t = 0) although it is blurry and off the
-    # data manifold. The model reads it as a clean frame of its immediate past, the norm damps it
-    # and the current context absorbs it. The fix is two inseparable gestures: actually noise the
-    # anchor to level t*, and declare that same t* for its slot. The anchor then becomes an
-    # honest noisy latent, a thing the model saw millions of times during training.
+    # ---- declaring the anchor's real noise level ------------------------------------------
+    # A splice declares the anchor as a clean frame (t = 0) although it is blurry and off the
+    # data manifold: the model reads it as a clean frame of its immediate past, and the current
+    # context absorbs it. Here the anchor is noised to a level t and that same t is declared
+    # for its slots, two steps that only make sense together. The anchor is then an ordinary
+    # noisy latent, which the model saw throughout training.
     #
     #   MEM_ANCHOR_T=0/unset   off, and every arm is unchanged
     #   MEM_ANCHOR_T=t         t in (0, 1000], the level both applied and declared

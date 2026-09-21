@@ -71,15 +71,13 @@ class FrameBankMixin:
         while FRAMEBANK stays off and the recalled frame is thrown away: the same moment as the
         framebank arm, a different content.
 
-        `force` (FRAMEBANK_GT) replaces the router's
-        decision by the schedule's ground-truth revisit flag, without touching the selection:
-        force=True recalls the argmax candidate even below tau, force=False recalls nothing.
-        Default None = the published behaviour, bitwise. Why: with an impoverished return prompt
-        ('the animal from earlier returns') the prompt cosine collapses, the bank never fires and
-        the arm silently degenerates into a no-recall run, and the comparison would then be
-        'a splice vs no splice', not 'which content'. What the router would have done is kept in
-        the event (router_recalled / router_chosen_seg / router_s_max): it is a result of its own,
-        not a detail (word routing dies in the generic regime)."""
+        `force` (FRAMEBANK_GT) replaces the router's decision with the schedule's ground-truth
+        revisit flag and leaves the selection alone: True recalls the argmax candidate even
+        below tau, False recalls nothing, None lets the router decide. It exists because a
+        vague return prompt ("the animal from earlier returns") collapses the prompt cosine, the
+        bank never fires, and the comparison becomes a splice against no splice instead of one
+        content against another. What the router would have done stays in the event
+        (router_recalled, router_chosen_seg), since how often it fails is a result too."""
         mode = mode or self._fb_mode()
         tau = env_float("FRAMEBANK_TAU", 0.90)
         tie = (os.environ.get("FRAMEBANK_TIE", "recent") or "recent").strip().lower()

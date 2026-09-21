@@ -10,15 +10,14 @@ from utils.env import env_int, env_str
 class SinkMixin:
 
     # ---- refreshing the pinned sink, the cheapest possible explanation ------------------------
-    # The sink holds the opening frames forever and is never rewritten, so when the subject does
-    # not open the video, the opener keeps a permanent grip on every later segment. The obvious
-    # objection to our gain is then: you are only lifting that grip, and refreshing the sink at
-    # the switch would give the same thing with no memory at all. This arm is that objection,
-    # implemented: no recall, no memory, no decoder, just the sink slots overwritten with the
-    # last true frame of the current scene. The rolling window is left alone.
+    # The sink holds the opening frames forever, so when the subject does not open the video,
+    # the opener weighs on every later segment. Any recall arm also lifts that weight, and the
+    # question is whether that alone explains what it gains. This arm answers it: no recall, no
+    # memory, no decoder, only the sink slots overwritten with the last true frame of the current
+    # scene. The rolling window is left alone.
     #   MEM_SINKPURGE=0/unset  off (default)
-    #   MEM_SINKPURGE=1        purge at revisit switches only (paired with the splice arms: same
-    #                          instant, same cell, so the comparison is apples to apples)
+    #   MEM_SINKPURGE=1        purge at revisit switches only: the same instant as the splice
+    #                          arms, so the two compare
     #   MEM_SINKPURGE=2        purge at every switch (the "always refresh" variant)
     def _sink_frames(self):
         """Runtime sink size in latent FRAMES, read from the model (set_runtime_sink_size aware)."""
@@ -74,7 +73,7 @@ class SinkMixin:
         # address the sink slots through the window arithmetic (empty write span). Instead:
         # prefill the anchor into a fresh temporary 1-frame cache (clean position-0 write),
         # then copy its k/v into the sink slots of the real cache (buffer layout [sink|window],
-        # sink = first sink_tokens entries, stored UNroped under rope_enhance like any key).
+        # sink = first sink_tokens entries, stored without RoPE under rope_enhance like any key).
         tmp = self._prefill_scratch_cache(anchor_frames, conditional_dict)
         with torch.no_grad():
             n_tok = nf * self.frame_seq_length

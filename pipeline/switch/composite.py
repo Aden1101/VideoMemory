@@ -9,14 +9,12 @@ from utils.env import env_float, env_int, env_str
 
 class CompositeMixin:
     # ---- bringing back the subject without the old scene -------------------------------------
-    # The splice replaces a whole latent frame, so the return re-renders the entire scene from
-    # the past: a shop awning flips colour at the return, while the frame-bank baseline brings
-    # the subject back into an intact scene. The border metric saw it, the re-ID crop did not.
-    # The fix is to composite the spliced latent instead of overwriting it:
+    # A splice replaces a whole latent frame, so it brings back the past scene along with the
+    # subject: the background jumps at the return, which a crop on the subject does not measure
+    # and a metric on the border does. Compositing keeps the current scene instead:
     #     composite = m * anchor (the subject, decoded or real) + (1 - m) * background
-    # with background = the last true latent frame of the current context (the frame produced just
-    # before the return switch, i.e. exactly the frame the replay evicts) and m a soft elliptical
-    # center mask. The recalled identity keeps the center; the world keeps rolling at the border.
+    # where the background is the last true latent frame of the current context, the one the
+    # splice would have evicted, and m a soft elliptical mask on the centre.
     #   MEM_DECODE_COMPOSITE=1  turn it on   (0 or unset: the anchor is spliced whole)
     #   MEM_COMP_CROP=0.6       fraction of H and W covered by the ellipse at m = 0.5 (the
     #                           center-60 % of the re-ID crop by default)
@@ -26,10 +24,9 @@ class CompositeMixin:
     def _composite_mask(H, W, crop, feather, device, dtype, cy=None, cx=None):
         """Soft elliptical mask on the latent grid: 1 = take the anchor (the subject),
         0 = keep the current context (the background). The blend weights are the pair
-        (m, 1 - m), so they sum to 1 EVERYWHERE by construction. smoothstep => C1 at both ends
-        of the ring, hence no seam in the decoded pixels.
-        (cy, cx) = ellipse center in PIXELS of the latent grid; None = the geometric center
-        (the default, which every composite arm uses unless it passes a center)."""
+        (m, 1 - m), so they sum to 1 at every pixel. The smoothstep is C1 at both ends of the
+        ring, hence no seam in the decoded pixels. (cy, cx) is the ellipse centre in pixels of
+        the latent grid; None is the geometric centre, which every arm uses unless it passes one."""
         assert 0.0 < crop <= 1.0, f"MEM_COMP_CROP must be in (0, 1], got {crop}"
         assert 0.0 <= feather < 1.0, f"MEM_COMP_FEATHER must be in [0, 1), got {feather}"
         cy = (H - 1) / 2.0 if cy is None else float(cy)
@@ -44,11 +41,10 @@ class CompositeMixin:
 
     @staticmethod
     def _energy_centroid(lat):
-        """Crude subject localizer on a latent frame, used by the UNION mask: the
-        centroid of the spatial energy that deviates from the frame's own spatial mean, i.e.
-        'where does this frame stop looking like a flat backdrop'. No cross-attention, no
-        detector: a 5-line saliency whose only job is to be better than 'always the center'.
-        lat (B,1,C,H,W) -> (cy, cx) in latent pixels."""
+        """Where the subject is on a latent frame, for the union mask: the centroid of the
+        energy that departs from the frame's own spatial mean. No cross-attention and no
+        detector; it only has to beat "always the centre".
+        lat (B,1,C,H,W) -> (cy, cx) in latent pixels, or (None, None) on a flat frame."""
         x = lat[0, 0].float()                                     # (C,H,W)
         e = (x - x.mean(dim=(1, 2), keepdim=True)).pow(2).sum(0).sqrt()      # (H,W)
         w = (e - e.median()).clamp_min(0.0)                       # keep the salient half
@@ -102,16 +98,14 @@ class CompositeMixin:
         self._comp_gate_now = 1.0
 
     def _comp_alpha(self):
-        """Composite DOSE in [0, 1]. alpha = 1 (default) = the full composite; alpha = 0 leaves
-        the anchor STRICTLY untouched, i.e. the arm falls back to its non-composite twin, which
-        is what makes the prompt gate safe to ship.
+        """Dose of the composite in [0, 1]. 1, the default, is the full composite; 0 gives the
+        anchor back bit for bit, so a gated arm can fall back to its non-composite twin.
           MEM_COMP_ALPHA=a          fixed dose
           MEM_COMP_PROMPT_GATE=1    a is multiplied by a ramp on the cosine between the prompt
-                                    ENTERING at this revisit and the prompt of the segment being
-                                    left: same decor asked twice (high cosine) => composite, so
-                                    the world must keep rolling; unrelated scene (low cosine) =>
-                                    alpha -> 0, the plain full-frame splice, because there a cut
-                                    is legitimate montage grammar.
+                                    entering at this revisit and the prompt being left. Close
+                                    prompts ask for the same scene twice, so the scene has to
+                                    continue: composite. Unrelated prompts make a cut
+                                    acceptable: dose 0, the plain full-frame splice.
           MEM_COMP_GATE_LO/HI       the ramp bounds (defaults 0.50 / 0.80)"""
         a = env_float("MEM_COMP_ALPHA", 1)
         if env_int("MEM_COMP_PROMPT_GATE"):
@@ -147,8 +141,8 @@ class CompositeMixin:
         if not env_int("MEM_DECODE_COMPOSITE"):
             return anchor
         assert os.environ.get("REPLAY_PAST_POS", "") not in ("head", "sink0"), \
-            "MEM_DECODE_COMPOSITE is defined for the RECENCY placement only (the background it " \
-            "blends into is the CURRENT context, which only makes sense at the recency slot)"
+            "MEM_DECODE_COMPOSITE is defined for the most recent slot only: the background it " \
+            "blends into is the current context"
         assert current_start_frame >= 1, "MEM_DECODE_COMPOSITE before any frame was produced"
         bg = output[:, current_start_frame - 1:current_start_frame].to(
             device=anchor.device, dtype=anchor.dtype)

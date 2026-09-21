@@ -304,37 +304,38 @@ class MemoryTrainingMixin:
                            float(getattr(config, "lr_mem_floor_frac", 1.0))]
 
     def _sample_bptt_horizon(self):
-        """How many chunks this generator step rolls out."""
-        # Cross-chunk truncated BPTT over K = bptt_window chunks: roll K chunks, detach the state
-        # only at the window start, sum the per-chunk losses, one backward over the window (trains
-        # the write across chunk boundaries; graph alive for one backward, freed after = no leak).
-        K_bptt = int(getattr(self.config, "bptt_window", 1))
-        # per-step random horizon K ~ U{bptt_window_min .. bptt_window} so the single grad
-        # chunk (W=1) supervises many horizons up to the freeze horizon, at proven W=1 VRAM.
-        # Rank-synced: FSDP collectives require every rank to run the same number of forwards.
-        K_min = int(getattr(self.config, "bptt_window_min", K_bptt))
-        if K_bptt > K_min:
-            if not dist.is_initialized():
-                K_bptt = int(torch.randint(K_min, K_bptt + 1, (1,)).item())
-            else:
-                _K = torch.tensor(
-                    int(torch.randint(K_min, K_bptt + 1, (1,)).item()) if dist.get_rank() == 0 else 0,
-                    device=self.device, dtype=torch.int32)
-                dist.broadcast(_K, src=0)
-                K_bptt = int(_K.item())
-        return K_bptt
+        """How many chunks this generator step rolls out: `bptt_window`, or a draw between
+        `bptt_window_min` and it. The state is detached only where the window starts and one
+        backward runs over the window, so the write is trained across chunk boundaries. A random
+        horizon lets a short gradient tail supervise states of many ages at the memory cost of
+        that tail alone. Rank 0 draws and broadcasts: FSDP needs every rank to run the same
+        number of forwards."""
+        horizon = int(getattr(self.config, "bptt_window", 1))
+        shortest = int(getattr(self.config, "bptt_window_min", horizon))
+        if horizon <= shortest:
+            return horizon
+        def draw():
+            return int(torch.randint(shortest, horizon + 1, (1,)).item())
 
-    def _bptt_generator_step(self, K_bptt):
-        """One generator step over a window of K_bptt chunks. Returns the log dict."""
-        # roll K_bptt chunks: the first (K_bptt - tail) under no_grad (deep state past KV-eviction,
-        # cheap), the last tail with grad = the supervised tail. tail=1 avoids the cross-chunk
-        # checkpoint-vs-eviction error (no backward recomputes a previous chunk). Absent -> tail=K.
-        tail = int(getattr(self.config, "grad_tail_W", K_bptt))
-        tail = max(1, min(tail, K_bptt))
+        if not dist.is_initialized():
+            return draw()
+        # only rank 0 draws, so the other ranks' random streams are left alone
+        shared = torch.tensor(draw() if dist.get_rank() == 0 else 0, device=self.device, dtype=torch.int32)
+        dist.broadcast(shared, src=0)
+        return int(shared.item())
+
+    def _bptt_generator_step(self, horizon):
+        """One generator step over a window of `horizon` chunks. Returns the log dict."""
+        # The first horizon - tail chunks run under no_grad: they only age the state past the
+        # KV eviction, cheaply. The last `tail` chunks carry the gradient. A tail of one chunk
+        # means no backward ever recomputes a previous chunk, whose cache entries may be gone by
+        # then. `grad_tail_W` left out of the config, the tail is the whole window.
+        tail = int(getattr(self.config, "grad_tail_W", horizon))
+        tail = max(1, min(tail, horizon))
         losses = []
         logs = []
         used = 0
-        # force a fresh sequence so the K-chunk window always starts at frame 0 (chunk 0 sets the
+        # force a fresh sequence so the window always starts at frame 0 (chunk 0 sets the
         # identity anchor, the grad tail lands in the same sequence).
         # seed step: every train_seed_every steps also put chunk 0 in-graph so the fast-weight
         # seed w0/w1/w2 (only reachable via init_state at chunk 0) receives gradient.
@@ -347,17 +348,17 @@ class MemoryTrainingMixin:
             self.start_new_sequence()
         # seed steps also grad chunk 0 -> more grad chunks; normalize each per-chunk backward so
         # the total gradient equals the normal path's mean(losses)/gas
-        n_grad = tail + (1 if (seed_step and K_bptt - tail > 0) else 0)
-        for i in range(K_bptt):
+        n_grad = tail + (1 if (seed_step and horizon - tail > 0) else 0)
+        for i in range(horizon):
             if i > 0 and not self.streaming_model.can_generate_more():
                 break
             used += 1
-            with_grad = (i >= K_bptt - tail) or (seed_step and i == 0)   # +chunk 0 on seed steps
+            with_grad = (i >= horizon - tail) or (seed_step and i == 0)   # +chunk 0 on seed steps
             # build the mem-OFF counterfactual twin only for the last (grad-tail) chunk
-            make_twin = (with_grad and i == K_bptt - 1 and twin_on)
+            make_twin = (with_grad and i == horizon - 1 and twin_on)
             chunk, chunk_info = self.streaming_model.generate_next_chunk(
-                requires_grad=with_grad, detach_state=(i == K_bptt - tail),
-                keep_last_write_grad=(with_grad and i < K_bptt - 1 and i + 1 > K_bptt - tail),
+                requires_grad=with_grad, detach_state=(i == horizon - tail),
+                keep_last_write_grad=(with_grad and i < horizon - 1 and i + 1 > horizon - tail),
                 make_twin=make_twin)
             if with_grad:
                 loss, chunk_log = self.streaming_model.compute_generator_loss(

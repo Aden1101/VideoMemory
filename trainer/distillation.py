@@ -1102,9 +1102,9 @@ class Trainer(MemoryTrainingMixin):
             if dist.get_rank() == 0:
                 print(f"[SeqTrain-Trainer] Training generator: generating next chunk")
 
-            K_bptt = self._sample_bptt_horizon()
-            if K_bptt > 1:
-                return self._bptt_generator_step(K_bptt)
+            horizon = self._sample_bptt_horizon()
+            if horizon > 1:
+                return self._bptt_generator_step(horizon)
 
             train_first_chunk = getattr(self.config, "train_first_chunk", False)
             if train_first_chunk:
