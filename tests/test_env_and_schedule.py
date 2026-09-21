@@ -82,6 +82,17 @@ def test_a_misspelt_arm_is_refused():
     env.check_arm_variables()                    # and a clean environment passes
 
 
+def test_the_private_noise_seeds_are_the_ones_the_published_runs_used():
+    source = open(os.path.join(ROOT, "pipeline", "switch", "noise.py")).read()
+    seeds = dict(re.findall(r"^([A-Z_]+_SEED) = (\d+)$", source, re.M))
+    assert seeds == {"ANCHOR_NOISE_SEED": "192837465", "ANCHOR_LEVEL_SEED": "77400241",
+                     "REPLAY_NOISE_SEED": "987654321", "SDEDIT_SEED": "5150241"}, seeds
+    # and no bare copy of them is left anywhere else (git grep exits 1 when it finds nothing)
+    others = subprocess.run(["git", "grep", "-lE", "|".join(seeds.values()), "--", "*.py", ":!tests",
+                             ":!pipeline/switch/noise.py"], cwd=ROOT, capture_output=True).stdout.decode().split()
+    assert not others, others
+
+
 # ---- the schedule --------------------------------------------------------------------------
 def test_a_b_a_is_one_revisit():
     plan = schedule.parse_schedule([(0, 0), (21, 1), (42, 0)], 2, None, 63, 3)

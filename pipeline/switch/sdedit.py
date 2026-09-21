@@ -2,6 +2,7 @@
 
 import torch
 
+from pipeline.switch.noise import SDEDIT_SEED
 from utils.env import env_float, env_int, env_str
 
 
@@ -47,7 +48,7 @@ class SdeditMixin:
         x0 = frame.to(device=dev, dtype=torch.bfloat16).repeat(1, nf, 1, 1, 1)
         B = x0.shape[0]
         g = torch.Generator(device=dev)
-        g.manual_seed(env_int("MEM_SDEDIT_SEED", 5150241)
+        g.manual_seed(env_int("MEM_SDEDIT_SEED", SDEDIT_SEED)
                        + int(current_start_frame))
         steps = self._sdedit_steps(sigma)
 

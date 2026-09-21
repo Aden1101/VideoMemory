@@ -21,7 +21,7 @@ import os
 
 import torch
 
-from pipeline.switch.noise import private_noise
+from pipeline.switch.noise import REPLAY_NOISE_SEED, mix_with_noise, private_noise
 from utils.env import env_float, env_int, env_str
 
 
@@ -78,8 +78,8 @@ class ReplayPastMixin:
         nf_env = env_int("REPLAY_PAST_FRAMES")
         na = nf_env if 0 < nf_env < window.shape[1] else window.shape[1]
         part = window[:, -na:]
-        eps = private_noise(part, 987654321 + current_start_frame).to(part.dtype)
-        degraded = ((1.0 - dose ** 2) ** 0.5) * part + dose * eps
+        eps = private_noise(part, REPLAY_NOISE_SEED + current_start_frame).to(part.dtype)
+        degraded = mix_with_noise(part, eps, dose)
         print(f"[REPLAY_PAST_NOISE] degraded the last {na} replayed frame(s), sigma={dose}", flush=True)
         return torch.cat([window[:, :-na], degraded], dim=1)
 

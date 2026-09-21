@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from pipeline.switch.noise import private_noise
+from pipeline.switch.noise import ANCHOR_LEVEL_SEED, ANCHOR_NOISE_SEED, mix_with_noise, private_noise
 from utils.env import env_float, env_int, env_str
 
 
@@ -127,9 +127,9 @@ class AnchorControlsMixin:
         mu = ref.mean(dim=(0, 1, 3, 4), keepdim=True)      # per latent channel (dim 2)
         sd = ref.std(dim=(0, 1, 3, 4), keepdim=True)
         # MEM_DECODE_NOISE_SEED is set per run, so paired runs do not all share one realisation
-        eps = private_noise(frame, env_int("MEM_DECODE_NOISE_SEED", 192837465) + current_start_frame)
+        eps = private_noise(frame, env_int("MEM_DECODE_NOISE_SEED", ANCHOR_NOISE_SEED) + current_start_frame)
         noise = mu + sd * eps
-        out = (((1.0 - s ** 2) ** 0.5) * frame.float() + s * noise).to(frame.dtype)
+        out = mix_with_noise(frame.float(), noise, s).to(frame.dtype)
         print(f"[MEM_DECODE_NOISE] anchor content REPLACED by noise calibrated on the {ref.shape[1]} "
               f"true window frames (dose {s}, per-channel mu in [{float(mu.min()):+.3f}, "
               f"{float(mu.max()):+.3f}], sigma in [{float(sd.min()):.3f}, {float(sd.max()):.3f}]); "
@@ -170,7 +170,7 @@ class AnchorControlsMixin:
         lo, hi = self._anchor_slots(n, kslots, slot_offset)
         part = splice[:, lo:hi]
         dev = part.device
-        eps = private_noise(part, env_int("MEM_ANCHOR_T_SEED", 77400241) + int(current_start_frame))
+        eps = private_noise(part, env_int("MEM_ANCHOR_T_SEED", ANCHOR_LEVEL_SEED) + int(current_start_frame))
         tt = torch.ones([part.shape[0] * part.shape[1]], device=dev, dtype=torch.float32) * t
         noised = self.scheduler.add_noise(part.flatten(0, 1).float(), eps.flatten(0, 1), tt) \
             .unflatten(0, part.shape[:2]).to(part.dtype)

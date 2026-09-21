@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from pipeline.switch.noise import private_noise
+from pipeline.switch.noise import ANCHOR_NOISE_SEED, mix_with_noise, private_noise
 from utils.env import env_float, env_int, env_str
 
 
@@ -61,7 +61,7 @@ class CompositeMixin:
     def _seeded_noise(like, current_start_frame):
         """Unit noise shaped like `like`, from its own generator seeded by the switch frame: the
         main random stream is not touched, so the paired arms keep identical noise."""
-        return private_noise(like, 192837465 + current_start_frame).to(like.dtype)
+        return private_noise(like, ANCHOR_NOISE_SEED + current_start_frame).to(like.dtype)
 
     @staticmethod
     def _fill_weights(mode, m, m_a, m_b, floor):
@@ -178,8 +178,7 @@ class CompositeMixin:
         alpha = self._comp_alpha()      # the dose: 0 gives back the anchor bitwise, 1 the full composite
         a_use = anchor
         if sig > 0:
-            a_use = ((1.0 - min(sig, 1.0) ** 2) ** 0.5) * anchor \
-                + min(sig, 1.0) * self._seeded_noise(anchor, current_start_frame)
+            a_use = mix_with_noise(anchor, self._seeded_noise(anchor, current_start_frame), min(sig, 1.0))
             print(f"[MEM_COMP_ANCHOR_NOISE] anchor content degraded with sigma={sig} "
                   f"(mask untouched)", flush=True)
         if w_noise is None:
@@ -216,8 +215,7 @@ class CompositeMixin:
         still gives back the pure anchor. The noise is the draw MEM_COMP_ANCHOR_NOISE uses,
         mixed with the anchor by MEM_COMP_FILL_SIGMA (1 = pure noise)."""
         sigma = min(env_float("MEM_COMP_FILL_SIGMA", 1.0), 1.0)
-        filler = ((1.0 - sigma ** 2) ** 0.5) * anchor \
-            + sigma * self._seeded_noise(anchor, current_start_frame)
+        filler = mix_with_noise(anchor, self._seeded_noise(anchor, current_start_frame), sigma)
         w_a, w_n, w_bg = w_anchor, w_noise, 1.0 - m
         if alpha != 1.0:
             w_n, w_bg = alpha * w_n, alpha * w_bg
