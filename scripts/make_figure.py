@@ -46,7 +46,7 @@ RUNS = [("run1_write_current_chunk", "1. writes the frames\nit is generating"),
 ARM_SINK = {"run1_write_current_chunk": 3, "run2_write_evicted_chunk": 1,
             "run3_write_evicted_stable": 1, "run4_from_longlive_lora": 1}
 KEEP = re.compile(r"^eval(\d+)(_sink1)?$")      # plain series only: no _ema, no _480, no _msc05
-# One shape throughout: round dots on a line, told apart by colour, so the legend has nothing
+# One shape throughout: round dots on a line, told apart by color, so the legend has nothing
 # to decode.
 C = {"memon": "#2a78d6", "memzero": "#eb6834", "stock": "#1baf7a"}
 INK, INK2, MUTED, LINE = "#0b0b0b", "#52514e", "#8a8880", "#dedad3"

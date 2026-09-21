@@ -6,7 +6,7 @@ import test cannot, which is everything that only fails at run time.
 
     python tests/test_inference_smoke.py            # detected device: a second on CUDA or Metal
 
-On CPU (AF_DEVICE=cpu) it takes many minutes: the memory write orthogonalises 6144 x 1536
+On CPU (AF_DEVICE=cpu) it takes many minutes: the memory write orthogonalizes 6144 x 1536
 matrices in bfloat16, which a CPU has no fast kernel for.
 """
 import os
@@ -102,7 +102,7 @@ def main():
           float(outs[0].abs().max()) > 0)
     check("two different chunks give different outputs",
           not torch.equal(outs[0], outs[1]))
-    check("the cross-attention cache was initialised", xa[0]["is_init"])
+    check("the cross-attention cache was initialized", xa[0]["is_init"])
     check("the memory block wrote a state, the plain block did not",
           ttt[1].state is not None and ttt[0].state is None)
     init = m.blocks[1].memory.init_state(1, device, DT)

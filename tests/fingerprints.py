@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Bitwise fingerprints of the memory path, to tell a refactor from a behaviour change.
+"""Bitwise fingerprints of the memory path, to tell a refactor from a behavior change.
 
 A refactor must leave every number unchanged, and "it still runs" does not show that. This
 script runs two small deterministic computations and hashes what comes out: the memory cell

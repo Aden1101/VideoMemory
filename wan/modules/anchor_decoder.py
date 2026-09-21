@@ -17,14 +17,14 @@ class FrameMixerBlock(nn.Module):
     """Spatial mixer block: what keeps the decoded frame free of a 2x2 checkerboard.
 
     Without it the decoder is strictly per token: each of the 30x52 queries reads the state on
-    its own and the head expands it into a 2x2 latent patch, so nothing forces two neighbouring
+    its own and the head expands it into a 2x2 latent patch, so nothing forces two neighboring
     patches to agree and the rendered frame carries a visible 2x2 checkerboard. This block adds
     the missing piece, a local spatial mixing on the token grid, as a residual correction:
 
         x <- x + pw2(GELU(pw1(depthwise3x3(RMSNorm(x)))))
 
-    `pw2` is zero-initialised, weight and bias, so the block is exactly the identity at
-    initialisation: a decoder built with mixer=True and warm-started from a checkpoint trained
+    `pw2` is zero-initialized, weight and bias, so the block is exactly the identity at
+    initialization: a decoder built with mixer=True and warm-started from a checkpoint trained
     without the mixer computes the same function, and `mixer.*` are the only keys the old
     state_dict is missing."""
 
@@ -73,8 +73,8 @@ class AnchorFrameDecoder(nn.Module):
       - fusion: the 3 reads concatenated (4608) -> Linear 4608 to 3072 -> GELU -> Linear 3072
         to 1536 -> LayerNorm, per token. No cross-token mixing here: the state is a global
         associative memory and each patch retrieves its own content by address.
-      - head: Linear 1536 to 16*2*2 = 64 per token, zero-initialised in weight and bias, so the
-        decoder emits an exactly null frame at initialisation rather than noise. Unpatchify to
+      - head: Linear 1536 to 16*2*2 = 64 per token, zero-initialized in weight and bias, so the
+        decoder emits an exactly null frame at initialization rather than noise. Unpatchify to
         (B, 1, 16, 60, 104) follows CausalWanModel.unpatchify: token dim = (ph, pw, c), tokens
         in (h, w) row-major order.
 
@@ -85,8 +85,8 @@ class AnchorFrameDecoder(nn.Module):
     cond_hidden) -> GELU -> Linear(cond_hidden, num_blocks*2*dim), producing a per-block
     (scale, shift) pair applied to the normalized queries as q <- q*(1+scale) + shift. That is
     "look in the state for what matches this description", where the description is the pooled
-    T5 embedding of the prompt whose subject must come back. The last linear is zero-initialised
-    in weight and bias, so scale = shift = 0 at initialisation and the conditioned decoder
+    T5 embedding of the prompt whose subject must come back. The last linear is zero-initialized
+    in weight and bias, so scale = shift = 0 at initialization and the conditioned decoder
     computes the unconditioned function: an unconditioned checkpoint warm-starts with
     strict=False, the only missing keys being the inert cond modules. cond_dim = 0, the default,
     creates no conditioning module at all. The input LayerNorm makes the conditioning robust to
@@ -94,8 +94,8 @@ class AnchorFrameDecoder(nn.Module):
     zero-padded positions.
 
     Optional spatial mixer: mixer=True inserts `mixer_blocks` FrameMixerBlock between the
-    per-token fusion and the head, the only place in the module where two neighbouring patches
-    can talk to each other. Each is the identity at initialisation, so a checkpoint trained
+    per-token fusion and the head, the only place in the module where two neighboring patches
+    can talk to each other. Each is the identity at initialization, so a checkpoint trained
     without the mixer warm-starts with strict=False and `mixer.*` are the only missing keys.
     mixer=False, the default, creates no module.
     """
@@ -129,7 +129,7 @@ class AnchorFrameDecoder(nn.Module):
         self.m = grid_h * grid_w
         self.detach_states = detach_states
 
-        # per-block query tables + shared factorized 2D grid embedding, initialised at
+        # per-block query tables + shared factorized 2D grid embedding, initialized at
         # randn / sqrt(dim); the norm on the queries renormalizes anyway
         self.queries = nn.Parameter(torch.randn(num_blocks, self.m, dim) / math.sqrt(dim))
         self.pos_row = nn.Parameter(torch.randn(grid_h, dim) / math.sqrt(dim))
@@ -181,7 +181,7 @@ class AnchorFrameDecoder(nn.Module):
         """states: one (w0, w1, w2) tuple per memory block, in memory_layers order.
         cond: the pooled prompt embedding, (B, cond_dim) or (cond_dim,), "retrieve what matches
         this description"; it needs a decoder built with cond_dim > 0. With cond=None such a
-        decoder reads unconditioned, which at initialisation is also what the conditioned read
+        decoder reads unconditioned, which at initialization is also what the conditioned read
         gives. Returns the latent frame (B, 1, z_dim, grid_h * patch_h, grid_w * patch_w)."""
         assert len(states) == self.num_blocks, \
             f"expected {self.num_blocks} block states, got {len(states)}"
@@ -197,15 +197,15 @@ class AnchorFrameDecoder(nn.Module):
                 fb = film.expand(B, -1, -1, -1) if film.shape[0] == 1 else film
                 assert fb.shape[0] == B, \
                     f"cond batch {film.shape[0]} != state batch {B} (and not broadcastable)"
-                # after the norm, so the modulation is not normalised away; scale = shift = 0
-                # at initialisation, which leaves q exactly as it is
+                # after the norm, so the modulation is not normalized away; scale = shift = 0
+                # at initialization, which leaves q exactly as it is
                 q = q * (1.0 + fb[:, b, 0].unsqueeze(1)) + fb[:, b, 1].unsqueeze(1)
             reads.append(self.read_norms[b](swiglu_apply(q, w0.to(dtype), w1.to(dtype), w2.to(dtype))))
         h = self.fuse2(F.gelu(self.fuse1(torch.cat(reads, dim=-1))))        # (B, m, dim), per token
         if self.use_mixer:                                                  # the only cross-token step
             for block in self.mixer:
                 h = block(h, self.grid_h, self.grid_w)
-        return self._unpatchify(self.head(self.out_norm(h)))                # exactly 0 at initialisation
+        return self._unpatchify(self.head(self.out_norm(h)))                # exactly 0 at initialization
 
     def _film(self, cond, dtype):
         """cond -> (Bc, num_blocks, 2, dim), a (scale, shift) pair per block, or None."""

@@ -4,7 +4,7 @@
 It was imported at the top of several modules, so on any recent install the code broke at
 import time with a message that said nothing about the real problem.
 
-Torchvision is used when it is there, so behaviour and encoding are unchanged on a
+Torchvision is used when it is there, so behavior and encoding are unchanged on a
 README-conformant install (torchvision 0.21). Otherwise this falls back to imageio, which is
 already in requirements.txt.
 

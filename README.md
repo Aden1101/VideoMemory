@@ -1,11 +1,11 @@
 # Fast-weight memory for long-form video generation
 
-A research fork of [Anchor-Forcing](https://github.com/vivoCameraResearch/Anchor-Forcing)
-(Wan2.1-T2V-1.3B, causal streaming, DMD distillation) that adds a fast-weight memory to the
-backbone, to fight identity drift over minutes of generated video.
+I added a fast-weight memory to [Anchor-Forcing](https://github.com/vivoCameraResearch/Anchor-Forcing)
+(Wan2.1-T2V-1.3B, causal streaming, DMD distillation), to fight identity drift over minutes of
+generated video.
 
-The result is negative: [the memory does not help](#result). What this work adds to upstream is
-listed in [Where the code is](#where-the-code-is), and [its tests run without a GPU](#running-it).
+The result is negative: [the memory does not help](#result). What I added to upstream is listed
+in [Where the code is](#where-the-code-is), and [its tests run without a GPU](#running-it).
 Upstream's README is kept at [`UPSTREAM_README.md`](UPSTREAM_README.md).
 
 ## The problem
@@ -18,23 +18,46 @@ prompt gives a category ("a woman in a red coat"), never the instance. Those att
 ## How it works
 
 A memory branch is inserted in a few transformer blocks (layers 5, 16, 27 of 30). Each branch
-carries a fast weight `W` that is rewritten during generation, by the forward pass, not by the
-optimizer.
+carries a fast weight `W` that the forward pass rewrites during generation.
 
+What the memory is fed. Attention sees the sink and a rolling window; the chunk that has just
+left the window is the one the memory writes.
+
+![three generation steps: the window slides, the chunk it drops is written to the memory](assets/arch_context.png)
+
+Where it sits. The branch reads the same normalized input as self-attention and adds a gated
+output to the residual stream; its state lives outside the block and is carried across chunks.
+
+![the transformer block with the memory branch between self-attention and cross-attention](assets/arch_block.png)
+
+What the cell does, for the chunk generated at step $t$, with the options the four runs share:
+$q$ comes from that chunk, $k$ and $v$ from the tokens of the chunk that has just left the
+window (run 1 takes them from the current chunk instead), and $`W = (w_0, w_1, w_2)`$.
+
+```math
+\Large
+\begin{aligned}
+\textbf{read}\quad & o_t = f_{W_{t-1}}(q_t), \qquad f_W(x) = \big(\mathrm{SiLU}(x\,w_0)\odot x\,w_2\big)\,w_1 \\[6pt]
+\textbf{write}\quad & G_m = \sum_i \eta_{i,m}\,\nabla_{w_m}\langle f_W(k_i),\, v_i\rangle, \qquad m \in \{0, 1, 2\} \\[2pt]
+& \widetilde{w}_m = w_m + \mathrm{Muon}(G_m) \\[2pt]
+& w_m[:,j] \leftarrow \widetilde{w}_m[:,j]\;\frac{\lVert w_m[:,j]\rVert}{\lVert \widetilde{w}_m[:,j]\rVert} \\[6pt]
+\textbf{inject}\quad & \hat{o}_t = o_t / \mathrm{RMS}(o_t), \qquad (s,\, a,\, g) = \mathrm{proj}(\hat{o}_t) \\[2pt]
+& x \leftarrow x + \tanh(g)\odot\big(\hat{o}_t\odot(1+\tanh a) + \tanh s\big)
+\end{aligned}
 ```
-chunk t                    chunk t+1
-   │                          │
-   ▼                          ▼
-┌────────────────────────────────────────┐
-│  KV cache   [ sink ×3 | window ×9 ]    │  FIFO, oldest chunk evicted
-└────────────────────────────────────────┘
-                 │ evicted chunk  (what attention can no longer see)
-                 ▼
-        ┌──────────────────┐
-        │   memory cell    │   read   o = f_W(q)          q from the current chunk
-        │   fast weight W  │   write  W <- renorm(Muon(grad_W <f_W(k), v>))
-        └──────────────────┘   inject x <- x + gate(x) * AdaLN(o)   into the residual stream
-```
+
+where
+
+- the read uses the state from before this step's write;
+- $`\eta_{i,m}`$ is a learning rate per token and per matrix, predicted from the token, and the
+  write is a gradient ascent on the score;
+- Muon is five Newton-Schulz iterations;
+- the last write line restores the norm of each column, so the norms stay those of the initial
+  state. With `use_decay` the state is first scaled by a learned forget gate, and each column is
+  capped at its initial norm;
+- $s$, $a$ and $g$ are one projection of the normalized read, with one RMS per chunk. The
+  injection then loses its mean over tokens (`dc_remove`) and is scaled to a fraction of the
+  residual stream's RMS (`mem_stream_scale`).
 
 Three points are not obvious from the code:
 
@@ -59,7 +82,7 @@ regenerated with the memory switched off, sharing history, KV cache and noise, s
 difference between the two is the injection. `model/twin_objective.py` builds that twin and
 scores four terms against it. Identity may not get worse, motion must match, and the injection
 must be measurably non-zero. All four terms are weighted zero in the runs reported below, which
-are plain DMD; the twin is there to be read, not to explain the figure.
+are plain DMD, so the twin plays no part in the figure.
 
 ## Result
 
@@ -86,26 +109,26 @@ has both measurements at step 1250, and going from sink 3 to sink 1 costs 0.06 t
 identity, the size of the effects below. So the conclusions rest on memory active against memory
 zeroed; against the reference, only run 1 is a fair comparison.
 
-The motion cost belongs to the continued training and not to the memory, since the
-memory-zeroed arm pays it too. Where motion does come back, run 2 at step 1250, identity with the memory active has
-collapsed to 0.36. In run 1, the one fair comparison to the reference, the only arm that ends
-above it on identity is the memory-zeroed one (0.773 against 0.743), with a third fewer clips
-rated dynamic; with the memory active identity is 0.667 and dynamic degree 0.23, a near-frozen
-video. Run 4 keeps more motion than its reference, and the memory still lowers identity there at
-two checkpoints out of three.
+The memory-zeroed arm pays the motion cost too, so that cost comes from the continued training.
+Where motion does come back, run 2 at step 1250, identity with the memory active has collapsed to
+0.36. In run 1, the one fair comparison to the reference, the only arm that ends above it on
+identity is the memory-zeroed one (0.773 against 0.743), with a third fewer clips rated dynamic;
+with the memory active identity is 0.667 and dynamic degree 0.23, a near-frozen video. Run 4 keeps
+more motion than its reference, and the memory still lowers identity there at two checkpoints out of
+three.
 
-The likely reason, for this write rule, this objective and this backbone, which is all that
-was tested: chunk-local DMD and the usual metrics reward the same thing, temporal
-self-similarity, so a learnable memory converges to a freeze or to a constant-bias degeneracy
-that the dashboard scores as healthy. The frozen checkpoints show it: run 1 at step 1250 and
-run 2 at step 750 have a dynamic degree of 0.23 and 0.24, and VBench rates their subject
-consistency at 0.97 and 0.98, above the unmodified model's 0.95.
+My reading, for this write rule, this objective and this backbone, which is all I tested: chunk-
+local DMD and the usual metrics reward the same thing, temporal self-similarity, so a learnable
+memory converges to a freeze or to a constant-bias degeneracy that the dashboard scores as healthy.
+The frozen checkpoints show it: run 1 at step 1250 and run 2 at step 750 have a dynamic degree of
+0.23 and 0.24, and VBench rates their subject consistency at 0.97 and 0.98, above the unmodified
+model's 0.95.
 
-A second line of work, in `pipeline/switch/`, tests recall directly. The prompt switches from
-subject A to B and back to A, and at the return the model is handed an anchor: one latent frame
-of A's first appearance, real or decoded from the memory state. Controls matter here: an anchor
-taken from a different video helps as much as the right one, which is how the apparent gain
-turned out never to have been content-driven.
+In a second line of work, in `pipeline/switch/`, I test recall directly. The prompt switches from
+subject A to B and back to A, and at the return the model is handed an anchor: one latent frame of
+A's first appearance, real or decoded from the memory state. Controls matter here: an anchor taken
+from a different video helps as much as the right one, which is how the apparent gain turned out
+never to have been content-driven.
 
 The open lead in numbers: median 13.5/19 for the delta rule against 7.0 for the deployed one, over
 10 seeds, with a background control at chance. The score counts, out of 19 video pairs with a
@@ -113,8 +136,8 @@ clearly distinct subject, how many the state tells apart in a two-way choice, so
 is read offline from replayed states (`write_only` and `replay_writes` in
 `wan/modules/video_memory.py` are that replay's interface). The two distributions barely overlap (11
 to 16 against 6 to 10), but the delta rule's median sits just under the 14/19 a single seed needs to
-be significant. The probe scripts ran on the training cluster and are not in this repository, so
-these numbers cannot be reproduced from here.
+be significant. I ran the probe scripts on the training cluster and they are not in this repository,
+so these numbers cannot be reproduced from here.
 
 ## Running it
 
@@ -134,7 +157,7 @@ With torch, `tests/test_memory_cell.py` checks what this README says of the cell
 the model calls: a zero gate is exactly inert, the read sees the state from before the write, the
 write takes the evicted chunk and keeps the column norms, and an offline replay rebuilds the same
 state. `tests/test_inference_smoke.py` streams a miniature model with the memory live, and
-`tests/fingerprints.py` hashes the memory path to tell a refactor from a behaviour change.
+`tests/fingerprints.py` hashes the memory path to tell a refactor from a behavior change.
 
 With the weights:
 
@@ -152,12 +175,11 @@ Two passes because the text encoder (11.4 GB) and the generator do not fit in me
 a consumer machine: pass 1 encodes and exits, pass 2 never loads the encoder. Training needs
 CUDA and two 48 GB cards.
 
-What has and has not been run since the code was reorganised into its own modules: the memory
-cell, the model and the inference rollouts give bit-identical numbers before and after, with
-the real weights. The training path (`trainer/memory_training.py`, `model/twin_objective.py`)
-was moved the same way and read side by side against the previous code, but not executed
-since, for lack of a CUDA machine. The training code as it stood before is at the git tag
-`before-refactor`; run a few steps of both and compare the loss before trusting a new run.
+After reorganizing the code into its own modules, I checked that the memory cell, the model and
+the inference rollouts give bit-identical numbers, with the real weights. I have not run the
+training path (`trainer/memory_training.py`, `model/twin_objective.py`) since, for lack of a CUDA
+machine: the training code from before the reorganization is at the git tag `before-refactor`,
+and a few steps of both should be compared before trusting a new run.
 
 Runs on CUDA, Apple Metal and CPU. On CUDA every device call delegates to the original
 `torch.cuda` one, so no previously measured number moves. `tests/test_device.py` checks that by
@@ -165,8 +187,8 @@ reimplementing upstream's rotary embedding and demanding bitwise equality.
 
 ## Where the code is
 
-Upstream's files are kept recognisable: what this work adds lives in files of its own, mixed
-into upstream's classes, so `git diff 392b3f8` on an upstream file shows call sites and little else.
+Upstream's files are kept recognizable: what I added lives in files of its own, mixed into
+upstream's classes, so `git diff 392b3f8` on an upstream file shows call sites and little else.
 
 | file | what it holds |
 |---|---|
@@ -182,5 +204,5 @@ into upstream's classes, so `git diff 392b3f8` on an upstream file shows call si
 
 The base import (`392b3f8`) is an unmodified copy of upstream `vivoCameraResearch/Anchor-Forcing`.
 The backbone, the DMD distillation and the streaming pipeline are theirs. Everything after that
-commit is this work: the memory cell, its write rules, the training objectives and the
+commit is mine: the memory cell, its write rules, the training objectives and the
 evaluation code. License CC BY-NC-SA 4.0, inherited from upstream; see [`LICENSE`](LICENSE).

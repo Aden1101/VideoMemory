@@ -30,7 +30,7 @@ class TwinObjective:
     dnh_weight: float = 0.0          # do-no-harm hinge: identity may not be worse than the twin
     dnh_deadband: float = 0.01       # cosine units of tolerated noise
     act_weight: float = 0.0          # activity floor on the injection's dose; a relu, so a
-    act_floor: float = 0.05          # floor and never a maximiser (relative AC-dose)
+    act_floor: float = 0.05          # floor and never a maximizer (relative AC-dose)
     motion_lag2: bool = False        # lag-2 motion statistic, blind to frame-rate shimmer
     dose_tmean_remove: bool = False  # a static overlay then earns zero dose
     flick_weight: float = 0.0        # second-temporal-difference hinge against the twin
@@ -191,7 +191,7 @@ class TwinObjectiveMixin:
     # The extra loss terms, and why the runs this repo presents have all of them off.
     #
     # Eight were built, in three generations, each closing the channel the previous one left
-    # open. Every one is a hinge with a deadband rather than a maximiser: an unbounded "be more
+    # open. Every one is a hinge with a deadband rather than a maximizer: an unbounded "be more
     # active" term is always satisfied by the cheapest route, which is noise or a constant bias.
     #
     #   id, tv            identity to the chunk-0 anchor, and a floor on latent motion. Used by
@@ -244,7 +244,7 @@ class TwinObjectiveMixin:
             "identity_id_loss": torch.zeros((), device=device),
         }
 
-        # against freezing: a penalty only when the mean change between neighbouring latent frames
+        # against freezing: a penalty only when the mean change between neighboring latent frames
         # falls under tv_motion_floor, and none above it
         if self.tv_loss_weight > 0.0 and chunk.shape[1] >= 2:
             motion = (chunk[:, 1:] - chunk[:, :-1]).abs().mean()
@@ -305,7 +305,7 @@ class TwinObjectiveMixin:
         injection during this chunk is the only lever and nothing is earned by degrading the
         baseline. Nothing pays for self-similarity, so freezing buys nothing that staying
         neutral does not, at a higher motion cost. The activity term is a relu: zero gradient
-        once the dose clears the floor, a floor and never a maximiser. What is left to game is
+        once the dose clears the floor, a floor and never a maximizer. What is left to game is
         a static texture overlay, judged at evaluation; dose_tmean_remove closes it.
 
         Returns (loss, log); every log key is present on every chunk, because merge_dict_list

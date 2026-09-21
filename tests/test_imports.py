@@ -5,7 +5,7 @@ stubs do not mix. Python 3.10 or later (upstream writes `X | None` in signatures
 
 It catches what compiling a file cannot: an import cycle, a name missing at import time, a
 class whose bases do not combine, a decorator applied to the wrong thing. It runs no function
-body, so it says nothing about behaviour.
+body, so it says nothing about behavior.
 
     python tests/test_imports.py        # or: python -m pytest tests/test_imports.py
 """
