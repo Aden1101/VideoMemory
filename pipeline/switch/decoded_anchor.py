@@ -5,6 +5,7 @@ import os
 import torch
 
 from utils.env import env_int, env_str
+from utils.log import log
 
 
 # MEM_DECODE: when a subject comes back, the frame fed into the attention context is decoded
@@ -63,9 +64,9 @@ def _memdec_get_decoder(ckpt_path, device):
         p.requires_grad_(False)
     _MEMDEC_CACHE[key] = decoder
     step = ck.get("step", "?") if isinstance(ck, dict) else "?"
-    print(f"[MEM_DECODE] AnchorFrameDecoder loaded from {ckpt_path} (step {step}, "
-          f"cond_dim={cond_dim}, cond_hidden={cond_hidden}, {decoder.num_params():,} params, "
-          f"fp32 on {device})", flush=True)
+    log(f"[MEM_DECODE] AnchorFrameDecoder loaded from {ckpt_path} (step {step}, "
+        f"cond_dim={cond_dim}, cond_hidden={cond_hidden}, {decoder.num_params():,} params, "
+        f"fp32 on {device})")
     return decoder
 
 
@@ -122,10 +123,10 @@ class AnchorDecodeMixin:
         self._thru_frame, cond_on = self._memdec_frame(ck, cond_third, out_dtype, out_device)
         self._thru_info = {"anchor_frame": int(anchor_frame), "anchor_chunk": int(anchor_chunk),
                            "evict_chunk": int(cur_chunk), "window_chunks": int(wc)}
-        print(f"[MEM_DECODE_THRU] anchor chunk {anchor_chunk} (frame {anchor_frame}) evicted "
-              f"and written at chunk {cur_chunk} (window_chunks {wc}), state decoded now "
-              f"(write age 1), frame cached for the return splice; "
-              f"cond={'ON' if cond_on else 'off'}", flush=True)
+        log(f"[MEM_DECODE_THRU] anchor chunk {anchor_chunk} (frame {anchor_frame}) evicted "
+            f"and written at chunk {cur_chunk} (window_chunks {wc}), state decoded now "
+            f"(write age 1), frame cached for the return splice; "
+            f"cond={'ON' if cond_on else 'off'}")
 
     def _single_anchor_window(self, output, current_start_frame, cond, ckpt):
         """The recache window of the fixed A -> B -> A rollout: the anchor decoded from the memory
@@ -138,17 +139,17 @@ class AnchorDecodeMixin:
                 "MEM_DECODE_THRU: the anchor chunk was never evicted before the " \
                 "return switch (check switch indices / local_attn_size)"
             frame, cond_on = self._thru_frame, None
-            print(f"[MEM_DECODE_THRU] splicing the frame decoded at eviction "
-                  f"{self._thru_info}", flush=True)
+            log(f"[MEM_DECODE_THRU] splicing the frame decoded at eviction "
+                f"{self._thru_info}")
         else:
             frame, cond_on = self._memdec_frame(ckpt, cond, output.dtype, output.device)
         kslots = max(1, env_int("MEM_DECODE_SLOTS", 1))
         dump = env_str("MEM_DECODE_DUMP")
         if dump:
             torch.save(frame.detach().to("cpu", torch.float16), f"{dump}.f{current_start_frame}.pt")
-            print(f"[MEM_DECODE_DUMP] anchor latent saved -> {dump}.f{current_start_frame}.pt", flush=True)
-        print(f"[MEM_DECODE] decoded anchor spliced at recency ({kslots}/{n} slots), "
-              f"cond={'thru' if cond_on is None else ('ON' if cond_on else 'off')}", flush=True)
+            log(f"[MEM_DECODE_DUMP] anchor latent saved -> {dump}.f{current_start_frame}.pt")
+        log(f"[MEM_DECODE] decoded anchor spliced at recency ({kslots}/{n} slots), "
+            f"cond={'thru' if cond_on is None else ('ON' if cond_on else 'off')}")
         return self._memdec_window(output, current_start_frame, n, frame, kslots, slot_offset=-1)
 
     # Both drivers build their window here. `inference_schedule()` generalises `inference()`,

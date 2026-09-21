@@ -11,6 +11,7 @@ from typing import List, Optional
 import torch
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from utils.env import check_arm_variables, env_int, env_str
+from utils.log import log
 from wan.modules.video_memory import TTTBlockCache
 from pipeline.switch.memory_state import _memwriter_sync
 from pipeline.switch.schedule import parse_schedule
@@ -90,7 +91,7 @@ class ScheduleDriverMixin:
                       self._reset_add_kv, self._fb_reset):
             reset()
         self.generator.model.local_attn_size = self.local_attn_size
-        print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}", flush=True)
+        log(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
         self._set_all_modules_max_attention_size(self.local_attn_size)
         return output
 
@@ -100,10 +101,9 @@ class ScheduleDriverMixin:
         batch_size, num_output_frames = noise.shape[:2]
         local = getattr(self.args.model_kwargs, "local_attn_size", -1)
         frames = num_output_frames if local == -1 else local
-        print(f"kv_cache_size: {frames * self.frame_seq_length} "
-              f"(policy: {'global (-1)' if local == -1 else f'int->local, size={local}'}, "
-              f"frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})",
-              flush=True)
+        log(f"kv_cache_size: {frames * self.frame_seq_length} "
+            f"(policy: {'global (-1)' if local == -1 else f'int->local, size={local}'}, "
+            f"frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
         self._initialize_kv_cache(batch_size, dtype=noise.dtype, device=noise.device,
                                   kv_cache_size_override=frames * self.frame_seq_length)
         self._initialize_crossattn_cache(batch_size=batch_size, dtype=noise.dtype,
@@ -177,8 +177,8 @@ class ScheduleDriverMixin:
             subject_key = prompt_idx if subject is None else subject
             if env_int("MEM_EPISODIC") and snapshots.get(subject_key):
                 self._restore_ttt(snapshots[subject_key])
-                print(f"[MEM_EPISODIC] restored the memory state of subject {subject_key} at frame "
-                      f"{current_start_frame}", flush=True)
+                log(f"[MEM_EPISODIC] restored the memory state of subject {subject_key} at frame "
+                    f"{current_start_frame}")
             self._dump_anchor(output, a_end)
             if env_int("MEM_COMP_PROMPT_GATE"):
                 self._comp_gate_from_prompts(cond_new, cond_prev)
@@ -213,9 +213,9 @@ class ScheduleDriverMixin:
                 "MEM_DECODE_ROUTED and FRAMEBANK are mutually exclusive (one router, one arm)"
             _, routing = self._fb_select(seg_idx, prompt_idx, cond_new, subject=subject, mode="key")
             recalls = bool(routing["recalled"])
-            print(f"[MEM_DECODE_ROUTED] segment {seg_idx}: router says "
-                  f"{'REVISIT -> splice' if recalls else 'fresh scene -> no splice'} "
-                  f"(ground truth was {'revisit' if is_revisit else 'fresh'})", flush=True)
+            log(f"[MEM_DECODE_ROUTED] segment {seg_idx}: router says "
+                f"{'REVISIT -> splice' if recalls else 'fresh scene -> no splice'} "
+                f"(ground truth was {'revisit' if is_revisit else 'fresh'})")
         decoder_ckpt = env_str("MEM_DECODE") if (recalls and not additive) else ""
         if decoder_ckpt:
             assert window is None, "MEM_DECODE and REPLAY_PAST are mutually exclusive"
@@ -247,7 +247,7 @@ class ScheduleDriverMixin:
         if frame is None or (ground_truth and not is_revisit):
             return None
         n = self._window_frames(current_start_frame)
-        print(f"[FRAMEBANK] recalled frame spliced at recency (1/{n} slots)", flush=True)
+        log(f"[FRAMEBANK] recalled frame spliced at recency (1/{n} slots)")
         return torch.cat([output[:, current_start_frame - n:current_start_frame - 1],
                           frame.to(dtype=output.dtype, device=output.device)], dim=1)
 
@@ -267,7 +267,7 @@ class ScheduleDriverMixin:
             path = f"{dump}.f{current_start_frame}.pt"
             torch.save(frame.detach().to("cpu", torch.float16), path + ".tmp")
             os.replace(path + ".tmp", path)
-            print(f"[MEM_DECODE_DUMP] anchor latent saved -> {path}", flush=True)
+            log(f"[MEM_DECODE_DUMP] anchor latent saved -> {path}")
         frame = self._maybe_wrong_anchor(frame)
         frame = self._maybe_noise_anchor(frame, output, current_start_frame, n)
         frame = self._maybe_sdedit(frame, cond_new, current_start_frame)
@@ -277,9 +277,9 @@ class ScheduleDriverMixin:
         # MEM_ANCHOR_T: noise the anchor and declare that noise level for its slots
         window, timesteps = self._maybe_declare_anchor_noise(window, n, kslots, offset,
                                                              current_start_frame)
-        print(f"[MEM_DECODE] decoded anchor spliced ({kslots}/{n} slots, window convention "
-              f"{'recency duplicated' if offset < 0 else f'slot_offset={offset}'}"
-              f"), cond={'ON' if cond_on else 'off'}", flush=True)
+        log(f"[MEM_DECODE] decoded anchor spliced ({kslots}/{n} slots, window convention "
+            f"{'recency duplicated' if offset < 0 else f'slot_offset={offset}'}"
+            f"), cond={'ON' if cond_on else 'off'}")
         return window, timesteps
 
     def _report_attention_mass(self):
@@ -289,11 +289,10 @@ class ScheduleDriverMixin:
         mass = self._add_mass_report()
         if mass:
             values = [m for m in mass.values() if m == m]      # drop the NaN of blocks without the hook
-            print(f"[MEM_ADDITIVE_KV] attention mass of the anchor tokens on the last forward: "
-                  f"mean {sum(values) / max(1, len(values)):.4f}, min {min(values):.4f}, "
-                  f"max {max(values):.4f} "
-                  f"| per block " + " ".join(f"{b}:{m:.3f}" for b, m in sorted(mass.items())),
-                  flush=True)
+            log(f"[MEM_ADDITIVE_KV] attention mass of the anchor tokens on the last forward: "
+                f"mean {sum(values) / max(1, len(values)):.4f}, min {min(values):.4f}, "
+                f"max {max(values):.4f} "
+                f"| per block " + " ".join(f"{b}:{m:.3f}" for b, m in sorted(mass.items())))
         trace = self._add_mass_log
         if trace:           # one entry per chunk; MEM_ADD_MASS_DUMP names a file for the whole of it
             after_return = [e for e in trace if e["frame"] > (self._switch_global_frame or 0)]
@@ -302,18 +301,18 @@ class ScheduleDriverMixin:
                     / max(1, sum(len(e["per_block"]) for e in steps))
                     for k in ("sink", "window", "anchor")}
             n_tokens = next(iter(steps[-1]["per_block"].values()))["n_tok"]
-            print(f"[MEM_ADD_MASS_SRC] attention mass per source after the return "
-                  f"({len(steps)} steps x {len(steps[-1]['per_block'])} blocks): "
-                  f"sink {share['sink']:.4f} | window {share['window']:.4f} | "
-                  f"anchor {share['anchor']:.4f}   (tokens {n_tokens} = sink/window/anchor, "
-                  f"uniform share of the anchor "
-                  f"{n_tokens[2] / max(1, sum(n_tokens)):.4f})", flush=True)
+            log(f"[MEM_ADD_MASS_SRC] attention mass per source after the return "
+                f"({len(steps)} steps x {len(steps[-1]['per_block'])} blocks): "
+                f"sink {share['sink']:.4f} | window {share['window']:.4f} | "
+                f"anchor {share['anchor']:.4f}   (tokens {n_tokens} = sink/window/anchor, "
+                f"uniform share of the anchor "
+                f"{n_tokens[2] / max(1, sum(n_tokens)):.4f})")
             dump = env_str("MEM_ADD_MASS_DUMP")
             if dump:
                 os.makedirs(os.path.dirname(dump) or ".", exist_ok=True)
                 with open(dump, "w") as f:
                     json.dump({"summary_after_return": share, "n_tok": n_tokens, "steps": trace}, f)
-                print(f"[MEM_ADD_MASS_SRC] full trace -> {dump}", flush=True)
+                log(f"[MEM_ADD_MASS_SRC] full trace -> {dump}")
 
     def _enter_segment(self, plan, conds, seg, output, current_start_frame):
         """The switch into segment `seg`: bank and snapshot the segment that just ended, then
@@ -325,15 +324,15 @@ class ScheduleDriverMixin:
                        subject=plan.subject[left])
         if env_int("MEM_EPISODIC") and plan.returns_later(left):
             self._ttt_snap_by_prompt[plan.subject[left]] = self._snapshot_ttt()
-            print(f"[MEM_EPISODIC] snapshotted the state of subject {plan.subject[left]} "
-                  f"at frame {current_start_frame}", flush=True)
+            log(f"[MEM_EPISODIC] snapshotted the state of subject {plan.subject[left]} "
+                f"at frame {current_start_frame}")
         self._switch_recache(
             output, current_start_frame, conds[seg], a_end=plan.anchor_end(seg), seg_idx=seg,
             prompt_idx=plan.prompt[seg], subject=plan.subject[seg],
             is_revisit=plan.is_revisit[seg], cond_prev=conds[left])
         self._switch_global_frame = current_start_frame
-        print(f"[schedule] switch to segment {seg} (prompt {plan.prompt[seg]}) at frame "
-              f"{current_start_frame}", flush=True)
+        log(f"[schedule] switch to segment {seg} (prompt {plan.prompt[seg]}) at frame "
+            f"{current_start_frame}")
 
     def _trace_attention_mass(self, current_start_frame, seg):
         """One point per generated chunk of the attention mass per source, for the additive
@@ -381,7 +380,7 @@ class ScheduleDriverMixin:
         plan = parse_schedule(schedule, len(prompts), subjects, num_output_frames,
                               self.num_frame_per_block)
         for line in plan.describe(prompts):
-            print(f"[schedule] {line}", flush=True)
+            log(f"[schedule] {line}")
         # one text-encoder call per schedule entry, in schedule order, as `inference()` does
         conds = [self.text_encoder(text_prompts=[prompts[p]]) for p in plan.prompt]
         starts = [start for start, _ in plan.schedule]

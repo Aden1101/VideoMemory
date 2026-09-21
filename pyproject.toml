@@ -10,7 +10,7 @@ include = [
     "wan/modules/video_memory.py", "wan/modules/memory_inject.py",
     "wan/modules/additive_attention.py", "wan/modules/anchor_decoder.py",
     "model/twin_objective.py", "trainer/memory_training.py", "pipeline/memory_rollout.py",
-    "pipeline/switch/*.py", "utils/env.py", "utils/device.py", "utils/prompt_cache.py",
+    "pipeline/switch/*.py", "utils/env.py", "utils/log.py", "utils/device.py", "utils/prompt_cache.py",
     "utils/video_io.py", "scripts/*.py", "tests/*.py",
 ]
 

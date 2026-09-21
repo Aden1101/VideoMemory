@@ -4,6 +4,7 @@ import os
 import torch
 
 from utils.env import env_str
+from utils.log import log
 
 
 # MEM_WRITER: replace the write parameters of the memory cells with ones trained offline, on
@@ -65,7 +66,7 @@ def _memwriter_restore(cm):
     cm._memwriter_backup = None
     prev = getattr(cm, "_memwriter_applied", None)
     cm._memwriter_applied = None
-    print(f"[MEM_WRITER] stock write parameters RESTORED (was {prev})", flush=True)
+    log(f"[MEM_WRITER] stock write parameters RESTORED (was {prev})")
 
 
 def _memwriter_sync(model):
@@ -80,7 +81,7 @@ def _memwriter_sync(model):
         return
     assert cm is not None, "MEM_WRITER set but no CausalWanModel found under the wrappers"
     if applied == os.path.abspath(path):
-        print(f"[MEM_WRITER] already applied ({path}), cells unchanged", flush=True)
+        log(f"[MEM_WRITER] already applied ({path}), cells unchanged")
         return
     if applied is not None:                    # switching writers: always measure vs the stock
         _memwriter_restore(cm)
@@ -106,8 +107,8 @@ def _memwriter_sync(model):
             report.append(f"b{bi} dL1={num:.4e} (rel {num / max(den, 1e-12):.3e})")
     cm._memwriter_backup = backup
     cm._memwriter_applied = os.path.abspath(path)
-    print(f"[MEM_WRITER] writer overlay from {path} (step {step}) on blocks {sorted(writer)}, "
-          f"{len(backup)} tensors | " + " | ".join(report), flush=True)
+    log(f"[MEM_WRITER] writer overlay from {path} (step {step}) on blocks {sorted(writer)}, "
+        f"{len(backup)} tensors | " + " | ".join(report))
 
 
 class MemoryStateMixin:

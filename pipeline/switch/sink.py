@@ -4,6 +4,7 @@ import torch
 from pipeline.switch.memory_state import _find_causal_model
 from pipeline.switch.replay import replay_position
 from utils.env import env_int, env_str
+from utils.log import log
 
 
 class SinkMixin:
@@ -52,10 +53,10 @@ class SinkMixin:
         after = self.kv_cache1[0]["k"][:, :n_tok].detach().float()
         rel = float((after - before).norm() / (before.norm() + 1e-12))
         untouched = float((self.kv_cache1[0]["k"][:, n_tok:].detach().float() - tail).abs().max())
-        print(f"[MEM_SINKPURGE] the {k} pinned sink frame(s) of the OPENER were overwritten with "
-              f"the current true frame(s) [{current_start_frame - k}, {current_start_frame}) at "
-              f"frame {current_start_frame} (mode {mode}): sink k rel-L2 change {rel:.4f}, rest of "
-              f"the window max|diff| {untouched:.3e} (must be 0)", flush=True)
+        log(f"[MEM_SINKPURGE] the {k} pinned sink frame(s) of the OPENER were overwritten with "
+            f"the current true frame(s) [{current_start_frame - k}, {current_start_frame}) at "
+            f"frame {current_start_frame} (mode {mode}): sink k rel-L2 change {rel:.4f}, rest of "
+            f"the window max|diff| {untouched:.3e} (must be 0)")
         assert rel > 1e-3, "MEM_SINKPURGE fired but the sink k/v did not change"
         assert untouched == 0.0, "MEM_SINKPURGE touched the local window, it must not"
 

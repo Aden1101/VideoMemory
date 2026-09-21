@@ -5,6 +5,7 @@ import torch
 
 from pipeline.switch.noise import ANCHOR_LEVEL_SEED, ANCHOR_NOISE_SEED, mix_with_noise, private_noise
 from utils.env import env_float, env_int, env_str
+from utils.log import log
 
 
 def _load_anchor(path):
@@ -32,8 +33,8 @@ class AnchorControlsMixin:
             px = TVF.gaussian_blur(px[:, 0], kernel_size=[k, k], sigma=[sigma, sigma])[:, None]
         out = self.vae.encode_to_latent(px.permute(0, 2, 1, 3, 4).to(torch.bfloat16))
         self.vae.model.clear_cache()
-        print(f"[ANCHOR_BLUR] anchor frame VAE round trip with sigma={sigma} px "
-              f"(kernel {int(6 * sigma) | 1 if sigma > 0 else 0})", flush=True)
+        log(f"[ANCHOR_BLUR] anchor frame VAE round trip with sigma={sigma} px "
+            f"(kernel {int(6 * sigma) | 1 if sigma > 0 else 0})")
         return out.to(dtype=lat.dtype, device=lat.device)
 
     def _anchor_content(self, output, lo, hi):
@@ -51,8 +52,8 @@ class AnchorControlsMixin:
             t = _load_anchor(src)
             assert tuple(t.shape) == tuple(real.shape), \
                 f"ANCHOR_FROM_FILE {src}: shape {tuple(t.shape)} != {tuple(real.shape)}"
-            print(f"[ANCHOR_FROM_FILE] anchor content REPLACED by {src} "
-                  f"(other seed's original-A frame)", flush=True)
+            log(f"[ANCHOR_FROM_FILE] anchor content REPLACED by {src} "
+                f"(other seed's original-A frame)")
             return t.to(dtype=real.dtype, device=real.device)
         if sig:
             return self._blur_latent(real, float(sig))
@@ -73,16 +74,15 @@ class AnchorControlsMixin:
         if os.path.exists(path):
             old = _load_anchor(path)
             d = float((old.float() - cur.float()).abs().max())
-            print(f"[ANCHOR_DUMP] existing {os.path.basename(path)} re-checked: "
-                  f"max|diff| = {d:.3e}", flush=True)
+            log(f"[ANCHOR_DUMP] existing {os.path.basename(path)} re-checked: "
+                f"max|diff| = {d:.3e}")
             assert d == 0.0, \
                 f"ANCHOR_DUMP: segment A differs from the stored anchor ({path}, {d:.3e})"
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({"anchor": cur, "frame": int(a_end - 1)}, path + ".tmp")
         os.replace(path + ".tmp", path)
-        print(f"[ANCHOR_DUMP] original-A anchor latent (frame {a_end - 1}) -> {path}",
-              flush=True)
+        log(f"[ANCHOR_DUMP] original-A anchor latent (frame {a_end - 1}) -> {path}")
 
     # ---- controls: does the anchor help because of what it contains, or just by being there? ----
     # Both replace the content of the anchor and change nothing else: same moment, same slot,
@@ -109,9 +109,9 @@ class AnchorControlsMixin:
         a, b = out.float().flatten(), frame.float().flatten()
         cos = float(torch.dot(a, b) / (a.norm() * b.norm() + 1e-12))
         rel = float((a - b).norm() / (b.norm() + 1e-12))
-        print(f"[MEM_DECODE_SRC] anchor REPLACED by the one decoded from another cell's state "
-              f"({os.path.basename(src)}): cos with this cell's own anchor {cos:.4f}, "
-              f"rel-L2 {rel:.4f}", flush=True)
+        log(f"[MEM_DECODE_SRC] anchor REPLACED by the one decoded from another cell's state "
+            f"({os.path.basename(src)}): cos with this cell's own anchor {cos:.4f}, "
+            f"rel-L2 {rel:.4f}")
         return out
 
     def _maybe_noise_anchor(self, frame, output, current_start_frame, n):
@@ -130,11 +130,11 @@ class AnchorControlsMixin:
         eps = private_noise(frame, env_int("MEM_DECODE_NOISE_SEED", ANCHOR_NOISE_SEED) + current_start_frame)
         noise = mu + sd * eps
         out = mix_with_noise(frame.float(), noise, s).to(frame.dtype)
-        print(f"[MEM_DECODE_NOISE] anchor content REPLACED by noise calibrated on the {ref.shape[1]} "
-              f"true window frames (dose {s}, per-channel mu in [{float(mu.min()):+.3f}, "
-              f"{float(mu.max()):+.3f}], sigma in [{float(sd.min()):.3f}, {float(sd.max()):.3f}]); "
-              f"anchor std {float(frame.float().std()):.3f} -> spliced std "
-              f"{float(out.float().std()):.3f}", flush=True)
+        log(f"[MEM_DECODE_NOISE] anchor content REPLACED by noise calibrated on the {ref.shape[1]} "
+            f"true window frames (dose {s}, per-channel mu in [{float(mu.min()):+.3f}, "
+            f"{float(mu.max()):+.3f}], sigma in [{float(sd.min()):.3f}, {float(sd.max()):.3f}]); "
+            f"anchor std {float(frame.float().std()):.3f} -> spliced std "
+            f"{float(out.float().std()):.3f}")
         return out
 
     # ---- declaring the anchor's real noise level ------------------------------------------
@@ -180,7 +180,7 @@ class AnchorControlsMixin:
         ts[lo:hi] = t
         rel = float((noised.float() - part.float()).norm() / part.float().norm().clamp_min(1e-6))
         assert rel > 1e-3, "MEM_ANCHOR_T fired but the anchor content did not change"
-        print(f"[MEM_ANCHOR_T] anchor slot(s) [{lo}, {hi}) of {n} NOISED to t={t:g} "
-              f"(sigma~{t / 1000:.3f}, rel-L2 {rel:.3f}) AND declared at t={t:g}; the {n - (hi - lo)} "
-              f"true frames keep t={int(self.args.context_noise)}", flush=True)
+        log(f"[MEM_ANCHOR_T] anchor slot(s) [{lo}, {hi}) of {n} NOISED to t={t:g} "
+            f"(sigma~{t / 1000:.3f}, rel-L2 {rel:.3f}) AND declared at t={t:g}; the {n - (hi - lo)} "
+            f"true frames keep t={int(self.args.context_noise)}")
         return out, ts

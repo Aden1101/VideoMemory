@@ -2,6 +2,7 @@
 
 from pipeline.switch.memory_state import _find_causal_model
 from utils.env import env_float, env_str
+from utils.log import log
 
 
 class AdditiveKVMixin:
@@ -71,10 +72,10 @@ class AdditiveKVMixin:
             sa._add_captured = None
         self._reset_crossattn_cache()
         self._add_installed = True
-        print(f"[MEM_ADDITIVE_KV] anchor frame installed as {n_tok} EXTRA k/v tokens on "
-              f"{len(blocks)} blocks (gain={gain}, rope band "
-              f"{'auto (one frame before the window)' if pos < 0 else pos}); the local window "
-              f"keeps its {self.local_attn_size} true frames, nothing evicted", flush=True)
+        log(f"[MEM_ADDITIVE_KV] anchor frame installed as {n_tok} EXTRA k/v tokens on "
+            f"{len(blocks)} blocks (gain={gain}, rope band "
+            f"{'auto (one frame before the window)' if pos < 0 else pos}); the local window "
+            f"keeps its {self.local_attn_size} true frames, nothing evicted")
 
     def _add_mass_report(self):
         """Mean attention mass the anchor tokens took, per block, the anti-inertia tripwire of

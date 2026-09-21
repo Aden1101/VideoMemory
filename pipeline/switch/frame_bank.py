@@ -3,6 +3,7 @@ import torch
 
 from pipeline.switch.decoded_anchor import _memdec_pooled_cond
 from utils.env import env_choice, env_float, env_int
+from utils.log import log
 
 
 class FrameBankMixin:
@@ -55,9 +56,9 @@ class FrameBankMixin:
             "key": self._fb_key(cond),
             "frame": output[:, current_start_frame - 1:current_start_frame].detach().clone(),
         })
-        print(f"[FRAMEBANK] preserve: segment {seg_idx} (prompt {prompt_idx}, subject "
-              f"{self._fb_bank[-1]['subject']}), last latent frame {current_start_frame - 1} "
-              f"-> pool size {len(self._fb_bank)}", flush=True)
+        log(f"[FRAMEBANK] preserve: segment {seg_idx} (prompt {prompt_idx}, subject "
+            f"{self._fb_bank[-1]['subject']}), last latent frame {current_start_frame - 1} "
+            f"-> pool size {len(self._fb_bank)}")
 
     def _fb_select(self, seg_idx, prompt_idx, cond, subject=None, mode=None, force=None):
         """Scene lifecycle 'recall'. Returns (frame or None, event dict). The event dict logs
@@ -128,9 +129,8 @@ class FrameBankMixin:
             pick = choose(float("-inf")) if force else None
         ev.update(chosen("", pick, ("seg", "prompt_idx", "subject")))
         self._fb_events.append(ev)
-        print(f"[FRAMEBANK] recall @segment {seg_idx} (prompt {prompt_idx}, subject {subj}): " +
-              " ".join(f"seg{c['seg']}(p{c['prompt_idx']}):{c['sim']:.4f}" for c in ev["candidates"])
-              + f" -> {'segment ' + str(ev['chosen_seg']) if ev['recalled'] else 'NO RECALL'}"
-              + (" [CORRECT]" if ev["correct"] else (" [WRONG SUBJECT]" if ev["recalled"] else "")),
-              flush=True)
+        log(f"[FRAMEBANK] recall @segment {seg_idx} (prompt {prompt_idx}, subject {subj}): " +
+            " ".join(f"seg{c['seg']}(p{c['prompt_idx']}):{c['sim']:.4f}" for c in ev["candidates"])
+            + f" -> {'segment ' + str(ev['chosen_seg']) if ev['recalled'] else 'NO RECALL'}"
+            + (" [CORRECT]" if ev["correct"] else (" [WRONG SUBJECT]" if ev["recalled"] else "")))
         return (None if pick is None else pick["frame"]), ev

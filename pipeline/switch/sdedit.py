@@ -4,6 +4,7 @@ import torch
 
 from pipeline.switch.noise import SDEDIT_SEED
 from utils.env import env_float, env_int, env_str
+from utils.log import log
 
 
 class SdeditMixin:
@@ -112,10 +113,10 @@ class SdeditMixin:
         cos = float(torch.dot(a, b) / (a.norm() * b.norm() + 1e-12))
         rel = float((a - b).norm() / (b.norm() + 1e-12))
         hf0, hf1 = self._lat_hf(frame), self._lat_hf(out)
-        print(f"[MEM_SDEDIT] anchor SHARPENED with the model prior (sigma={s}, trajectory "
-              f"{[round(t, 1) for t in self._sdedit_steps(s)]}, "
-              f"{env_int('MEM_SDEDIT_FRAMES') or self.num_frame_per_block}-frame block, return prompt): "
-              f"cos with the raw anchor {cos:.4f}, rel-L2 {rel:.4f}, latent |laplacian| "
-              f"{hf0:.4f} -> {hf1:.4f} (x{hf1 / max(hf0, 1e-9):.2f}), std "
-              f"{float(frame.float().std()):.3f} -> {float(out.float().std()):.3f}", flush=True)
+        log(f"[MEM_SDEDIT] anchor SHARPENED with the model prior (sigma={s}, trajectory "
+            f"{[round(t, 1) for t in self._sdedit_steps(s)]}, "
+            f"{env_int('MEM_SDEDIT_FRAMES') or self.num_frame_per_block}-frame block, return prompt): "
+            f"cos with the raw anchor {cos:.4f}, rel-L2 {rel:.4f}, latent |laplacian| "
+            f"{hf0:.4f} -> {hf1:.4f} (x{hf1 / max(hf0, 1e-9):.2f}), std "
+            f"{float(frame.float().std()):.3f} -> {float(out.float().std()):.3f}")
         return out

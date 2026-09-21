@@ -6,6 +6,7 @@ import torch
 from pipeline.switch.noise import ANCHOR_NOISE_SEED, mix_with_noise, private_noise
 from pipeline.switch.replay import replay_position
 from utils.env import env_choice, env_float, env_int, env_str
+from utils.log import log
 
 
 class CompositeMixin:
@@ -122,8 +123,8 @@ class CompositeMixin:
             return
         c = float(torch.dot(self._fb_key(cond_new), self._fb_key(cond_prev)))
         self._comp_gate_now = max(0.0, min(1.0, (c - lo) / max(hi - lo, 1e-6)))
-        print(f"[MEM_COMP_PROMPT_GATE] cos(prompt entering, prompt being left) = {c:.4f} "
-              f"-> composite dose alpha = {self._comp_gate_now:.3f} (ramp {lo}..{hi})", flush=True)
+        log(f"[MEM_COMP_PROMPT_GATE] cos(prompt entering, prompt being left) = {c:.4f} "
+            f"-> composite dose alpha = {self._comp_gate_now:.3f} (ramp {lo}..{hi})")
 
     def _maybe_composite(self, anchor, output, current_start_frame):
         """Blend the recalled anchor (the subject) onto the last true latent frame of the current
@@ -166,8 +167,8 @@ class CompositeMixin:
             by, bx = self._energy_centroid(bg)
             m_a, m_b = ellipse(ay, ax), ellipse(by, bx)
             m = torch.maximum(m_a, m_b)
-            print(f"[MEM_COMP_UNION] anchor centroid ({ay}, {ax}) U background centroid "
-                  f"({by}, {bx}), union mask mean {float(m.mean()):.3f}", flush=True)
+            log(f"[MEM_COMP_UNION] anchor centroid ({ay}, {ax}) U background centroid "
+                f"({by}, {bx}), union mask mean {float(m.mean()):.3f}")
             fill = env_choice("MEM_COMP_FILL", ("noise", "priority", "floor"))
             w_anchor, w_noise = self._fill_weights(fill, m, m_a, m_b,
                                                    env_float("MEM_COMP_FILL_FLOOR", 0.4))
@@ -180,8 +181,8 @@ class CompositeMixin:
         a_use = anchor
         if sig > 0:
             a_use = mix_with_noise(anchor, self._seeded_noise(anchor, current_start_frame), min(sig, 1.0))
-            print(f"[MEM_COMP_ANCHOR_NOISE] anchor content degraded with sigma={sig} "
-                  f"(mask untouched)", flush=True)
+            log(f"[MEM_COMP_ANCHOR_NOISE] anchor content degraded with sigma={sig} "
+                f"(mask untouched)")
         if w_noise is None:
             if alpha != 1.0:
                 m = 1.0 - alpha * (1.0 - m)
@@ -201,13 +202,13 @@ class CompositeMixin:
                         "crop": crop, "feather": feather,
                         "bg_frame": int(current_start_frame - 1)},
                        f"{dump}.f{current_start_frame}.pt")
-            print(f"[MEM_COMP_DUMP] composite parts -> {dump}.f{current_start_frame}.pt", flush=True)
+            log(f"[MEM_COMP_DUMP] composite parts -> {dump}.f{current_start_frame}.pt")
         controls = (f" | CONTROLS shift={shift} invert={invert} uniform={uniform} union={union} "
                     f"alpha={alpha:.3f} anchor_noise={sig}"
                     if (shift or invert or uniform or union or sig or alpha != 1.0) else "")
-        print(f"[MEM_DECODE_COMPOSITE] anchor ({anchor.shape[1]} frame(s)) composited onto the "
-              f"background of true frame {current_start_frame - 1}: elliptical mask crop={crop} "
-              f"feather={feather}, subject weight mean {float(m.mean()):.3f}{controls}", flush=True)
+        log(f"[MEM_DECODE_COMPOSITE] anchor ({anchor.shape[1]} frame(s)) composited onto the "
+            f"background of true frame {current_start_frame - 1}: elliptical mask crop={crop} "
+            f"feather={feather}, subject weight mean {float(m.mean()):.3f}{controls}")
         return comp
 
     def _blend_with_fill(self, anchor, bg, m, w_anchor, w_noise, alpha, fill, current_start_frame):
@@ -221,7 +222,7 @@ class CompositeMixin:
         if alpha != 1.0:
             w_n, w_bg = alpha * w_n, alpha * w_bg
             w_a = 1.0 - alpha * (1.0 - w_a)
-        print(f"[MEM_COMP_FILL={fill}] current-subject region (mean weight {float(w_n.mean()):.3f}) "
-              f"filled with noise sigma={sigma} instead of anchor content; anchor "
-              f"{float(w_a.mean()):.3f}, background {float(w_bg.mean()):.3f}", flush=True)
+        log(f"[MEM_COMP_FILL={fill}] current-subject region (mean weight {float(w_n.mean()):.3f}) "
+            f"filled with noise sigma={sigma} instead of anchor content; anchor "
+            f"{float(w_a.mean()):.3f}, background {float(w_bg.mean()):.3f}")
         return (w_a * anchor.float() + w_n * filler.float() + w_bg * bg.float()).to(anchor.dtype)
