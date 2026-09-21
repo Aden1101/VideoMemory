@@ -17,7 +17,7 @@ _MEMWRITER_PARAMS = ("qkv.weight", "qkv.bias", "lrs.weight", "lrs.bias",
                      "k_norm.weight", "decay_logit")
 
 
-def _find_causal_model(m):
+def find_causal_model(m):
     """Walk peft/wrapper layers down to the raw CausalWanModel (verbatim idiom of
     the pair-collection code). Type check, not hasattr:
     peft wrappers delegate attribute reads but setattr lands on the wrapper, so the backup
@@ -69,11 +69,11 @@ def _memwriter_restore(cm):
     log(f"[MEM_WRITER] stock write parameters RESTORED (was {prev})")
 
 
-def _memwriter_sync(model):
+def sync_memory_writer(model):
     """Called once per inference() call, before any write happens. MEM_WRITER empty/unset =>
     no-op (or a restore, if a previous arm of this process had overlaid a writer)."""
     path = env_str("MEM_WRITER")
-    cm = _find_causal_model(model)
+    cm = find_causal_model(model)
     applied = getattr(cm, "_memwriter_applied", None) if cm is not None else None
     if not path:
         if applied is not None:

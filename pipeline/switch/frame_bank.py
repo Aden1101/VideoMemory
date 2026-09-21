@@ -1,7 +1,8 @@
 """The Echo-Forcing baseline: a pool of real past frames, routed back by similarity."""
 import torch
 
-from pipeline.switch.decoded_anchor import _memdec_pooled_cond
+from pipeline.switch.decoded_anchor import pooled_prompt
+from pipeline.switch.routing import ROUTING_MODES, TIE_RULES, pick_banked
 from utils.env import env_choice, env_float, env_int
 from utils.log import log
 
@@ -20,7 +21,7 @@ class FrameBankMixin:
     #   FRAMEBANK_TAU      routing threshold (default 0.90)
     #   FRAMEBANK_TIE      "recent" (default, freshest true observation) | "first" (1st appearance)
     def _fb_mode(self):
-        return env_choice("FRAMEBANK", ("key", "truth"))
+        return env_choice("FRAMEBANK", ROUTING_MODES)
 
     def _route_on(self):
         """Is the Echo-Forcing ROUTER (bank + cosine decision) needed at all this rollout?
@@ -38,7 +39,7 @@ class FrameBankMixin:
         """L2-normalized pooled prompt embedding = the scene key. Same pooling as the decoder's
         cond (non-padding rows only), fp32, CPU: deterministic, draws no RNG (the paired-arm
         noise stream must stay identical)."""
-        k = _memdec_pooled_cond(cond).float()
+        k = pooled_prompt(cond).float()
         return k / k.norm().clamp_min(1e-12)
 
     def _fb_store(self, output, current_start_frame, seg_idx, prompt_idx, cond, subject=None):
@@ -79,7 +80,7 @@ class FrameBankMixin:
         (router_recalled, router_chosen_seg), since how often it fails is a result too."""
         mode = mode or self._fb_mode()
         tau = env_float("FRAMEBANK_TAU", 0.90)
-        tie = env_choice("FRAMEBANK_TIE", ("recent", "first"), default="recent")
+        tie = env_choice("FRAMEBANK_TIE", TIE_RULES, default="recent")
         subj = int(prompt_idx if subject is None else subject)
         q = self._fb_key(cond)
         # Echo-Forcing routing rule: the immediately preceding scene is the recent window, never
@@ -91,18 +92,11 @@ class FrameBankMixin:
               "candidates": [{"seg": e["seg"], "prompt_idx": e["prompt_idx"],
                               "subject": e["subject"], "end_frame": e["end_frame"], "sim": s}
                              for e, s in zip(cands, sims)]}
-        if mode not in ("truth", "key"):
+        if mode not in ROUTING_MODES:
             raise ValueError(f"FRAMEBANK={mode!r} (expected ''|'key'|'truth')")
 
         def choose(threshold):
-            """The banked entry this mode selects, or None. `threshold` only binds the cosine
-            router; the forced recall passes -inf to take the argmax whatever its score."""
-            if mode == "truth":
-                pool = [e for e in cands if e["subject"] == subj]
-            else:
-                smax = max(sims) if cands else float("-inf")
-                pool = [e for e, s in zip(cands, sims) if s >= smax - 1e-6] if smax >= threshold else []
-            return (pool[-1] if tie == "recent" else pool[0]) if pool else None
+            return pick_banked(cands, sims, mode=mode, subject=subj, tie=tie, threshold=threshold)
 
         def chosen(prefix, pick, fields):
             """What the event log keeps of a selection: whether one was made, which entry, and

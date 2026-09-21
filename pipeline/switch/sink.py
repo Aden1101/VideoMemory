@@ -1,7 +1,7 @@
 """Rewriting the pinned sink frames instead of a slot of the rolling window."""
 import torch
 
-from pipeline.switch.memory_state import _find_causal_model
+from pipeline.switch.memory_state import find_causal_model
 from pipeline.switch.replay import replay_position
 from utils.env import env_int, env_str
 from utils.log import log
@@ -21,7 +21,7 @@ class SinkMixin:
     #   MEM_SINKPURGE=2        purge at every switch (the "always refresh" variant)
     def _sink_frames(self):
         """Runtime sink size in latent FRAMES, read from the model (set_runtime_sink_size aware)."""
-        cm = _find_causal_model(self.generator.model)
+        cm = find_causal_model(self.generator.model)
         assert cm is not None, "MEM_SINKPURGE: no CausalWanModel found under the wrappers"
         return int(getattr(cm.blocks[0].self_attn, "_sink_runtime",
                            getattr(cm.blocks[0].self_attn, "sink_size", 0)))

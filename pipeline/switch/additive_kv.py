@@ -1,6 +1,6 @@
 """Adding the anchor to the attention context instead of evicting a true frame for it."""
 
-from pipeline.switch.memory_state import _find_causal_model
+from pipeline.switch.memory_state import find_causal_model
 from utils.env import env_float, env_str
 from utils.log import log
 
@@ -17,7 +17,7 @@ class AdditiveKVMixin:
     #   MEM_ADD_POS=k|auto  RoPE band start of the anchor tokens; auto = one frame before the
     #                       local window (the distances the model already reads every step)
     def _add_blocks(self):
-        cm = _find_causal_model(self.generator.model)
+        cm = find_causal_model(self.generator.model)
         assert cm is not None, "MEM_ADDITIVE_KV: no CausalWanModel found under the wrappers"
         return cm.blocks
 
@@ -31,7 +31,7 @@ class AdditiveKVMixin:
     def _clear_add_kv(self):
         """Called once per rollout, unconditionally: an additive channel installed by a previous
         arm of the same process must never leak into the next one."""
-        cm = _find_causal_model(self.generator.model)
+        cm = find_causal_model(self.generator.model)
         if cm is None:
             return
         for blk in cm.blocks:
@@ -80,7 +80,7 @@ class AdditiveKVMixin:
     def _add_mass_report(self):
         """Mean attention mass the anchor tokens took, per block, the anti-inertia tripwire of
         the design plan (a channel that reads 0 % is dead by construction)."""
-        cm = _find_causal_model(self.generator.model)
+        cm = find_causal_model(self.generator.model)
         if cm is None or not self._add_installed:
             return None
         return {bi: float(getattr(blk.self_attn, "_add_mass", float("nan")))
@@ -90,7 +90,7 @@ class AdditiveKVMixin:
         """Attention mass by source [sink | window | anchor] per
         block, at the last forward. `window` = everything in the context that is not the sink
         (the prompt cache, when active, is counted there). None unless MEM_ADD_MASS_SRC=1."""
-        cm = _find_causal_model(self.generator.model)
+        cm = find_causal_model(self.generator.model)
         if cm is None or not self._add_installed:
             return None
         out = {}

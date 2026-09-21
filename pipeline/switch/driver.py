@@ -13,7 +13,7 @@ from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with
 from utils.env import check_arm_variables, env_int, env_str
 from utils.log import log
 from wan.modules.video_memory import TTTBlockCache
-from pipeline.switch.memory_state import _memwriter_sync
+from pipeline.switch.memory_state import sync_memory_writer
 from pipeline.switch.schedule import parse_schedule
 
 
@@ -86,7 +86,7 @@ class ScheduleDriverMixin:
         self._first_switch_frame = first_switch_frame
         # MEM_WRITER: overlay write parameters trained offline, before the first write. It
         # draws nothing from the RNG, so paired arms keep identical noise.
-        _memwriter_sync(self.generator.model)
+        sync_memory_writer(self.generator.model)
         for reset in (self._reset_memory_slots, self._reset_early_decode, self._reset_composite,
                       self._reset_add_kv, self._fb_reset):
             reset()

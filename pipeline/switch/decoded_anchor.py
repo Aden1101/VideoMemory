@@ -16,7 +16,7 @@ _MEMDEC_CACHE = {}   # (abs ckpt path, device str) -> loaded AnchorFrameDecoder,
 _MEMDEC_BLOCKS = (5, 16, 27)
 
 
-def _memdec_pooled_cond(cond_dict):
+def pooled_prompt(cond_dict):
     """Verbatim logic copy of the pooling used when the decoder training pairs were collected,
     must stay identical, fp16 cpu round-trip included: the conditioned decoder was trained on
     'cond_emb' produced by exactly this pooling. WanTextEncoder zeroes the padding positions:
@@ -92,7 +92,7 @@ class AnchorDecodeMixin:
                       for t in self.ttt_cache[bi].state) for bi in _MEMDEC_BLOCKS]
         cond = None
         if getattr(dec, "cond_dim", 0):
-            cond = _memdec_pooled_cond(cond_dict).to(dev, torch.float32)[None]
+            cond = pooled_prompt(cond_dict).to(dev, torch.float32)[None]
         with torch.no_grad():
             frame = dec(sts, cond=cond)
         return frame[:, 0:1].to(dtype=out_dtype, device=out_device), cond is not None
