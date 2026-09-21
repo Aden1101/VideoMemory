@@ -26,7 +26,7 @@ left the window is the one the memory writes.
 
 ![three generation steps: the window slides, the chunk it drops is written to the memory](assets/arch_context.png)
 
-Where it sits. The branch reads the same normalised input as self-attention and adds a gated
+Where it sits. The branch reads the same normalized input as self-attention and adds a gated
 output to the residual stream; its state lives outside the block and is carried across chunks.
 
 ![the transformer block with the memory branch between self-attention and cross-attention](assets/arch_block.png)
@@ -52,7 +52,7 @@ token and per matrix, predicted from the token, and the score is ascended, not d
 is five Newton-Schulz iterations. The last write line puts each column back to the norm it had
 before the update, so the norms stay those of the initial state; with `use_decay` the state is
 first scaled by a learned forget gate and each column is capped at its initial norm instead.
-The gate, the scale and the shift are one projection of the normalised read, which is what
+The gate, the scale and the shift are one projection of the normalized read, which is what
 makes the gate depend on the content, and RMS is taken once per chunk. The injection then
 loses its mean over tokens (`dc_remove`) and is scaled to a fraction of the residual stream's
 RMS (`mem_stream_scale`).
@@ -107,13 +107,13 @@ has both measurements at step 1250, and going from sink 3 to sink 1 costs 0.06 t
 identity, the size of the effects below. So the conclusions rest on memory active against memory
 zeroed; against the reference, only run 1 is a fair comparison.
 
-The motion cost belongs to the continued training and not to the memory, since the
-memory-zeroed arm pays it too. Where motion does come back, run 2 at step 1250, identity with the memory active has
-collapsed to 0.36. In run 1, the one fair comparison to the reference, the only arm that ends
-above it on identity is the memory-zeroed one (0.773 against 0.743), with a third fewer clips
-rated dynamic; with the memory active identity is 0.667 and dynamic degree 0.23, a near-frozen
-video. Run 4 keeps more motion than its reference, and the memory still lowers identity there at
-two checkpoints out of three.
+The motion cost belongs to the continued training and not to the memory, since the memory-zeroed arm
+pays it too. Where motion does come back, run 2 at step 1250, identity with the memory active has
+collapsed to 0.36. In run 1, the one fair comparison to the reference, the only arm that ends above
+it on identity is the memory-zeroed one (0.773 against 0.743), with a third fewer clips rated
+dynamic; with the memory active identity is 0.667 and dynamic degree 0.23, a near-frozen video. Run
+4 keeps more motion than its reference, and the memory still lowers identity there at two
+checkpoints out of three.
 
 The likely reason, for this write rule, this objective and this backbone, which is all that
 was tested: chunk-local DMD and the usual metrics reward the same thing, temporal
@@ -155,7 +155,7 @@ With torch, `tests/test_memory_cell.py` checks what this README says of the cell
 the model calls: a zero gate is exactly inert, the read sees the state from before the write, the
 write takes the evicted chunk and keeps the column norms, and an offline replay rebuilds the same
 state. `tests/test_inference_smoke.py` streams a miniature model with the memory live, and
-`tests/fingerprints.py` hashes the memory path to tell a refactor from a behaviour change.
+`tests/fingerprints.py` hashes the memory path to tell a refactor from a behavior change.
 
 With the weights:
 
@@ -173,7 +173,7 @@ Two passes because the text encoder (11.4 GB) and the generator do not fit in me
 a consumer machine: pass 1 encodes and exits, pass 2 never loads the encoder. Training needs
 CUDA and two 48 GB cards.
 
-What has and has not been run since the code was reorganised into its own modules: the memory
+What has and has not been run since the code was reorganized into its own modules: the memory
 cell, the model and the inference rollouts give bit-identical numbers before and after, with
 the real weights. The training path (`trainer/memory_training.py`, `model/twin_objective.py`)
 was moved the same way and read side by side against the previous code, but not executed
@@ -186,7 +186,7 @@ reimplementing upstream's rotary embedding and demanding bitwise equality.
 
 ## Where the code is
 
-Upstream's files are kept recognisable: what this work adds lives in files of its own, mixed
+Upstream's files are kept recognizable: what this work adds lives in files of its own, mixed
 into upstream's classes, so `git diff 392b3f8` on an upstream file shows call sites and little else.
 
 | file | what it holds |
