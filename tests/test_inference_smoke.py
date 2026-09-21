@@ -1,6 +1,7 @@
 #!/usr/bin/env python
-"""A real miniature CausalWanModel with a memory branch, rolled out over three chunks. No
-image is judged: this checks that the chain executes and the caches advance. Catches what an
+"""A real miniature CausalWanModel with a memory branch, rolled out over three chunks, each
+with its read pass and its write pass, as the inference pipeline does. No image is judged:
+this checks that the chain executes, the caches advance and the memory writes. Catches what an
 import test cannot, which is everything that only fails at run time.
 
     python tests/test_inference_smoke.py            # detected device
@@ -16,6 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from utils.device import describe, device, synchronize  # noqa: E402
 from wan.modules.causal_model import CausalWanModel  # noqa: E402
+from wan.modules.video_memory import TTTBlockCache  # noqa: E402
 
 HEADS, HEAD_DIM = 12, 128          # required by the pipeline's _initialize_kv_cache
 DIM = HEADS * HEAD_DIM
@@ -50,10 +52,13 @@ def main():
     xa = [{"k": torch.zeros(1, 512, HEADS, HEAD_DIM, dtype=DT, device=device),
            "v": torch.zeros(1, 512, HEADS, HEAD_DIM, dtype=DT, device=device),
            "is_init": False} for _ in range(LAYERS)]
+    # one memory cache per block, as the pipelines allocate them. Without it the memory branch
+    # returns at its first line and the test would cover the model but not the memory.
+    ttt = [TTTBlockCache() for _ in range(LAYERS)]
 
-    # The output head is zero-init (causal_model.py:1780, the "never noise into the cache"
-    # rule), so a fresh model returns exactly zero. It is perturbed here, otherwise S4 and S5
-    # would be comparing 0 with 0 and would never catch a regression of the path.
+    # The output head is zero-init (CausalWanModel.init_weights, the "never noise into the cache"
+    # rule), so a fresh model returns exactly zero. It is perturbed here, otherwise the two checks on
+    # the output values would be comparing 0 with 0 and would never catch a regression of the path.
     with torch.no_grad():
         m.head.head.weight.normal_(0, 0.02)
 
@@ -65,24 +70,31 @@ def main():
         for c in range(CHUNKS):
             x = [torch.randn(16, F, H, W, device=device, dtype=DT)]
             t0 = time.time()
-            out = m(x, t=t, context=ctx, seq_len=F * FRAME_SEQ, kv_cache=kv, crossattn_cache=xa,
-                    current_start=c * F * FRAME_SEQ)
+            common = dict(context=ctx, seq_len=F * FRAME_SEQ, kv_cache=kv, crossattn_cache=xa,
+                          current_start=c * F * FRAME_SEQ, ttt_cache=ttt)
+            out = m(x, t=t, ttt_update=False, **common)                        # read pass
+            m(out, t=torch.zeros_like(t), ttt_update=True, **common)           # write pass
             synchronize()
             ends.append(int(kv[0]["global_end_index"]))
             outs.append(out)
             print(f"  .. chunk {c}: {tuple(out[0].shape)} in {(time.time()-t0)*1000:5.0f} ms, "
                   f"cache at {ends[-1]} tokens")
 
-    check("S1 output shape matches the input",
+    check("output shape matches the input",
           tuple(outs[0][0].shape) == (16, F, H, W), str(tuple(outs[0][0].shape)))
-    check("S2 no non-finite value", all(bool(torch.isfinite(o).all()) for o in outs))
-    check("S3 the KV cache advances from chunk to chunk",
+    check("no non-finite value", all(bool(torch.isfinite(o).all()) for o in outs))
+    check("the KV cache advances from chunk to chunk",
           ends == [(c + 1) * F * FRAME_SEQ for c in range(CHUNKS)], str(ends))
-    check("S4 output is not identically zero (head perturbed)",
+    check("output is not identically zero (head perturbed)",
           float(outs[0].abs().max()) > 0)
-    check("S5 two different chunks give different outputs",
+    check("two different chunks give different outputs",
           not torch.equal(outs[0], outs[1]))
-    check("S6 the cross-attention cache was initialised", xa[0]["is_init"])
+    check("the cross-attention cache was initialised", xa[0]["is_init"])
+    check("the memory block wrote a state, the plain block did not",
+          ttt[1].state is not None and ttt[0].state is None)
+    init = m.blocks[1].memory.init_state(1, device, DT)
+    check("that state moved away from its init",
+          any(not torch.equal(w, w0) for w, w0 in zip(ttt[1].state, init)))
 
     print(f"\n{len(OK)}/{len(OK)} inference smoke PASS on {device}")
 

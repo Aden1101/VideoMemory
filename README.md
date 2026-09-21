@@ -54,7 +54,7 @@ Three points are not obvious from the code:
 
 Training compares each chunk against a counterfactual twin of itself: the same chunk
 regenerated with the memory switched off, sharing history, KV cache and noise, so the only
-difference between the two is the injection. `model/streaming_training.py` builds that twin and
+difference between the two is the injection. `model/twin_objective.py` builds that twin and
 scores four terms against it. Identity may not get worse, motion must match, and the injection
 must be measurably non-zero. All four terms are weighted zero in the runs reported below, which
 are plain DMD; the twin is there to be read, not to explain the figure.
@@ -144,9 +144,34 @@ Runs on CUDA, Apple Metal and CPU. On CUDA every device call delegates to the or
 reimplementing upstream's rotary embedding and demanding bitwise equality.
 
 ```bash
+python -m pytest tests/                # everything below, none of it needs weights
+python tests/test_env_and_schedule.py  # arm switches and prompt schedule: no torch, one second
+python tests/test_imports.py           # every module imports, heavy packages stubbed: no torch
+python tests/test_eval_report.py       # the scoring script writes the 29 published tables again: no torch
 python tests/test_device.py            # device layer
-python tests/test_inference_smoke.py   # real model, streaming, no weights needed
+python tests/test_inference_smoke.py   # real model, streaming
+python tests/golden.py --record        # fingerprints of the memory path, to compare after a change
 ```
+
+`tests/test_memory_cell.py` checks what this README says of the cell through the code the model
+calls: a zero gate is exactly inert, the read sees the state from before the write, the write
+takes the evicted chunk and keeps the column norms, and an offline replay rebuilds the same state.
+
+## Where the code is
+
+Upstream's files are kept recognisable: what this work adds lives in files of its own, mixed
+into upstream's classes, so `git diff 392b3f8` on an upstream file shows call sites and little else.
+
+| file | what it holds |
+|---|---|
+| `wan/modules/video_memory.py` | the memory cell: read, write gradient, Muon update, gated output |
+| `wan/modules/memory_inject.py` | the cell inside a transformer block, and the eviction feed |
+| `wan/modules/additive_attention.py` | attention over the context plus extra anchor tokens |
+| `model/twin_objective.py` | the counterfactual-twin objective |
+| `trainer/memory_training.py` | backpropagation across chunks, state snapshots, optimizer groups, memory logs |
+| `pipeline/memory_rollout.py` | the write pass under grad, and cache dropout |
+| `pipeline/switch/` | recall at a prompt switch: `driver.py` is the rollout, `schedule.py` its plan, and each other module one way of bringing the subject back, with its controls |
+| `utils/device.py`, `utils/env.py`, `utils/prompt_cache.py` | device layer, arm switches, prompt cache |
 
 ## Credit
 
