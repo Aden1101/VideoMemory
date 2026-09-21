@@ -83,7 +83,7 @@ def draw_context():
     chunks, cell, gap, chunk_gap = 8, 0.34, 0.06, 0.30
     chunk_w = 3 * cell + 2 * gap
     left, right = 2.35, 2.35 + chunks * chunk_w + (chunks - 1) * chunk_gap
-    c = Canvas(right + 3.4, 6.35)
+    c = Canvas(right + 2.5, 6.35)
 
     def chunk_x(i):
         return left + i * (chunk_w + chunk_gap)
@@ -97,11 +97,10 @@ def draw_context():
     items = [("sink, never evicted", GREEN_F, GREEN, False), ("attention window", GREY_F, MUTED, False),
              ("being generated", BLUE_F, BLUE, False), ("written to the memory", ORANGE_F, ORANGE, False),
              ("held by the memory only", "#ffffff", LINE, True)]
-    x = left
-    for label, face, edge, dashed in items:
+    for offset, (label, face, edge, dashed) in zip((0, 2.75, 5.2, 7.55, 10.4), items):
+        x = left + offset
         c.box(x, 5.72, 0.3, 0.3, face, edge, dashed=dashed, radius=0.05)
         c.text(x + 0.42, 5.87, label, size=8.6, ha="left")
-        x += 0.62 + 0.118 * len(label)
 
     for row, current in enumerate((5, 6, 7)):
         y = 4.15 - row * 1.5
@@ -122,20 +121,21 @@ def draw_context():
         c.ax.plot([wl, wl, wr, wr], [y + 0.62, y + 0.72, y + 0.72, y + 0.62], color=MUTED, lw=0.9)
         # the evicted chunk goes to the memory
         ex = chunk_x(current - 4) + chunk_w / 2
-        c.arrow((ex, y - 0.08), (ex, y - 0.42), (right + 0.75, y - 0.42), (right + 0.75, y + 0.02),
-                colour=ORANGE)
-        c.module(right + 0.75, y + 0.30, 0.95, 0.56, "$W$", face=BLUE_F, edge=BLUE, size=11, lw=1.2)
-        c.text(right + 1.4, y + 0.30, f"write chunk {current - 4}", size=8.6, colour=ORANGE, ha="left")
+        c.arrow((ex, y - 0.08), (ex, y - 0.42), (right + 0.62, y - 0.42), colour=ORANGE)
+        c.text(right + 0.5, y - 0.22, f"write chunk {current - 4}", size=8.4, colour=ORANGE, ha="right")
 
     c.text((chunk_x(2) + chunk_x(4) + chunk_w) / 2, 4.15 + 0.95, "rolling window, 9 frames", size=8.2,
            colour=MUTED)
+    # one memory for the whole rollout: every step writes into the same state
+    c.box(right + 0.65, 0.45, 1.5, 4.4, BLUE_F, BLUE, lw=1.2, radius=0.14)
+    c.text(right + 1.4, 2.78, "memory\n$W$", size=10.5, colour=INK)
     # time axis
-    ay = 0.62
-    c.arrow((left, ay), (right + 0.25, ay), colour=MUTED, lw=0.9)
+    ay = 0.3
+    c.arrow((left, ay), (right + 0.1, ay), colour=MUTED, lw=0.9)
     for i in range(chunks):
         c.text(chunk_x(i) + chunk_w / 2, ay - 0.27, str(i), size=8.2, colour=MUTED)
     c.text(left - 0.35, ay - 0.27, "chunk", size=8.2, colour=MUTED, ha="right")
-    c.text(right + 0.3, ay - 0.27, "time", size=8.2, colour=MUTED, ha="left")
+    c.text(right + 0.1, ay - 0.27, "time", size=8.2, colour=MUTED, ha="right")
     c.save("arch_context.png")
 
 
@@ -192,7 +192,7 @@ def draw_cell():
     read_y, state_y, write_y = 4.55, 2.95, 1.35
 
     c.text(0.15, read_y + 0.9, "read", size=10, colour=BLUE, weight="bold", ha="left")
-    c.text(0.15, write_y + 0.9, "write", size=10, colour=ORANGE, weight="bold", ha="left")
+    c.text(0.15, write_y - 0.85, "write", size=10, colour=ORANGE, weight="bold", ha="left")
 
     # read lane
     c.module(1.45, read_y, 1.9, 0.78, "current chunk", face=BLUE_F, edge=BLUE)
