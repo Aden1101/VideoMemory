@@ -1,10 +1,8 @@
 """The Echo-Forcing baseline: a pool of real past frames, routed back by similarity."""
-import os
-
 import torch
 
 from pipeline.switch.decoded_anchor import _memdec_pooled_cond
-from utils.env import env_float, env_int
+from utils.env import env_choice, env_float, env_int
 
 
 class FrameBankMixin:
@@ -21,7 +19,7 @@ class FrameBankMixin:
     #   FRAMEBANK_TAU      routing threshold (default 0.90)
     #   FRAMEBANK_TIE      "recent" (default, freshest true observation) | "first" (1st appearance)
     def _fb_mode(self):
-        return (os.environ.get("FRAMEBANK", "") or "").strip().lower()
+        return env_choice("FRAMEBANK", ("key", "truth"))
 
     def _route_on(self):
         """Is the Echo-Forcing ROUTER (bank + cosine decision) needed at all this rollout?
@@ -80,8 +78,7 @@ class FrameBankMixin:
         (router_recalled, router_chosen_seg), since how often it fails is a result too."""
         mode = mode or self._fb_mode()
         tau = env_float("FRAMEBANK_TAU", 0.90)
-        tie = (os.environ.get("FRAMEBANK_TIE", "recent") or "recent").strip().lower()
-        assert tie in ("recent", "first"), f"FRAMEBANK_TIE must be recent|first, got {tie!r}"
+        tie = env_choice("FRAMEBANK_TIE", ("recent", "first"), default="recent")
         subj = int(prompt_idx if subject is None else subject)
         q = self._fb_key(cond)
         # Echo-Forcing routing rule: the immediately preceding scene is the recent window, never

@@ -5,10 +5,10 @@ without it, none of this runs and the attention is upstream's.
 """
 import copy
 import math
-import os
 
 import torch
 
+from utils.env import env_int
 from wan.modules.attention import attention
 
 
@@ -73,7 +73,7 @@ class AdditiveKVAttentionMixin:
         # attention mass per source [sink | window | anchor], exact rather than approximate:
         # the log-sum-exp of a concatenation is the logaddexp of the parts, so the three
         # fractions sum to 1. Costs two more attention calls, only when the flag is set.
-        if int(os.environ.get("MEM_ADD_MASS_SRC", "0") or 0) and 0 < n_sink < k_ctx.shape[1]:
+        if env_int("MEM_ADD_MASS_SRC") and 0 < n_sink < k_ctx.shape[1]:
             ks, vs = k_ctx[:, :n_sink], v_ctx[:, :n_sink]
             kw, vw = k_ctx[:, n_sink:], v_ctx[:, n_sink:]
             _, lse_s = self._sdpa_lse(q, ks.transpose(1, 2), vs.transpose(1, 2))

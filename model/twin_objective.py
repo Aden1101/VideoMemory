@@ -13,6 +13,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from utils.env import env_int
+
 
 @dataclass
 class TwinObjective:
@@ -121,7 +123,7 @@ class TwinObjectiveMixin:
         equals the real chunk, which validates that the snapshot is complete and the RNG paired."""
         snap = self._twin_snapshot()
         previous = os.environ.get("MEM_ZERO_ALL")
-        if os.environ.get("TWIN_SELFTEST", "0") != "1":
+        if env_int("TWIN_SELFTEST") != 1:
             os.environ["MEM_ZERO_ALL"] = "1"
         try:
             with torch.no_grad():
@@ -138,7 +140,7 @@ class TwinObjectiveMixin:
 
     @staticmethod
     def _twin_selftest(real, twin):
-        if twin is None or os.environ.get("TWIN_SELFTEST", "0") != "1":
+        if twin is None or env_int("TWIN_SELFTEST") != 1:
             return
         diff = (real.detach() - twin).abs().max().item()
         print(f"[TWIN-SELFTEST] rank{dist.get_rank() if dist.is_initialized() else 0} "

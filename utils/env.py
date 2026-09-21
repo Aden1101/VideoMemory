@@ -19,6 +19,16 @@ def env_str(name):
     return os.environ.get(name, "").strip()
 
 
+def env_choice(name, allowed, default=""):
+    """A variable that takes one of a few words, lower-cased; anything else is refused rather
+    than silently run as the default arm."""
+    value = env_str(name).lower() or default
+    if value != default and value not in allowed:
+        raise ValueError(f"{name}={value!r}: expected one of {sorted(allowed)}"
+                         + (f", or unset for {default!r}" if default else ", or unset"))
+    return value
+
+
 def env_on(name):
     """Is this arm switched on: set to something other than empty, zero or a negative number."""
     value = env_str(name)

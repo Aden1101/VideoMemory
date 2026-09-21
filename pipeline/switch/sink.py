@@ -1,9 +1,8 @@
 """Rewriting the pinned sink frames instead of a slot of the rolling window."""
-import os
-
 import torch
 
 from pipeline.switch.memory_state import _find_causal_model
+from pipeline.switch.replay import replay_position
 from utils.env import env_int, env_str
 
 
@@ -33,7 +32,7 @@ class SinkMixin:
         mode = env_int("MEM_SINKPURGE")
         if not mode or not (is_revisit or mode >= 2):
             return
-        assert os.environ.get("REPLAY_PAST_POS", "") != "sink0", \
+        assert replay_position() != "sink0", \
             "MEM_SINKPURGE and REPLAY_PAST_POS=sink0 both rewrite the sink: not a stack"
         assert not env_str("MEM_DECODE") \
             and not env_int("REPLAY_PAST") and not self._fb_mode(), \

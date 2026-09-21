@@ -17,12 +17,16 @@ N-switch `_switch_recache`) build the same window through these three helpers.
                            to imitate an imperfect recall.
     REPLAY_PAST_BLOCKS=a,b keep the replayed window only on these transformer blocks.
 """
-import os
-
 import torch
 
 from pipeline.switch.noise import REPLAY_NOISE_SEED, mix_with_noise, private_noise
-from utils.env import env_float, env_int, env_str
+from utils.env import env_choice, env_float, env_int, env_str
+
+
+def replay_position():
+    """REPLAY_PAST_POS: "" for the most recent slots, "head" for the oldest end of the window,
+    "sink0" for the sink slot."""
+    return env_choice("REPLAY_PAST_POS", ("head", "sink0"))
 
 
 class ReplayPastMixin:
@@ -48,7 +52,7 @@ class ReplayPastMixin:
             print(f"[REPLAY_PAST] anchor at window slot {pos}/{n} "
                   f"({slot_k} frames before most-recent)", flush=True)
         elif 0 < nf < n:
-            if os.environ.get("REPLAY_PAST_POS", "") == "head":
+            if replay_position() == "head":
                 window = torch.cat([
                     self._anchor_content(output, a_end - nf, a_end),
                     output[:, current_start_frame - (n - nf):current_start_frame]], dim=1)
@@ -88,7 +92,7 @@ class ReplayPastMixin:
         """Refill the kv cache at a switch, with `window` in place of the true recent frames.
         `window=None` gives the plain recache."""
         blocks_env = env_str("REPLAY_PAST_BLOCKS")
-        sink0 = os.environ.get("REPLAY_PAST_POS", "") == "sink0"
+        sink0 = replay_position() == "sink0"
         assert timestep_override is None or not (blocks_env or sink0), \
             "MEM_ANCHOR_T declares the noise level of the slot the recache writes, so it is " \
             "defined for the plain window, not for REPLAY_PAST_BLOCKS / REPLAY_PAST_POS=sink0"

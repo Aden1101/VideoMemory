@@ -54,10 +54,24 @@ def test_set_values():
     os.environ.pop("MEM_TEST", None)
 
 
+def test_a_choice_is_lowercased_defaulted_and_refused_when_unknown():
+    for value, want in ((None, "recent"), ("", "recent"), (" First ", "first")):
+        _with(value)
+        assert env.env_choice("MEM_TEST", ("recent", "first"), default="recent") == want
+    _with("frist")
+    try:
+        env.env_choice("MEM_TEST", ("recent", "first"), default="recent")
+    except ValueError as e:
+        assert "frist" in str(e)
+    else:
+        raise AssertionError("a misspelt choice was accepted")
+    os.environ.pop("MEM_TEST", None)
+
+
 def test_the_registry_lists_exactly_what_the_source_reads():
     files = subprocess.check_output(["git", "ls-files", "*.py"], cwd=ROOT).decode().split()
     read = set()
-    readers = r"(?:env_int|env_float|env_str|env_on|environ\.get|environ\.pop|environ)"
+    readers = r"(?:env_int|env_float|env_str|env_on|env_choice|environ\.get|environ\.pop|environ)"
     pattern = re.compile(readers + r"""[(\[]\s*["']([A-Z][A-Z_0-9]*)["']""")
     for f in files:
         if f.startswith("tests/"):

@@ -6,7 +6,6 @@ so the two can be compared side by side. What is ours is the causal chunk-by-chu
 the renormalization back to the initial norms, the gated injection and the eviction feed.
 """
 import math
-import os
 from typing import Optional, Sequence
 
 import torch
@@ -14,6 +13,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
+
+from utils.env import env_int
 
 
 class CompatRMSNorm(nn.Module):
@@ -473,7 +474,7 @@ class VideoMemoryLayer(nn.Module):
         carrier = x if self.rel_norm else self.a_norm(x)
         out = gate * (carrier * (1 + scale) + shift)
         self._record_diagnostics(out, gate, num_frames)
-        if self.dc_remove or int(os.environ.get("MEM_DC_REMOVE", "0")):
+        if self.dc_remove or env_int("MEM_DC_REMOVE"):
             out = out - out.mean(dim=1, keepdim=True)
         return out
 

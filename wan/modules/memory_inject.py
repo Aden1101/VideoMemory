@@ -5,7 +5,6 @@ Mixed into CausalWanAttentionBlock. The block itself, its attention and its cach
 upstream's and stay in wan/modules/causal_model.py.
 """
 import math
-import os
 
 import torch
 
@@ -179,7 +178,7 @@ class EvictionFeedMixin:
         sink_chunks = math.ceil(int(getattr(self.blocks[0].self_attn, "_sink_runtime", 0)) / frames)
         tokens_per_frame = int(math.prod(grid_sizes[0][1:]).item())
         chunk = int(current_start) // (tokens_per_frame * frames)
-        debug = int(os.environ.get("MEM_EVICT_DEBUG", "0"))
+        debug = env_int("MEM_EVICT_DEBUG")
         for index, block in enumerate(self.blocks):
             if getattr(block, "memory", None) is None or ttt_cache[index] is None:
                 continue

@@ -1,8 +1,7 @@
 """Adding the anchor to the attention context instead of evicting a true frame for it."""
-import os
 
 from pipeline.switch.memory_state import _find_causal_model
-from utils.env import env_float
+from utils.env import env_float, env_str
 
 
 class AdditiveKVMixin:
@@ -55,7 +54,7 @@ class AdditiveKVMixin:
             blk.self_attn._add_captured = None
         self._prefill_scratch_cache(anchor_frames, conditional_dict)    # the blocks capture k/v as it runs
         gain = env_float("MEM_ADD_GAIN", 1)
-        p = (os.environ.get("MEM_ADD_POS", "") or "").strip().lower()
+        p = env_str("MEM_ADD_POS").lower()
         pos = -1 if p in ("", "auto") else int(p)
         n_tok = nf * self.frame_seq_length
         for bi, blk in enumerate(blocks):

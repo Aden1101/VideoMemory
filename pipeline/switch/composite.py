@@ -4,7 +4,8 @@ import os
 import torch
 
 from pipeline.switch.noise import ANCHOR_NOISE_SEED, mix_with_noise, private_noise
-from utils.env import env_float, env_int, env_str
+from pipeline.switch.replay import replay_position
+from utils.env import env_choice, env_float, env_int, env_str
 
 
 class CompositeMixin:
@@ -140,7 +141,7 @@ class CompositeMixin:
                                    two differ (see _fill_weights)"""
         if not env_int("MEM_DECODE_COMPOSITE"):
             return anchor
-        assert os.environ.get("REPLAY_PAST_POS", "") not in ("head", "sink0"), \
+        assert not replay_position(), \
             "MEM_DECODE_COMPOSITE is defined for the most recent slot only: the background it " \
             "blends into is the current context"
         assert current_start_frame >= 1, "MEM_DECODE_COMPOSITE before any frame was produced"
@@ -167,7 +168,7 @@ class CompositeMixin:
             m = torch.maximum(m_a, m_b)
             print(f"[MEM_COMP_UNION] anchor centroid ({ay}, {ax}) U background centroid "
                   f"({by}, {bx}), union mask mean {float(m.mean()):.3f}", flush=True)
-            fill = (os.environ.get("MEM_COMP_FILL", "") or "").strip().lower()
+            fill = env_choice("MEM_COMP_FILL", ("noise", "priority", "floor"))
             w_anchor, w_noise = self._fill_weights(fill, m, m_a, m_b,
                                                    env_float("MEM_COMP_FILL_FLOOR", 0.4))
         if invert:
