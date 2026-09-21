@@ -72,7 +72,7 @@ mean the memory helps, and the verdicts are not part of this project's conclusio
 left in because the tables are kept exactly as the script wrote them.
 
 The tables call the thresholds pre-registered. Git cannot show that: they enter this
-repository's history in the same commit as the first tables (`cf1d8f1`, 2026-08-13). They have
+repository's history in the same commit as the first tables (`33e0878`, 2026-08-13). They have
 not changed since, and every table prints the ones it used. The French words in the verdict
 line are the script's own, kept for the same reason as the verdicts.
 
