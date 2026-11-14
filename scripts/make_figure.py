@@ -126,8 +126,8 @@ def draw(runs, path=os.path.join(ROOT, "assets", "motion_identity.png")):
 
     axes[0][0].set_ylim(0.20, 0.85)
     axes[1][0].set_ylim(-0.05, 1.10)
-    fig.suptitle(f"Memory on scores lower identity than memory off at {n_lower} of {len(gaps)} "
-                 f"checkpoints (mean gap {sum(gaps) / len(gaps):+.2f})",
+    fig.suptitle(f"Memory on scores lower identity than memory off at {n_lower / len(gaps):.0%} "
+                 f"of checkpoints (mean gap {sum(gaps) / len(gaps):+.2f})",
                  fontsize=14, color=INK, fontweight="bold", x=0.012, ha="left", y=0.975)
     fig.text(0.5, 0.055, "training step", fontsize=10, color=INK2, ha="center")
     fig.legend(handles=[

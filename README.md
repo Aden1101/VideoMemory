@@ -65,8 +65,8 @@ are plain DMD; the twin is there to be read, not to explain the figure.
 
 ![motion vs identity](assets/motion_identity.png)
 
-- The memory does not help: with it active, identity is lower than with it zeroed at 10 of the
-  15 checkpoints, by 0.07 on average.
+- The memory does not help: with it active, identity is lower than with it zeroed at two thirds of
+  the checkpoints, by 0.07 on average.
 - Training costs motion, memory or not: in runs 1 to 3 both arms fall under the motion reference.
 - One lead is open: a training-free delta write rule reads the subject out of the state where
   the deployed rule does not.
@@ -75,8 +75,8 @@ One column per training run, identity on top, motion below, against the training
 dashed line is that run's own unmodified model. The four share everything except what their
 titles name: same frozen backbone, same LoRA co-training, and the same objective, plain DMD
 distillation with every extra loss term in the codebase weighted zero. Run 4 differs from run 3
-by one line of config, the fine-tune it starts from, which is why its reference sits lower. Six
-prompts per point, one seed, no repeat, so there is no noise estimate. One point per step; EMA
+by one line of config, the fine-tune it starts from, which is why its reference sits lower. No
+measurement was repeated, so there is no noise estimate. One point per step; EMA
 and 480-frame evaluations are left out, and where a step was evaluated at two sink sizes the
 sink-1 measurement is the one drawn.
 
@@ -92,10 +92,9 @@ collapsed to 0.36. In run 1, the one fair comparison to the reference, the only 
 above it on identity is the memory-zeroed one (0.773 against 0.743), with a third fewer clips
 rated dynamic; with the memory active identity is 0.667 and dynamic degree 0.23, a near-frozen
 video. Run 4 keeps more motion than its reference, and the memory still lowers identity there at
-two checkpoints out of three.
+most checkpoints.
 
-The likely reason, for this write rule, this objective and this backbone, which is all that
-was tested: chunk-local DMD and the usual metrics reward the same thing, temporal
+The likely reason, for this write rule, this objective and this backbone: chunk-local DMD and the usual metrics reward the same thing, temporal
 self-similarity, so a learnable memory converges to a freeze or to a constant-bias degeneracy
 that the dashboard scores as healthy. The frozen checkpoints show it: run 1 at step 1250 and
 run 2 at step 750 have a dynamic degree of 0.23 and 0.24, and VBench rates their subject
@@ -107,14 +106,13 @@ of A's first appearance, real or decoded from the memory state. Controls matter 
 taken from a different video helps as much as the right one, which is how the apparent gain
 turned out never to have been content-driven.
 
-The open lead in numbers: median 13.5/19 for the delta rule against 7.0 for the deployed one, over
-10 seeds, with a background control at chance. The score counts, out of 19 video pairs with a
-clearly distinct subject, how many the state tells apart in a two-way choice, so chance is 9.5; it
-is read offline from replayed states (`write_only` and `replay_writes` in
-`wan/modules/video_memory.py` are that replay's interface). The two distributions barely overlap (11
-to 16 against 6 to 10), but the delta rule's median sits just under the 14/19 a single seed needs to
-be significant. The probe scripts ran on the training cluster and are not in this repository, so
-these numbers cannot be reproduced from here.
+The open lead: given pairs of videos with clearly distinct subjects, the state written by the
+delta rule tells them apart in a two-way choice more often than chance, while the deployed rule
+and a background control stay at chance. The score is read offline from replayed states
+(`write_only` and `replay_writes` in `wan/modules/video_memory.py` are that replay's interface).
+Across seeds the two distributions barely overlap, but the delta rule's median sits just under
+the level a single seed needs to be significant. The probe scripts ran on the training cluster
+and are not in this repository, so this result cannot be reproduced from here.
 
 ## Running it
 
